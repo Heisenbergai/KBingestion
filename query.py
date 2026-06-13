@@ -23,6 +23,36 @@ voyage = voyageai.Client(api_key=os.getenv("VOYAGE_API_KEY"))
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 
+# ── Test endpoint — diagnoses each component independently ─────────────────────
+@router.get("/test")
+async def test_components():
+    results = {}
+    
+    # Test 1: Voyage AI
+    try:
+        r = voyage.embed(["test"], model="voyage-3", input_type="query")
+        results["voyage"] = "OK"
+    except Exception as e:
+        results["voyage"] = f"FAILED: {str(e)}"
+    
+    # Test 2: Supabase
+    try:
+        supabase.table("document_chunks").select("id").limit(1).execute()
+        results["supabase"] = "OK"
+    except Exception as e:
+        results["supabase"] = f"FAILED: {str(e)}"
+    
+    # Test 3: Gemini
+    try:
+        model = genai.GenerativeModel(model_name="gemini-2.0-flash")
+        response = model.generate_content("Say hello in one word.")
+        results["gemini"] = f"OK: {response.text}"
+    except Exception as e:
+        results["gemini"] = f"FAILED: {str(e)}"
+    
+    return results
+
+
 # ── Request shape ──────────────────────────────────────────────────────────────
 class QueryRequest(BaseModel):
     question:    str            # the user's question
@@ -121,4 +151,7 @@ Answer:"""
         }
 
     except Exception as e:
+        import traceback
+        print(f"QUERY ERROR: {str(e)}")
+        print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
