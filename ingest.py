@@ -46,7 +46,7 @@ def download_file(storage_path: str) -> bytes:
     storage_path is the path inside the 'asset-documents' bucket.
     Returns the file as raw bytes in memory.
     """
-    file_bytes = supabase.storage.from_("asset-documents").download(storage_path)
+    file_bytes = supabase.storage.from_("knowledge-files").download(storage_path)
     return file_bytes
 
 
