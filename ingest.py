@@ -210,3 +210,6 @@ async def ingest_document(request: IngestRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+
+print("SUPABASE_URL =", SUPABASE_URL)
+
