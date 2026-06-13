@@ -1,6 +1,6 @@
 import os
 import voyageai
-import anthropic
+from groq import Groq
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional
@@ -18,7 +18,7 @@ supabase = create_client(
 )
 
 voyage = voyageai.Client(api_key=os.getenv("VOYAGE_API_KEY"))
-claude = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+groq = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 
 # ── Test endpoint ──────────────────────────────────────────────────────────────
@@ -40,16 +40,16 @@ async def test_components():
     except Exception as e:
         results["supabase"] = f"FAILED: {str(e)}"
 
-    # Test 3: Anthropic
+    # Test 3: Groq
     try:
-        response = claude.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=10,
-            messages=[{"role": "user", "content": "Say hello in one word."}]
+        response = groq.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": "Say hello in one word."}],
+            max_tokens=10
         )
-        results["anthropic"] = f"OK: {response.content[0].text}"
+        results["groq"] = f"OK: {response.choices[0].message.content}"
     except Exception as e:
-        results["anthropic"] = f"FAILED: {str(e)}"
+        results["groq"] = f"FAILED: {str(e)}"
 
     return results
 
@@ -96,11 +96,14 @@ async def query_documents(request: QueryRequest):
 
         context = "\n\n---\n\n".join(context_parts)
 
-        # Step 4: Ask Claude
-        response = claude.messages.create(
-            model="claude-haiku-4-5",
+        # Step 4: Ask Groq
+        response = groq.chat.completions.create(
+            model="llama-3.1-8b-instant",
             max_tokens=1000,
-            system="""You are a helpful assistant for employees at this company.
+            messages=[
+                {
+                    "role": "system",
+                    "content": """You are a helpful assistant for employees at this company.
 Answer questions based ONLY on the document excerpts provided below.
 
 Rules:
@@ -108,8 +111,8 @@ Rules:
 2. Be direct, precise, and clear. No fluff.
 3. If the answer is not in the documents, respond with exactly: "I couldn't find this information in the available documents."
 4. Never guess or make up information.
-5. If relevant, mention which document the answer comes from.""",
-            messages=[
+5. If relevant, mention which document the answer comes from."""
+                },
                 {
                     "role": "user",
                     "content": f"Document excerpts:\n{context}\n\nQuestion: {request.question}\n\nAnswer:"
@@ -117,7 +120,7 @@ Rules:
             ]
         )
 
-        answer = response.content[0].text
+        answer = response.choices[0].message.content
 
         # Step 5: Return answer + sources
         sources = list(set([
