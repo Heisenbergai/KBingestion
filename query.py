@@ -124,7 +124,7 @@ Rules you must follow:
 5. If relevant, mention which document the answer comes from."""
 
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
+            model_name="gemini-2.0-flash",
             system_instruction=system_instruction
         )
 
