@@ -44,7 +44,7 @@ async def test_components():
     
     # Test 3: Gemini
     try:
-        model = genai.GenerativeModel(model_name="gemini-2.0-flash")
+        model = genai.GenerativeModel(model_name="gemini-1.5-flash")
         response = model.generate_content("Say hello in one word.")
         results["gemini"] = f"OK: {response.text}"
     except Exception as e:
@@ -124,7 +124,7 @@ Rules you must follow:
 5. If relevant, mention which document the answer comes from."""
 
         model = genai.GenerativeModel(
-            model_name="gemini-2.0-flash",
+            model_name="gemini-1.5-flash",
             system_instruction=system_instruction
         )
 
