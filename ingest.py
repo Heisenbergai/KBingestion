@@ -192,4 +192,7 @@ async def ingest_document(request: IngestRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        import traceback
+        print(f"INGEST ERROR: {str(e)}")
+        print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
