@@ -12,11 +12,12 @@ supabase = create_client(
 )
 
 # ── Groq free-tier rate limit constants ─────────────────────────────────────────
-# llama-3.1-8b-instant supports 128K context, but the FREE TIER rate limit
-# is 6,000 tokens-per-minute (input + output combined). This is the real
-# ceiling in practice — context window is not the binding constraint.
-TPM_LIMIT     = 6000
-SAFETY_MARGIN = 500   # buffer for system prompt + formatting overhead
+# Using gemma2-9b-it: 15,000 TPM (2.5x higher than llama-3.1-8b-instant's 6,000),
+# but only an 8K context window (vs 128K for llama models). At this model's size,
+# the CONTEXT WINDOW is the binding constraint, not TPM — so we check both.
+TPM_LIMIT      = 15000
+CONTEXT_WINDOW = 8192
+SAFETY_MARGIN  = 500   # buffer for system prompt + formatting overhead
 
 
 def fetch_combined_content(document_ids: list[str]) -> str:
@@ -65,25 +66,31 @@ def fetch_combined_content(document_ids: list[str]) -> str:
 
 def check_tpm_budget(combined_content: str, output_budget: int) -> int:
     """
-    Raises HTTPException if the request would exceed Groq's free-tier
-    6,000 tokens-per-minute limit (input + output combined).
+    Raises HTTPException if the request would exceed either:
+    - Groq's free-tier TPM limit (15,000 tokens/minute for gemma2-9b-it), or
+    - The model's context window (8,192 tokens for gemma2-9b-it)
 
-    Returns the approximate input token count if within budget.
+    Whichever is smaller wins. Returns the approximate input token count
+    if within budget.
 
     Rough estimate: ~4 characters per token.
     """
     approx_input_tokens = len(combined_content) // 4
     approx_total = approx_input_tokens + output_budget + SAFETY_MARGIN
 
-    if approx_total > TPM_LIMIT:
-        max_safe_input_tokens = TPM_LIMIT - output_budget - SAFETY_MARGIN
+    max_by_tpm     = TPM_LIMIT - output_budget - SAFETY_MARGIN
+    max_by_context = CONTEXT_WINDOW - output_budget - SAFETY_MARGIN
+    max_safe_input_tokens = min(max_by_tpm, max_by_context)
+
+    if approx_total > TPM_LIMIT or approx_total > CONTEXT_WINDOW:
+        binding_constraint = "context window (8K)" if max_by_context < max_by_tpm else "rate limit (15K TPM)"
         raise HTTPException(
             status_code=400,
             detail=(
                 f"This document set (~{approx_input_tokens} tokens) exceeds the current "
-                f"free-tier limit of ~{max_safe_input_tokens} tokens per request. "
-                f"Select fewer or shorter documents, or split into multiple courses/paths. "
-                f"(Groq free tier: 6,000 tokens/minute)"
+                f"free-tier limit of ~{max_safe_input_tokens} tokens per request "
+                f"(binding constraint: {binding_constraint}). "
+                f"Select fewer or shorter documents, or split into multiple courses/paths."
             )
         )
 

@@ -171,7 +171,7 @@ Design a {template['name']} course following the structure described in the syst
 Respond only with the JSON object."""
 
         response = groq.chat.completions.create(
-            model="llama-3.1-8b-instant",
+            model="gemma2-9b-it",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
