@@ -3,19 +3,14 @@ import json
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional
-from supabase import create_client
 from groq import Groq
 from dotenv import load_dotenv
+
+from shared import fetch_combined_content, check_tpm_budget
 
 load_dotenv()
 
 router = APIRouter()
-
-# ── Clients ────────────────────────────────────────────────────────────────────
-supabase = create_client(
-    os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_SERVICE_KEY")
-)
 
 groq = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
@@ -33,73 +28,21 @@ async def generate_path(request: GeneratePathRequest):
     Takes a list of already-ingested document_ids, reads ALL their content
     (not just top-5 similar chunks — the full text), and asks the AI to
     design a structured learning path: modules, objectives, sequence, duration.
+
+    This is the lightweight "outline only" version. For a full course with
+    reading material, quizzes, and exercises per module, use /generate-course.
     """
     try:
         if not request.document_ids:
             raise HTTPException(status_code=400, detail="document_ids cannot be empty")
 
-        # ── Step 1: Fetch ALL chunks for these documents, in order ─────────────
-        # Unlike /query (which does similarity search for 5 chunks),
-        # this pulls every chunk so the AI sees the complete document.
-        result = supabase.table("document_chunks") \
-            .select("document_id, content, chunk_index, metadata") \
-            .in_("document_id", request.document_ids) \
-            .order("document_id") \
-            .order("chunk_index") \
-            .execute()
+        # Fetch and combine all document content (shared helper)
+        combined_content = fetch_combined_content(request.document_ids)
 
-        chunks = result.data
+        # Safety check against Groq's free-tier rate limit
+        OUTPUT_BUDGET = 2000
+        check_tpm_budget(combined_content, OUTPUT_BUDGET)
 
-        if not chunks:
-            raise HTTPException(
-                status_code=404,
-                detail="No processed content found for the given document_ids. "
-                       "Make sure these documents have completed AI Processing."
-            )
-
-        # ── Step 2: Reassemble full text per document ──────────────────────────
-        docs = {}
-        for chunk in chunks:
-            doc_id = chunk["document_id"]
-            if doc_id not in docs:
-                docs[doc_id] = {
-                    "file_name":   chunk["metadata"].get("file_name", "Unknown document"),
-                    "text_parts":  []
-                }
-            docs[doc_id]["text_parts"].append(chunk["content"])
-
-        document_sections = []
-        for doc_id, doc in docs.items():
-            full_text = " ".join(doc["text_parts"])
-            document_sections.append(f"=== Document: {doc['file_name']} ===\n{full_text}")
-
-        combined_content = "\n\n".join(document_sections)
-
-        # ── Step 3: Safety check — Groq free-tier rate limit, not context window ──
-        # llama-3.1-8b-instant supports 128K context, but the FREE TIER rate limit
-        # is 6,000 tokens-per-minute (input + output combined). This is the real
-        # ceiling we hit in practice — context window is not the binding constraint.
-        # Rough estimate: ~4 characters per token.
-        OUTPUT_BUDGET = 2000   # max_tokens reserved for the AI's response
-        TPM_LIMIT     = 6000   # Groq free tier limit for this model
-        SAFETY_MARGIN = 500    # buffer for system prompt + formatting overhead
-
-        approx_input_tokens = len(combined_content) // 4
-        approx_total = approx_input_tokens + OUTPUT_BUDGET + SAFETY_MARGIN
-
-        if approx_total > TPM_LIMIT:
-            max_safe_input_tokens = TPM_LIMIT - OUTPUT_BUDGET - SAFETY_MARGIN
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"This document set (~{approx_input_tokens} tokens) exceeds the current "
-                    f"free-tier limit of ~{max_safe_input_tokens} tokens per request. "
-                    f"Select fewer or shorter documents, or split this into multiple "
-                    f"learning paths. (Groq free tier: 6,000 tokens/minute)"
-                )
-            )
-
-        # ── Step 4: Ask the AI to design the course ─────────────────────────────
         system_prompt = """You are an instructional designer creating structured onboarding \
 and training courses from company documents.
 
@@ -142,7 +85,7 @@ Respond only with the JSON object described in the system prompt."""
                 {"role": "user", "content": user_prompt}
             ],
             response_format={"type": "json_object"},
-            max_tokens=2000,
+            max_tokens=OUTPUT_BUDGET,
             temperature=0.3
         )
 
