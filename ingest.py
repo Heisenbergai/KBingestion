@@ -121,14 +121,45 @@ def chunk_text(text: str) -> list[str]:
 def embed_chunks(chunks: list[str]) -> list[list[float]]:
     """
     Sends each chunk to Voyage AI and gets back a vector of 1024 numbers.
-    """
-    all_embeddings = []
-    batch_size = 128
 
-    for i in range(0, len(chunks), batch_size):
+    Rate-limit safety:
+    - Voyage AI standard tier allows generous RPM/TPM, but bursts of many
+      large batches back-to-back can still trip limits under load.
+    - We use smaller batches (50 chunks) and a small delay between batches.
+    - On a rate limit error, we wait and retry with exponential backoff
+      instead of failing the whole ingestion.
+    """
+    import time
+
+    all_embeddings = []
+    batch_size = 50          # smaller batches = smaller bursts
+    delay_between_batches = 1.0  # seconds, keeps us well under per-minute limits
+
+    i = 0
+    while i < len(chunks):
         batch = chunks[i:i + batch_size]
-        result = voyage.embed(batch, model="voyage-3", input_type="document")
-        all_embeddings.extend(result.embeddings)
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                result = voyage.embed(batch, model="voyage-3", input_type="document")
+                all_embeddings.extend(result.embeddings)
+                break
+            except Exception as e:
+                if "RateLimitError" in str(type(e)) or "rate limit" in str(e).lower():
+                    wait_time = (attempt + 1) * 5  # 5s, 10s, 15s
+                    print(f"Rate limit hit, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(wait_time)
+                    if attempt == max_retries - 1:
+                        raise
+                else:
+                    raise
+
+        i += batch_size
+
+        # Small pause between batches to avoid bursting limits
+        if i < len(chunks):
+            time.sleep(delay_between_batches)
 
     return all_embeddings
 
