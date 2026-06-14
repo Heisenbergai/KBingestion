@@ -12,11 +12,12 @@ supabase = create_client(
 )
 
 # ── Groq free-tier rate limit constants ─────────────────────────────────────────
-# Using gemma2-9b-it: 15,000 TPM (2.5x higher than llama-3.1-8b-instant's 6,000),
-# but only an 8K context window (vs 128K for llama models). At this model's size,
-# the CONTEXT WINDOW is the binding constraint, not TPM — so we check both.
-TPM_LIMIT      = 15000
-CONTEXT_WINDOW = 8192
+# llama-3.1-8b-instant: 6,000 TPM, 128K context window.
+# gemma2-9b-it (which had a higher 15K TPM allowance) was decommissioned by
+# Groq in favor of llama-3.1-8b-instant — so this is the model to use.
+# At this size, TPM (6,000) is the binding constraint, not context (128K).
+TPM_LIMIT      = 6000
+CONTEXT_WINDOW = 128000
 SAFETY_MARGIN  = 500   # buffer for system prompt + formatting overhead
 
 
