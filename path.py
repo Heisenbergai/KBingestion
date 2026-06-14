@@ -75,15 +75,28 @@ async def generate_path(request: GeneratePathRequest):
 
         combined_content = "\n\n".join(document_sections)
 
-        # ── Step 3: Safety check — stay within model's context window ──────────
-        # Rough estimate: ~4 characters per token. llama-3.1-8b-instant
-        # supports up to 128K input tokens, so we leave generous headroom.
-        approx_tokens = len(combined_content) // 4
-        if approx_tokens > 100000:
+        # ── Step 3: Safety check — Groq free-tier rate limit, not context window ──
+        # llama-3.1-8b-instant supports 128K context, but the FREE TIER rate limit
+        # is 6,000 tokens-per-minute (input + output combined). This is the real
+        # ceiling we hit in practice — context window is not the binding constraint.
+        # Rough estimate: ~4 characters per token.
+        OUTPUT_BUDGET = 2000   # max_tokens reserved for the AI's response
+        TPM_LIMIT     = 6000   # Groq free tier limit for this model
+        SAFETY_MARGIN = 500    # buffer for system prompt + formatting overhead
+
+        approx_input_tokens = len(combined_content) // 4
+        approx_total = approx_input_tokens + OUTPUT_BUDGET + SAFETY_MARGIN
+
+        if approx_total > TPM_LIMIT:
+            max_safe_input_tokens = TPM_LIMIT - OUTPUT_BUDGET - SAFETY_MARGIN
             raise HTTPException(
                 status_code=400,
-                detail=f"Combined content (~{approx_tokens} tokens) is too large for a single "
-                       f"learning path. Select fewer documents or split into multiple paths."
+                detail=(
+                    f"This document set (~{approx_input_tokens} tokens) exceeds the current "
+                    f"free-tier limit of ~{max_safe_input_tokens} tokens per request. "
+                    f"Select fewer or shorter documents, or split this into multiple "
+                    f"learning paths. (Groq free tier: 6,000 tokens/minute)"
+                )
             )
 
         # ── Step 4: Ask the AI to design the course ─────────────────────────────
@@ -129,7 +142,7 @@ Respond only with the JSON object described in the system prompt."""
                 {"role": "user", "content": user_prompt}
             ],
             response_format={"type": "json_object"},
-            max_tokens=4000,
+            max_tokens=2000,
             temperature=0.3
         )
 
