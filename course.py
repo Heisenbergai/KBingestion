@@ -75,9 +75,11 @@ async def list_templates():
 
 # ── Request shape ──────────────────────────────────────────────────────────────
 class GenerateCourseRequest(BaseModel):
-    template_id:  str            # one of the keys in TEMPLATES
-    document_ids: list[str]      # which processed documents to build the course from
-    course_title: Optional[str] = None  # optional hint for the course title
+    template_id:        str             # one of the keys in TEMPLATES
+    document_ids:       list[str]       # which processed documents to build the course from
+    course_title:       Optional[str] = None  # optional hint for the course title
+    additional_context: Optional[str] = None  # free-text guidance from the course creator
+                                                # (focus areas, tone, specific topics to emphasize)
 
 
 # ── Main route ─────────────────────────────────────────────────────────────────
@@ -161,11 +163,12 @@ Respond ONLY with valid JSON in this exact structure, nothing else, no markdown 
 }}"""
 
         title_hint = f"\nThe course should be titled around: {request.course_title}" if request.course_title else ""
+        context_hint = f"\nAdditional context from the course creator (use this to guide focus, tone, and emphasis): {request.additional_context}" if request.additional_context else ""
 
         user_prompt = f"""Source content:
 
 {combined_content}
-{title_hint}
+{title_hint}{context_hint}
 
 Design a {template['name']} course following the structure described in the system prompt. \
 Respond only with the JSON object."""
