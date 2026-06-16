@@ -10,8 +10,9 @@ from typing import Optional
 from supabase import create_client
 from dotenv import load_dotenv
 
-# Import the slide renderer from slides.py
+# Import the slide renderer and TTS function
 from slides import render_slide
+from voiceover import synthesize_speech
 
 load_dotenv()
 
@@ -41,25 +42,8 @@ class GenerateVideoRequest(BaseModel):
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
-def generate_tts(text: str, voice: str) -> bytes:
-    """Calls Groq Orpheus TTS and returns raw WAV bytes."""
-    response = httpx.post(
-        "https://api.groq.com/openai/v1/audio/speech",
-        headers={
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": "canopylabs/orpheus-v1-english",
-            "input": text,
-            "voice": voice,
-            "response_format": "wav",
-        },
-        timeout=90,
-    )
-    if response.status_code != 200:
-        raise Exception(f"Groq TTS failed: {response.text}")
-    return response.content
+# TTS is now handled by synthesize_speech() imported from voiceover.py
+# (Google Cloud Neural2 — 1M chars/month free, no daily token cap)
 
 
 def save_to_supabase(video_bytes: bytes, document_id: str, module_label: str) -> str:
@@ -122,7 +106,7 @@ async def generate_video(request: GenerateVideoRequest):
                 img.save(img_path, format="PNG")
 
                 # ── Step 1b: Generate narration audio ──────────────────────────
-                audio_bytes = generate_tts(slide.narration, request.voice)
+                audio_bytes = synthesize_speech(slide.narration, request.voice)
                 audio_path = os.path.join(tmpdir, f"audio_{i:03d}.wav")
                 with open(audio_path, "wb") as f:
                     f.write(audio_bytes)
@@ -188,28 +172,22 @@ async def generate_video(request: GenerateVideoRequest):
             video_size_mb = len(video_bytes) / (1024 * 1024)
             print(f"Video generated: {video_size_mb:.1f} MB")
 
-            if request.document_id:
-                signed_url = save_to_supabase(
-                    video_bytes,
-                    request.document_id,
-                    request.module_label
-                )
-                return {
-                    "success": True,
-                    "video_url": signed_url,
-                    "slide_count": total,
-                    "size_mb": round(video_size_mb, 2),
-                    "message": f"Video generated from {total} slides."
-                }
-            else:
-                # No document_id — return the raw video bytes directly
-                # (useful for testing without Supabase storage)
-                from fastapi.responses import Response as FastAPIResponse
-                return FastAPIResponse(
-                    content=video_bytes,
-                    media_type="video/mp4",
-                    headers={"Content-Disposition": "attachment; filename=explainer.mp4"}
-                )
+            # Always upload to Supabase and return JSON with signed URL.
+            # Use document_id if provided, otherwise use a random UUID path.
+            import uuid as _uuid
+            storage_doc_id = request.document_id if request.document_id else str(_uuid.uuid4())
+            signed_url = save_to_supabase(
+                video_bytes,
+                storage_doc_id,
+                request.module_label
+            )
+            return {
+                "success":     True,
+                "video_url":   signed_url,
+                "slide_count": total,
+                "size_mb":     round(video_size_mb, 2),
+                "message":     f"Video generated from {total} slides."
+            }
 
     except HTTPException:
         raise
