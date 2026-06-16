@@ -1,0 +1,1 @@
+{"detail":"Groq TTS error: {\"error\":{\"message\":\"voice must be one of the following voices: [autumn diana hannah austin daniel troy]\",\"type\":\"invalid_request_error\"}}\n"}
