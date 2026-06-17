@@ -7,8 +7,8 @@ from PIL import Image, ImageDraw, ImageFont
 router = APIRouter()
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-W, H = 640, 360  # 16:9, standard video resolution
-PAD_X = 45
+W, H = 1280, 720  # 16:9, standard video resolution
+PAD_X = 90
 
 FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "Inter-Bold.ttf")
 
@@ -83,42 +83,42 @@ def render_slide(title: str, bullets: list[str], module_label: str, slide_number
     """
     img, draw = base_slide()
 
-    label_font = load_font("SemiBold", 10)
+    label_font = load_font("SemiBold", 20)
     draw.text((PAD_X, 50), module_label.upper(), font=label_font, fill=ACCENT)
 
     # Title — wrap to max 2 lines, shrinking font size if it doesn't fit
-    title_size = 27
+    title_size = 54
     title_font = load_font("Bold", title_size)
     max_title_width = W - 2 * PAD_X
     title_lines = wrap_text(draw, title, title_font, max_title_width)
-    while len(title_lines) > 2 and title_size > 18:
-        title_size -= 2
+    while len(title_lines) > 2 and title_size > 36:
+        title_size -= 4
         title_font = load_font("Bold", title_size)
         title_lines = wrap_text(draw, title, title_font, max_title_width)
     title_lines = title_lines[:2]
 
-    y = 55
+    y = 110
     for line in title_lines:
         draw.text((PAD_X, y), line, font=title_font, fill=TEXT_DARK)
         y += int(title_size * 1.2)
 
-    y += 7
-    draw.rectangle([PAD_X, y, PAD_X + 45, y + 3], fill=ACCENT)
-    y += 25
+    y += 14
+    draw.rectangle([PAD_X, y, PAD_X + 90, y + 6], fill=ACCENT)
+    y += 50
 
     # Bullets — each wraps independently, font size fixed
-    bullet_font = load_font("Regular", 15)
-    line_height = 23
+    bullet_font = load_font("Regular", 30)
+    line_height = 46
     max_bullet_width = W - 2 * PAD_X - 38
     for b in bullets:
-        draw.ellipse([PAD_X, y + 6, PAD_X + 6, y + 13], fill=ACCENT)
+        draw.ellipse([PAD_X, y + 13, PAD_X + 13, y + 26], fill=ACCENT)
         for line in wrap_text(draw, b, bullet_font, max_bullet_width):
-            draw.text((PAD_X + 19, y), line, font=bullet_font, fill=TEXT_GRAY)
+            draw.text((PAD_X + 38, y), line, font=bullet_font, fill=TEXT_GRAY)
             y += line_height
-        y += 9
+        y += 18
 
-    slide_font = load_font("Medium", 11)
-    draw.text((W - 75, H - 25), f"{slide_number} / {total_slides}", font=slide_font, fill=TEXT_LIGHT_GRAY)
+    slide_font = load_font("Medium", 22)
+    draw.text((W - 150, H - 50), f"{slide_number} / {total_slides}", font=slide_font, fill=TEXT_LIGHT_GRAY)
     progress_bar(draw, slide_number, total_slides)
 
     return img

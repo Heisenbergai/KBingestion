@@ -131,7 +131,7 @@ async def generate_video(request: GenerateVideoRequest):
                     "-tune", "stillimage",
                     "-c:a", "aac",
                     "-b:a", "128k",
-                    "-vf", "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2",
+                    "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
                     "-pix_fmt", "yuv420p",
                     "-r", "24",
                     clip_path,
