@@ -140,7 +140,14 @@ async def generate_video(request: GenerateVideoRequest):
                 )
                 stdout, stderr = await proc.communicate()
                 if proc.returncode != 0:
-                    raise Exception(f"FFmpeg clip {slide_num} failed: {stderr.decode()}")
+                    stderr_text = stderr.decode("utf-8", errors="replace")
+                    audio_size  = os.path.getsize(audio_path)
+                    img_size    = os.path.getsize(img_path)
+                    print(f"=== FFmpeg clip {slide_num} FAILED ===")
+                    print(f"Audio: {audio_size} bytes | Image: {img_size} bytes")
+                    print(f"FFmpeg stderr (last 1000 chars):")
+                    print(stderr_text[-1000:])
+                    raise Exception(f"FFmpeg clip {slide_num} failed — see logs above")
 
             # ── Step 3: Concatenate all clips into one MP4 ─────────────────────
             # FFmpeg concat demuxer: list all clips in a text file, then concat
