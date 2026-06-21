@@ -74,13 +74,11 @@ def save_to_r2(video_bytes: bytes, document_id: str, module_label: str) -> str:
         ContentType="video/mp4",
     )
 
-    # Presigned URL — valid for 7 days, plays directly in browser
-    url = r2.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": R2_BUCKET_NAME, "Key": key},
-        ExpiresIn=604800,  # 7 days
-    )
+    # Direct public URL — works when bucket has public access enabled on R2
+    # No presigning needed, no SSL handshake, plays directly in any browser
+    url = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com/{R2_BUCKET_NAME}/{key}"
     print(f"[R2] Uploaded: {key}")
+    print(f"[R2] URL: {url}")
     return url
 
 
