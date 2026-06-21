@@ -74,9 +74,10 @@ def save_to_r2(video_bytes: bytes, document_id: str, module_label: str) -> str:
         ContentType="video/mp4",
     )
 
-    # Direct public URL — works when bucket has public access enabled on R2
-    # No presigning needed, no SSL handshake, plays directly in any browser
-    url = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com/{R2_BUCKET_NAME}/{key}"
+    # Public Development URL — enabled on the R2 bucket
+    # Format: https://pub-{hash}.r2.dev/{key}  (bucket name NOT in the path)
+    R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL", "https://pub-222a48f277db4cb6b9fbdda27a672cc5.r2.dev")
+    url = f"{R2_PUBLIC_URL}/{key}"
     print(f"[R2] Uploaded: {key}")
     print(f"[R2] URL: {url}")
     return url
