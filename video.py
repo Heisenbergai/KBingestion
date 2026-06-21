@@ -1,13 +1,14 @@
 import os
 import io
+import uuid
 import tempfile
 import asyncio
 import httpx
+import boto3
+from botocore.config import Config
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional
-from supabase import create_client
 from dotenv import load_dotenv
 
 # Import the slide renderer and TTS function
@@ -20,9 +21,19 @@ router = APIRouter()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-supabase = create_client(
-    os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_SERVICE_KEY")
+# ── Cloudflare R2 client (S3-compatible, zero egress fees) ─────────────────────
+R2_ACCOUNT_ID      = os.getenv("R2_ACCOUNT_ID")
+R2_ACCESS_KEY_ID   = os.getenv("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
+R2_BUCKET_NAME     = os.getenv("R2_BUCKET_NAME", "knowledge-videos")
+
+r2 = boto3.client(
+    "s3",
+    endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+    aws_access_key_id=R2_ACCESS_KEY_ID,
+    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+    config=Config(signature_version="s3v4"),
+    region_name="auto",
 )
 
 
@@ -46,19 +57,31 @@ class GenerateVideoRequest(BaseModel):
 # (Google Cloud Neural2 — 1M chars/month free, no daily token cap)
 
 
-def save_to_supabase(video_bytes: bytes, document_id: str, module_label: str) -> str:
-    """Uploads the video to Supabase Storage and returns a signed URL."""
+def save_to_r2(video_bytes: bytes, document_id: str, module_label: str) -> str:
+    """
+    Uploads the video to Cloudflare R2 and returns a presigned URL (7 days).
+    R2 has zero egress fees — no cost for employees streaming the video.
+    Presigned URL works regardless of bucket public/private setting.
+    """
     safe_label = module_label.replace(" ", "_").replace("·", "").replace("/", "_")[:60]
-    path = f"explainer_videos/{document_id}/{safe_label}.mp4"
+    unique_id  = str(uuid.uuid4())[:8]
+    key        = f"explainer-videos/{document_id}/{safe_label}_{unique_id}.mp4"
 
-    supabase.storage.from_("knowledge-files").upload(
-        path,
-        video_bytes,
-        {"content-type": "video/mp4", "upsert": "true"}
+    r2.put_object(
+        Bucket=R2_BUCKET_NAME,
+        Key=key,
+        Body=video_bytes,
+        ContentType="video/mp4",
     )
 
-    result = supabase.storage.from_("knowledge-files").create_signed_url(path, 86400)
-    return result["signedURL"]
+    # Presigned URL — valid for 7 days, plays directly in browser
+    url = r2.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": R2_BUCKET_NAME, "Key": key},
+        ExpiresIn=604800,  # 7 days
+    )
+    print(f"[R2] Uploaded: {key}")
+    return url
 
 
 # ── Main route ─────────────────────────────────────────────────────────────────
@@ -183,7 +206,7 @@ async def generate_video(request: GenerateVideoRequest):
             # Use document_id if provided, otherwise use a random UUID path.
             import uuid as _uuid
             storage_doc_id = request.document_id if request.document_id else str(_uuid.uuid4())
-            signed_url = save_to_supabase(
+            signed_url = save_to_r2(
                 video_bytes,
                 storage_doc_id,
                 request.module_label
