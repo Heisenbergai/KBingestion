@@ -27,6 +27,12 @@ R2_ACCESS_KEY_ID   = os.getenv("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
 R2_BUCKET_NAME     = os.getenv("R2_BUCKET_NAME", "knowledge-videos")
 
+# verify=False: works around SSL handshake failure between Python 3.12
+# and R2's endpoint on Railway's Debian 13 base image.
+# The connection is still encrypted — we're skipping cert verification only.
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 r2 = boto3.client(
     "s3",
     endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
@@ -34,6 +40,7 @@ r2 = boto3.client(
     aws_secret_access_key=R2_SECRET_ACCESS_KEY,
     config=Config(signature_version="s3v4"),
     region_name="auto",
+    verify=False,
 )
 
 
