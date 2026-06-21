@@ -30,19 +30,17 @@ R2_BUCKET_NAME     = os.getenv("R2_BUCKET_NAME", "knowledge-videos")
 # verify=False: works around SSL handshake failure between Python 3.12
 # and R2's endpoint on Railway's Debian 13 base image.
 # The connection is still encrypted — we're skipping cert verification only.
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 r2 = boto3.client(
-    "s3",
+    service_name="s3",
     endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
     aws_access_key_id=R2_ACCESS_KEY_ID,
     aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-    config=Config(signature_version="s3v4"),
     region_name="auto",
-    verify=False,
+    config=Config(
+        signature_version="s3v4",
+        retries={"max_attempts": 5}
+    )
 )
-
 
 # ── Request shape ──────────────────────────────────────────────────────────────
 class Slide(BaseModel):
@@ -63,6 +61,9 @@ class GenerateVideoRequest(BaseModel):
 # TTS is now handled by synthesize_speech() imported from voiceover.py
 # (Google Cloud Neural2 — 1M chars/month free, no daily token cap)
 
+print("R2_ACCOUNT_ID:", R2_ACCOUNT_ID)
+print("R2_BUCKET_NAME:", R2_BUCKET_NAME)
+print("R2_ENDPOINT:", f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com")
 
 def save_to_r2(video_bytes: bytes, document_id: str, module_label: str) -> str:
     """
