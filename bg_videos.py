@@ -1,141 +1,92 @@
 import os
-import asyncio
 import uuid
+import asyncio
+import httpx
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
-from supabase import create_client
+from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv()
 
 router = APIRouter()
 
-supabase = create_client(
-    os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_SERVICE_KEY")
+# ── In-memory job store ────────────────────────────────────────────────────────
+# Railway is stateless — no DB access. Jobs live in memory only.
+# On Railway restart, jobs are cleared — Lovable handles persistence.
+JOBS: dict[str, dict] = {}
+
+BASE_URL = os.getenv(
+    "RAILWAY_PUBLIC_DOMAIN",
+    "https://kbingestion-production.up.railway.app"
 )
+if not BASE_URL.startswith("http"):
+    BASE_URL = f"https://{BASE_URL}"
 
 
-# ── Request shape ──────────────────────────────────────────────────────────────
+# ── Request shapes ─────────────────────────────────────────────────────────────
+class ModuleInput(BaseModel):
+    index:         int
+    title:         str
+    objectives:    list[str]
+    reading:       str          # reading.content from the module
+    course_title:  str
+
+
 class GenerateCourseVideosRequest(BaseModel):
-    training_id: str
-
-
-# ── Status helpers ─────────────────────────────────────────────────────────────
-def get_video_status(training_id: str) -> dict:
-    result = supabase.table("generated_trainings") \
-        .select("video_generation_status") \
-        .eq("id", training_id) \
-        .single() \
-        .execute()
-    return result.data.get("video_generation_status") or {}
-
-
-def set_module_status(training_id: str, module_index: int,
-                      status: str, video_url: str = None):
-    """Updates one module's status in the video_generation_status JSON column."""
-    current = get_video_status(training_id)
-    current[str(module_index)] = {
-        "status": status,  # pending | generating | done | failed
-        "video_url": video_url
-    }
-    supabase.table("generated_trainings") \
-        .update({"video_generation_status": current}) \
-        .eq("id", training_id) \
-        .execute()
-
-
-def set_module_video_url(training_id: str, module_index: int, video_url: str):
-    """
-    Writes the video URL into the module inside course_data.
-    This is what the learner view reads to show the video player.
-    """
-    result = supabase.table("generated_trainings") \
-        .select("course_data") \
-        .eq("id", training_id) \
-        .single() \
-        .execute()
-
-    course_data = result.data.get("course_data", {})
-    modules = course_data.get("modules", [])
-
-    if module_index < len(modules):
-        modules[module_index]["explainer_video"] = video_url
-        course_data["modules"] = modules
-        supabase.table("generated_trainings") \
-            .update({"course_data": course_data}) \
-            .eq("id", training_id) \
-            .execute()
+    modules:      list[ModuleInput]
+    voice:        Optional[str] = "austin"
 
 
 # ── Background worker ──────────────────────────────────────────────────────────
-async def generate_all_videos_background(training_id: str):
+async def process_modules(job_id: str, modules: list[ModuleInput], voice: str):
     """
-    Runs in the background after the HTTP response is returned.
-    Generates a video for each module sequentially, updating status after each.
+    Processes each module sequentially:
+    1. Generate slide JSON (/generate-explainer)
+    2. Generate video (/generate-video → R2)
+    3. Update in-memory job status
+
+    Railway never touches Lovable's DB.
+    Lovable polls /job-status/{job_id} and saves video_url itself.
     """
-    print(f"[bg-videos] Starting for training {training_id}")
+    print(f"[job:{job_id}] Starting — {len(modules)} modules")
 
-    # Fetch training data
-    result = supabase.table("generated_trainings") \
-        .select("course_data, course_title") \
-        .eq("id", training_id) \
-        .single() \
-        .execute()
-
-    if not result.data:
-        print(f"[bg-videos] Training {training_id} not found")
-        return
-
-    course_data  = result.data.get("course_data", {})
-    course_title = result.data.get("title", "Course")
-    modules      = course_data.get("modules", [])
-
-    print(f"[bg-videos] {len(modules)} modules to process")
-
-    for i, module in enumerate(modules):
-        # Skip intro (index 0) and final thank-you module (last index)
-        # — these are handled differently (no video, or static video)
-        module_title = module.get("title", f"Module {i+1}")
+    for module in modules:
+        idx = module.index
+        JOBS[job_id]["modules"][idx]["status"] = "generating"
+        print(f"[job:{job_id}] Module {idx+1}/{len(modules)}: {module.title}")
 
         try:
-            print(f"[bg-videos] Module {i+1}/{len(modules)}: {module_title}")
-            set_module_status(training_id, i, "generating")
+            async with httpx.AsyncClient(timeout=180) as client:
 
-            # Call /generate-explainer to get slide content
-            import httpx
-            base_url = os.getenv("RAILWAY_PUBLIC_DOMAIN", "https://kbingestion-production.up.railway.app")
-            if not base_url.startswith("http"):
-                base_url = f"https://{base_url}"
-
-            async with httpx.AsyncClient(timeout=120) as client:
-                # Step 1: Generate slide JSON
+                # Step 1 — Generate slide content
                 explainer_res = await client.post(
-                    f"{base_url}/generate-explainer",
+                    f"{BASE_URL}/generate-explainer",
                     json={
-                        "module_title":    module_title,
-                        "objectives":      module.get("objectives", []),
-                        "reading_content": module.get("reading", {}).get("content", ""),
+                        "module_title":    module.title,
+                        "objectives":      module.objectives,
+                        "reading_content": module.reading,
                     }
                 )
                 if explainer_res.status_code != 200:
-                    raise Exception(f"Explainer failed: {explainer_res.text}")
+                    raise Exception(f"Explainer failed ({explainer_res.status_code}): {explainer_res.text[:200]}")
 
-                explainer_data = explainer_res.json()
+                slides = explainer_res.json().get("slides", [])
+                if not slides:
+                    raise Exception("Explainer returned no slides")
 
-                # Step 2: Generate video
+                # Step 2 — Generate video
                 video_res = await client.post(
-                    f"{base_url}/generate-video",
+                    f"{BASE_URL}/generate-video",
                     json={
-                        "module_title":  module_title,
-                        "module_label":  f"Module {i+1} · {course_title}",
-                        "slides":        explainer_data.get("slides", []),
-                        "voice":         "austin",
-                    },
-                    timeout=180  # video generation can take up to 3 minutes
+                        "module_title":  module.title,
+                        "module_label":  f"Module {idx+1} · {module.course_title}",
+                        "slides":        slides,
+                        "voice":         voice,
+                    }
                 )
                 if video_res.status_code != 200:
-                    raise Exception(f"Video failed: {video_res.text}")
+                    raise Exception(f"Video failed ({video_res.status_code}): {video_res.text[:200]}")
 
                 video_data = video_res.json()
                 video_url  = video_data.get("video_url")
@@ -143,20 +94,24 @@ async def generate_all_videos_background(training_id: str):
                 if not video_url:
                     raise Exception("No video_url in response")
 
-            # Save URL into course_data modules
-            set_module_video_url(training_id, i, video_url)
-            set_module_status(training_id, i, "done", video_url)
-            print(f"[bg-videos] Module {i+1} done: {video_url}")
-
-            # Small pause between modules to avoid hitting TTS rate limits
-            if i < len(modules) - 1:
-                await asyncio.sleep(3)
+            # Update in-memory status — Lovable polls this
+            JOBS[job_id]["modules"][idx]["status"]    = "done"
+            JOBS[job_id]["modules"][idx]["video_url"] = video_url
+            print(f"[job:{job_id}] Module {idx+1} done: {video_url}")
 
         except Exception as e:
-            print(f"[bg-videos] Module {i+1} FAILED: {str(e)}")
-            set_module_status(training_id, i, "failed")
+            print(f"[job:{job_id}] Module {idx+1} FAILED: {str(e)}")
+            JOBS[job_id]["modules"][idx]["status"] = "failed"
+            JOBS[job_id]["modules"][idx]["error"]  = str(e)
 
-    print(f"[bg-videos] All modules processed for training {training_id}")
+        # Small pause between modules — avoids TTS rate limit bursts
+        if idx < len(modules) - 1:
+            await asyncio.sleep(3)
+
+    # Mark overall job complete
+    statuses = [m["status"] for m in JOBS[job_id]["modules"].values()]
+    JOBS[job_id]["status"] = "failed" if all(s == "failed" for s in statuses) else "done"
+    print(f"[job:{job_id}] All modules processed. Job status: {JOBS[job_id]['status']}")
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -166,85 +121,81 @@ async def generate_course_videos(
     background_tasks: BackgroundTasks
 ):
     """
-    Fire-and-forget endpoint. Returns immediately after:
-    1. Initialising all module statuses to 'pending'
-    2. Scheduling the background worker
-
-    The frontend polls /video-status/{training_id} to track progress.
+    Fire-and-forget endpoint.
+    Lovable sends module data → Railway returns job_id immediately →
+    Lovable polls /job-status/{job_id} → saves video_urls to its own DB.
     """
-    # Verify training exists
-    result = supabase.table("generated_trainings") \
-        .select("id, course_data") \
-        .eq("id", request.training_id) \
-        .single() \
-        .execute()
+    if not request.modules:
+        raise HTTPException(status_code=400, detail="modules list cannot be empty")
 
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Training not found")
+    job_id = str(uuid.uuid4())
 
-    modules = result.data.get("course_data", {}).get("modules", [])
-
-    # Initialise all modules to 'pending'
-    initial_status = {
-        str(i): {"status": "pending", "video_url": None}
-        for i in range(len(modules))
-    }
-    supabase.table("generated_trainings") \
-        .update({"video_generation_status": initial_status}) \
-        .eq("id", request.training_id) \
-        .execute()
-
-    # Schedule background task — returns to caller immediately
-    background_tasks.add_task(
-        generate_all_videos_background,
-        request.training_id
-    )
-
-    return {
-        "success":      True,
-        "training_id":  request.training_id,
-        "module_count": len(modules),
-        "message":      f"Video generation started for {len(modules)} modules. Poll /video-status/{request.training_id} for progress."
-    }
-
-
-@router.get("/video-status/{training_id}")
-async def get_video_generation_status(training_id: str):
-    """
-    Polled by the frontend every 10 seconds.
-    Returns per-module status so the UI can update each module independently.
-    """
-    result = supabase.table("generated_trainings") \
-        .select("video_generation_status, course_data") \
-        .eq("id", training_id) \
-        .single() \
-        .execute()
-
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Training not found")
-
-    status = result.data.get("video_generation_status") or {}
-    modules = result.data.get("course_data", {}).get("modules", [])
-
-    # Count totals for frontend progress indicator
-    statuses    = [v.get("status") for v in status.values()]
-    total       = len(modules)
-    done        = statuses.count("done")
-    failed      = statuses.count("failed")
-    generating  = statuses.count("generating")
-    pending     = statuses.count("pending")
-    all_done    = (done + failed) == total and total > 0
-
-    return {
-        "training_id": training_id,
-        "modules":     status,       # { "0": {"status": "done", "video_url": "..."}, ... }
-        "summary": {
-            "total":      total,
-            "done":       done,
-            "failed":     failed,
-            "generating": generating,
-            "pending":    pending,
-            "all_done":   all_done,
-            "progress_pct": int((done + failed) / total * 100) if total > 0 else 0
+    # Initialise job in memory
+    JOBS[job_id] = {
+        "status":  "processing",
+        "modules": {
+            str(m.index): {
+                "index":     m.index,
+                "title":     m.title,
+                "status":    "pending",
+                "video_url": None,
+                "error":     None,
+            }
+            for m in request.modules
         }
     }
+
+    # Schedule background processing — returns immediately
+    background_tasks.add_task(process_modules, job_id, request.modules, request.voice)
+
+    return {
+        "job_id":       job_id,
+        "status":       "processing",
+        "module_count": len(request.modules),
+        "message":      f"Processing started. Poll /job-status/{job_id} every 10 seconds."
+    }
+
+
+@router.get("/job-status/{job_id}")
+async def get_job_status(job_id: str):
+    """
+    Polled by Lovable every 10 seconds.
+    Returns per-module status + video_url as each module completes.
+    Lovable saves video_url to its own DB when status is 'done'.
+    """
+    if job_id not in JOBS:
+        raise HTTPException(
+            status_code=404,
+            detail="Job not found. Railway may have restarted — please regenerate."
+        )
+
+    job = JOBS[job_id]
+    modules = list(job["modules"].values())
+
+    total     = len(modules)
+    done      = sum(1 for m in modules if m["status"] == "done")
+    failed    = sum(1 for m in modules if m["status"] == "failed")
+    all_done  = (done + failed) == total
+
+    return {
+        "job_id":   job_id,
+        "status":   job["status"],
+        "all_done": all_done,
+        "summary": {
+            "total":        total,
+            "done":         done,
+            "failed":       failed,
+            "pending":      sum(1 for m in modules if m["status"] == "pending"),
+            "generating":   sum(1 for m in modules if m["status"] == "generating"),
+            "progress_pct": int((done + failed) / total * 100) if total > 0 else 0
+        },
+        "modules": modules   # includes video_url for completed modules
+    }
+
+
+@router.delete("/job/{job_id}")
+async def cleanup_job(job_id: str):
+    """Optional: Lovable can call this after saving all URLs to free memory."""
+    if job_id in JOBS:
+        del JOBS[job_id]
+    return {"deleted": job_id}
