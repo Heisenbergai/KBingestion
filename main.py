@@ -9,6 +9,7 @@ from voiceover import router as voiceover_router
 from slides import router as slides_router
 from video import router as video_router
 from bg_videos import router as bg_videos_router
+from presentation import router as presentation_router
 
 app = FastAPI(title="Knowledge OS API", version="1.0.0")
 
@@ -29,6 +30,7 @@ app.include_router(voiceover_router)
 app.include_router(slides_router)
 app.include_router(video_router)
 app.include_router(bg_videos_router)
+app.include_router(presentation_router)
 
 @app.get("/health")
 def health_check():
