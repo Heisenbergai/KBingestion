@@ -138,9 +138,10 @@ Formatting rules - make answers easy to scan and digest:
         ]))
 
         return {
-            "answer":  answer,
-            "sources": sources
-        }
+    "answer":  answer,
+    "sources": sources,
+    "chunks":  [chunk["content"] for chunk in chunks]  # raw text for presentation generation
+}
 
     except Exception as e:
         import traceback
