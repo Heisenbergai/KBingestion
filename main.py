@@ -11,6 +11,7 @@ from video import router as video_router
 from bg_videos import router as bg_videos_router
 from presentation import router as presentation_router
 from chatbot import router as chatbot_router
+from admin import router as admin_router
 
 app = FastAPI(title="Knowledge OS API", version="1.0.0")
 
@@ -33,6 +34,7 @@ app.include_router(video_router)
 app.include_router(bg_videos_router)
 app.include_router(presentation_router)
 app.include_router(chatbot_router)
+app.include_router(admin_router)
 
 @app.get("/health")
 def health_check():
