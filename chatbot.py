@@ -20,10 +20,10 @@ voyage = voyageai.Client(api_key=os.getenv("VOYAGE_API_KEY"))
 groq   = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 
-# ── Bot config shape ───────────────────────────────────────────────────────────
 class BotConfig(BaseModel):
     id:                str
     name:              str
+    workspace_id:      str           # ← REQUIRED — isolates search to this workspace
     system_prompt:     Optional[str] = ""
     greeting_message:  Optional[str] = "Hi! How can I help you today?"
     primary_color:     Optional[str] = "#1E2761"
@@ -33,7 +33,6 @@ class BotConfig(BaseModel):
     allowed_domains:   Optional[list[str]] = []
 
 
-# ── Request shapes ─────────────────────────────────────────────────────────────
 class WidgetQueryRequest(BaseModel):
     question:        str
     session_id:      str
@@ -49,31 +48,30 @@ class InternalQueryRequest(BaseModel):
     conversation_id: Optional[str] = None
 
 
-# ── Core RAG + conversational query ───────────────────────────────────────────
 def run_rag_query(question: str, bot: BotConfig) -> tuple[str, list[str]]:
     """
-    Runs RAG search. If relevant chunks found, answers from them.
-    If no relevant chunks, the bot still responds naturally and in character
-    — it never gives a cold mechanical fallback.
+    Searches ONLY document chunks belonging to the bot's workspace.
+    workspace_id in bot_config is the single source of truth for isolation.
     """
+    if not bot.workspace_id:
+        raise HTTPException(
+            status_code=400,
+            detail="workspace_id is required in bot_config. Data isolation cannot be guaranteed without it."
+        )
 
     bot_name      = bot.name or "Assistant"
     custom_prompt = (bot.system_prompt or "").strip()
 
-    # ── Build the system prompt ────────────────────────────────────────────────
-    # The custom prompt from the admin IS the bot's personality and instructions.
-    # We always append grounding rules, but the bot's character comes first.
     if custom_prompt:
         base_personality = custom_prompt
     else:
         base_personality = (
             f"You are {bot_name}, a friendly and knowledgeable AI assistant. "
             f"You help users by answering their questions clearly and warmly. "
-            f"You are professional yet approachable. "
-            f"You keep responses concise and useful."
+            f"You are professional yet approachable."
         )
 
-    # ── Try to find relevant document chunks ──────────────────────────────────
+    # Search ONLY this workspace's chunks
     chunks = []
     context_block = ""
 
@@ -81,15 +79,17 @@ def run_rag_query(question: str, bot: BotConfig) -> tuple[str, list[str]]:
         embed_result = voyage.embed([question], model="voyage-3", input_type="query")
         question_embedding = embed_result.embeddings[0]
 
-        search_result = supabase.rpc("match_chunks", {
-            "query_embedding":  question_embedding,
-            "match_count":      8,
-            "filter_asset_id":  None
+        # Use workspace-scoped RPC function
+        search_result = supabase.rpc("match_chunks_workspace", {
+            "query_embedding":     question_embedding,
+            "match_count":         8,
+            "filter_asset_id":     None,
+            "filter_workspace_id": bot.workspace_id,  # ← workspace isolation
         }).execute()
 
         all_chunks = search_result.data or []
 
-        # Filter to linked folder documents if specified
+        # Additionally filter by linked folder if specified
         if bot.linked_folder_ids and all_chunks:
             chunks = [
                 c for c in all_chunks
@@ -106,38 +106,36 @@ def run_rag_query(question: str, bot: BotConfig) -> tuple[str, list[str]]:
                 context_parts.append(f"[{file_name}]\n{chunk['content']}")
             context_block = "\n\n---\n\n".join(context_parts)
 
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"[chatbot] RAG search error (continuing without context): {str(e)}")
+        print(f"[chatbot] RAG search error: {str(e)}")
 
-    # ── Build final system content ─────────────────────────────────────────────
     if context_block:
-        # Documents found — answer from them, stay in character
         system_content = f"""{base_personality}
 
-You have access to the following company knowledge base documents to help answer questions.
+You have access to the following company knowledge base documents.
 Prioritise information from these documents when relevant.
 If the answer is clearly in the documents, use it.
-If it's a general/conversational question not needing the documents, just answer naturally.
-Never say you "cannot find information" if the question is conversational — just answer it.
+If it is a general conversational question, answer naturally.
+Never say you cannot find information if the question is conversational.
 
 Documents:
 {context_block}"""
     else:
-        # No documents found — stay in character, be helpful, never be mechanical
         system_content = f"""{base_personality}
 
-No specific documents are available for this query right now.
-Respond naturally and helpfully based on your role and instructions above.
-For greetings, small talk, and general questions — respond warmly and in character.
-For specific company/product questions you don't have data for — politely let the user know
-you'll need to check, and suggest they contact the relevant team if urgent.
+No specific documents match this query right now.
+Respond naturally and helpfully based on your role.
+For greetings and general questions respond warmly and in character.
+For specific company questions you don't have data for, politely let the user know
+and suggest they contact the relevant team if urgent.
 Never give a cold or robotic response."""
 
-    # ── Generate response ──────────────────────────────────────────────────────
     response = groq.chat.completions.create(
         model="llama-3.1-8b-instant",
         max_tokens=600,
-        temperature=0.5,   # slightly higher than 0.3 for more natural conversation
+        temperature=0.5,
         messages=[
             {"role": "system", "content": system_content},
             {"role": "user",   "content": question}
@@ -155,7 +153,6 @@ Never give a cold or robotic response."""
     return answer, sources
 
 
-# ── Domain check ───────────────────────────────────────────────────────────────
 def verify_domain(bot: BotConfig, request: Request):
     allowed = bot.allowed_domains or []
     if not allowed:
@@ -164,13 +161,8 @@ def verify_domain(bot: BotConfig, request: Request):
     referer = request.headers.get("referer", "")
     source  = origin or referer
     if not any(domain in source for domain in allowed):
-        raise HTTPException(
-            status_code=403,
-            detail="Domain not allowed. Add your domain in bot settings."
-        )
+        raise HTTPException(status_code=403, detail="Domain not allowed.")
 
-
-# ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @router.post("/widget-query")
 async def widget_query(request: Request, body: WidgetQueryRequest):
