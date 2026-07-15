@@ -28,6 +28,15 @@ class BotConfig(BaseModel):
     greeting_message:  Optional[str] = "Hi! How can I help you today?"
     primary_color:     Optional[str] = "#1E2761"
     avatar_url:        Optional[str] = None
+    # IMPORTANT: these must be document_id / asset_id values, NOT folder IDs.
+    # Railway has no access to Lovable's knowledge_folders table (see
+    # 02_infrastructure.md — Railway cannot query the Lovable-managed DB),
+    # so it cannot resolve "which documents live in folder X" itself.
+    # Lovable MUST resolve the bot's linked folders to their contained
+    # document/asset IDs before calling /internal-query or /widget-query.
+    # If this list contains raw folder UUIDs instead, the filter below will
+    # never match anything and the bot will silently lose access to its
+    # knowledge base — see the fallback + warning log in run_rag_query().
     linked_folder_ids: Optional[list[str]] = []
     public_token:      Optional[str] = None
     allowed_domains:   Optional[list[str]] = []
@@ -89,13 +98,33 @@ def run_rag_query(question: str, bot: BotConfig) -> tuple[str, list[str]]:
 
         all_chunks = search_result.data or []
 
-        # Additionally filter by linked folder if specified
+        # Additionally filter by linked folder if specified.
+        # See the comment on BotConfig.linked_folder_ids — this only works
+        # if Lovable resolved folder IDs to document/asset IDs first.
         if bot.linked_folder_ids and all_chunks:
-            chunks = [
+            filtered = [
                 c for c in all_chunks
                 if c.get("document_id") in bot.linked_folder_ids
                 or c.get("asset_id") in bot.linked_folder_ids
             ]
+            if filtered:
+                chunks = filtered
+            else:
+                # Defensive fallback: the filter matched nothing, which almost
+                # always means linked_folder_ids contains folder UUIDs rather
+                # than resolved document/asset IDs. Fail SAFE (use all
+                # workspace chunks) rather than silently blinding the bot —
+                # but log loudly so this is easy to spot in Railway logs.
+                print(
+                    f"[chatbot] WARNING: bot '{bot.name}' (id={bot.id}) has "
+                    f"linked_folder_ids={bot.linked_folder_ids} but none of "
+                    f"the {len(all_chunks)} matched chunks belong to those IDs. "
+                    f"Falling back to unfiltered workspace search. "
+                    f"This usually means Lovable sent folder IDs instead of "
+                    f"resolved document/asset IDs — check the bot's folder "
+                    f"scoping logic in Lovable."
+                )
+                chunks = all_chunks
         else:
             chunks = all_chunks
 

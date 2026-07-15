@@ -1,19 +1,46 @@
 (function () {
   'use strict';
 
-  // ── Config from the page ────────────────────────────────────────────────────
-  const cfg    = window.HireflowBot || {};
-  const botId  = cfg.botId;
-  const token  = cfg.token;
-  const API    = 'https://kbingestion-production.up.railway.app';
+  // ── Config from the embedding page ──────────────────────────────────────────
+  // Lovable generates this snippet PER BOT with all fields inlined at creation
+  // time — e.g.:
+  //
+  //   window.HireflowBot = {
+  //     botId: "...", token: "...", workspaceId: "...",
+  //     name: "HR Assistant", greetingMessage: "Hi! How can I help?",
+  //     primaryColor: "#1E2761", avatarUrl: "https://...",
+  //     systemPrompt: "...", linkedFolderIds: [], allowedDomains: []
+  //   };
+  //
+  // Railway is stateless and cannot look up bot config from Lovable's DB by
+  // botId alone — so the widget never fetches config at runtime. Everything
+  // it needs is baked into the snippet Lovable generates.
+  const cfg = window.HireflowBot || {};
+  const API = 'https://kbingestion-production.up.railway.app';
 
-  if (!botId || !token) {
-    console.warn('[HireflowBot] Missing botId or token.');
+  if (!cfg.botId || !cfg.token || !cfg.workspaceId) {
+    console.error('[HireflowBot] Missing botId, token, or workspaceId in window.HireflowBot config. Widget cannot start.');
     return;
   }
 
+  // Builds the bot_config object exactly as chatbot.py's BotConfig expects it
+  function buildBotConfig() {
+    return {
+      id:                cfg.botId,
+      name:              cfg.name || 'Assistant',
+      workspace_id:      cfg.workspaceId,
+      system_prompt:     cfg.systemPrompt || '',
+      greeting_message:  cfg.greetingMessage || 'Hi! How can I help you today?',
+      primary_color:     cfg.primaryColor || '#1E2761',
+      avatar_url:        cfg.avatarUrl || null,
+      linked_folder_ids: cfg.linkedFolderIds || [],
+      public_token:      cfg.token,
+      allowed_domains:   cfg.allowedDomains || [],
+    };
+  }
+
   // ── Session ID (persisted in localStorage per visitor) ──────────────────────
-  const SESSION_KEY = `hf_session_${botId}`;
+  const SESSION_KEY = `hf_session_${cfg.botId}`;
   let sessionId = localStorage.getItem(SESSION_KEY);
   if (!sessionId) {
     sessionId = crypto.randomUUID ? crypto.randomUUID()
@@ -22,20 +49,6 @@
   }
 
   let conversationId = null;
-  let botConfig      = {};
-
-  // ── Load bot config ─────────────────────────────────────────────────────────
-  async function loadConfig() {
-    try {
-      const res = await fetch(`${API}/widget-config/${botId}?token=${token}`);
-      if (!res.ok) return;
-      botConfig = await res.json();
-      applyBranding();
-      showGreeting();
-    } catch (e) {
-      console.warn('[HireflowBot] Could not load config:', e);
-    }
-  }
 
   // ── Inject CSS ───────────────────────────────────────────────────────────────
   function injectStyles(primaryColor) {
@@ -123,14 +136,12 @@
   }
 
   // ── Build DOM ────────────────────────────────────────────────────────────────
-  function buildUI() {
-    // Bubble
+  function buildUI(botConfig) {
     const bubble = document.createElement('button');
     bubble.id = 'hf-bubble';
     bubble.innerHTML = `<svg viewBox="0 0 24 24"><path d="M12 2C6.477 2 2 6.477 2 12c0 1.89.525 3.66 1.438 5.168L2 22l4.832-1.438A9.96 9.96 0 0012 22c5.523 0 10-4.477 10-10S17.523 2 12 2z"/></svg>`;
     document.body.appendChild(bubble);
 
-    // Window
     const win = document.createElement('div');
     win.id = 'hf-window';
     win.innerHTML = `
@@ -140,7 +151,7 @@
           <svg viewBox="0 0 24 24" style="width:20px;height:20px;fill:#fff"><path d="M12 2C6.477 2 2 6.477 2 12c0 1.89.525 3.66 1.438 5.168L2 22l4.832-1.438A9.96 9.96 0 0012 22c5.523 0 10-4.477 10-10S17.523 2 12 2z"/></svg>
         </div>
         <div id="hf-header-text">
-          <strong id="hf-bot-name">Assistant</strong>
+          <strong id="hf-bot-name">${botConfig.name}</strong>
           <span>Online</span>
         </div>
       </div>
@@ -155,43 +166,24 @@
     `;
     document.body.appendChild(win);
 
-    // Toggle
+    const avatarEl = document.getElementById('hf-avatar');
+    const placeholder = document.getElementById('hf-avatar-placeholder');
+    if (botConfig.avatar_url) {
+      avatarEl.src = botConfig.avatar_url;
+      avatarEl.style.display = 'block';
+      placeholder.style.display = 'none';
+    }
+
     bubble.addEventListener('click', () => win.classList.toggle('open'));
-
-    // Send on click
-    document.getElementById('hf-send').addEventListener('click', sendMessage);
-
-    // Send on Enter
+    document.getElementById('hf-send').addEventListener('click', () => sendMessage(botConfig));
     document.getElementById('hf-input').addEventListener('keydown', e => {
-      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(botConfig); }
     });
   }
 
-  // ── Apply branding from config ───────────────────────────────────────────────
-  function applyBranding() {
-    const nameEl   = document.getElementById('hf-bot-name');
-    const avatarEl = document.getElementById('hf-avatar');
-    const placeholder = document.getElementById('hf-avatar-placeholder');
-
-    if (nameEl && botConfig.name)      nameEl.textContent  = botConfig.name;
-
-    if (avatarEl && botConfig.avatar_url) {
-      avatarEl.src              = botConfig.avatar_url;
-      avatarEl.style.display    = 'block';
-      if (placeholder) placeholder.style.display = 'none';
-    }
-  }
-
-  // ── Show greeting message ────────────────────────────────────────────────────
-  function showGreeting() {
-    const greeting = botConfig.greeting_message || 'Hi! How can I help you today?';
-    appendMessage('bot', greeting);
-  }
-
-  // ── Append message to chat ───────────────────────────────────────────────────
   function appendMessage(role, text, sources) {
-    const msgs  = document.getElementById('hf-messages');
-    const div   = document.createElement('div');
+    const msgs = document.getElementById('hf-messages');
+    const div = document.createElement('div');
     div.className = `hf-msg ${role}`;
     div.textContent = text;
     msgs.appendChild(div);
@@ -207,15 +199,14 @@
     return div;
   }
 
-  // ── Send message ─────────────────────────────────────────────────────────────
-  async function sendMessage() {
-    const input    = document.getElementById('hf-input');
+  // ── Send message — matches WidgetQueryRequest in chatbot.py exactly ─────────
+  async function sendMessage(botConfig) {
+    const input = document.getElementById('hf-input');
     const question = input.value.trim();
     if (!question) return;
 
-    input.value   = '';
+    input.value = '';
     input.disabled = true;
-
     appendMessage('user', question);
 
     const typing = appendMessage('bot', 'Thinking...', null);
@@ -226,19 +217,19 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          bot_id:          botId,
-          token:           token,
           question:        question,
           session_id:      sessionId,
+          bot_config:      botConfig,        // ← full object, not bot_id
           conversation_id: conversationId,
+          token:           cfg.token,
         }),
       });
 
       const data = await res.json();
-
       typing.remove();
 
       if (!res.ok) {
+        console.error('[HireflowBot] widget-query error:', data);
         appendMessage('bot', data.detail || 'Sorry, something went wrong. Please try again.');
       } else {
         appendMessage('bot', data.answer, data.sources);
@@ -254,10 +245,11 @@
   }
 
   // ── Init ─────────────────────────────────────────────────────────────────────
-  async function init() {
-    injectStyles(cfg.primaryColor);
-    buildUI();
-    await loadConfig();
+  function init() {
+    const botConfig = buildBotConfig();
+    injectStyles(botConfig.primary_color);
+    buildUI(botConfig);
+    appendMessage('bot', botConfig.greeting_message);
   }
 
   if (document.readyState === 'loading') {
