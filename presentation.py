@@ -40,6 +40,9 @@ r2 = boto3.client(
 )
 
 # ── Color palettes ─────────────────────────────────────────────────────────────
+# Render functions only read the five color keys, so adding a palette here
+# automatically works in PPTX export. PALETTE_META below is what the
+# template gallery in Lovable displays.
 PALETTES = {
     "midnight_executive": {
         "primary":   "1E2761",
@@ -61,6 +64,85 @@ PALETTES = {
         "accent":    "212121",
         "dark_text": "1C1C1C",
         "light_text": "FAFAFA",
+    },
+    "emerald_boardroom": {
+        "primary":   "065F46",
+        "secondary": "D1FAE5",
+        "accent":    "FFFFFF",
+        "dark_text": "022C22",
+        "light_text": "ECFDF5",
+    },
+    "burgundy_classic": {
+        "primary":   "6D1A36",
+        "secondary": "F5D9E0",
+        "accent":    "FFFFFF",
+        "dark_text": "3B0A1E",
+        "light_text": "FDF2F5",
+    },
+    "graphite_gold": {
+        "primary":   "1F1F1F",
+        "secondary": "EFE7D3",
+        "accent":    "C9A227",
+        "dark_text": "141414",
+        "light_text": "FAF8F2",
+    },
+}
+
+PALETTE_META = {
+    "midnight_executive": {"name": "Midnight Executive", "description": "Deep navy with soft blue accents — boardroom classic"},
+    "ocean_gradient":     {"name": "Ocean Gradient",     "description": "Layered ocean blues — calm and confident"},
+    "charcoal_minimal":   {"name": "Charcoal Minimal",   "description": "Understated greys — lets the content speak"},
+    "emerald_boardroom":  {"name": "Emerald Boardroom",  "description": "Rich green with mint accents — growth and finance"},
+    "burgundy_classic":   {"name": "Burgundy Classic",   "description": "Wine tones — premium and traditional"},
+    "graphite_gold":      {"name": "Graphite Gold",      "description": "Near-black with gold accents — high-end keynote"},
+}
+
+# What the frontend needs to build "Add slide" menus and inline edit forms.
+# "fields" lists the editable properties per type; "default" is a ready
+# blank slide the frontend can insert directly (set index client-side).
+SLIDE_TYPE_DEFS = {
+    "title": {
+        "name": "Title",
+        "fields": ["title", "subtitle"],
+        "default": {"type": "title", "title": "Presentation Title", "subtitle": "Subtitle goes here"},
+    },
+    "executive_summary": {
+        "name": "Executive Summary",
+        "fields": ["headline", "bullets"],
+        "default": {"type": "executive_summary", "headline": "Key message of the deck in one sentence",
+                    "bullets": ["First supporting point", "Second supporting point", "Third supporting point"]},
+    },
+    "content": {
+        "name": "Content",
+        "fields": ["headline", "bullets", "image_query"],
+        "default": {"type": "content", "headline": "Section headline",
+                    "bullets": ["Point one", "Point two", "Point three"]},
+    },
+    "two_column": {
+        "name": "Two Column",
+        "fields": ["headline", "left", "right", "image_query"],
+        "default": {"type": "two_column", "headline": "Comparison or context headline",
+                    "left": ["Point one", "Point two"], "right": "Supporting paragraph text."},
+    },
+    "big_stat": {
+        "name": "Big Stats",
+        "fields": ["headline", "stats"],
+        "default": {"type": "big_stat", "headline": "The numbers that matter",
+                    "stats": [{"value": "0%", "label": "Metric", "sublabel": ""},
+                              {"value": "0", "label": "Metric", "sublabel": ""}]},
+    },
+    "chart": {
+        "name": "Chart",
+        "fields": ["headline", "chart", "insight"],
+        "default": {"type": "chart", "headline": "Data insight headline",
+                    "chart": {"type": "column", "labels": ["A", "B", "C"],
+                              "datasets": [{"label": "Series 1", "data": [10, 20, 30]}]},
+                    "insight": "One-sentence insight about this data."},
+    },
+    "closing": {
+        "name": "Closing",
+        "fields": ["title", "sources"],
+        "default": {"type": "closing", "title": "Thank You", "sources": []},
     },
 }
 
@@ -496,6 +578,38 @@ SLIDE_RENDERERS = {
 
 # Slide types that can meaningfully use a supporting photo
 IMAGE_CAPABLE_TYPES = {"content", "bullets", "two_column"}
+
+
+# ── Endpoint 0: Template registry for the gallery + editor ─────────────────────
+@router.get("/presentation-templates")
+async def presentation_templates():
+    """
+    Everything Lovable needs to render the template gallery and the
+    slide editor without hardcoding design knowledge:
+    - templates: palette id, display name, description, and the five colors
+      (hex WITH # prefix, ready for CSS) so the gallery can draw real
+      mini-previews of each template.
+    - slide_types: editable fields + a default blank slide per type, for
+      the "Add slide" menu and inline editing forms.
+    - tones: valid options for the tone dropdown.
+    """
+    return {
+        "templates": [
+            {
+                "id": pid,
+                "name": PALETTE_META.get(pid, {}).get("name", pid),
+                "description": PALETTE_META.get(pid, {}).get("description", ""),
+                "colors": {k: f"#{v}" for k, v in palette.items()},
+            }
+            for pid, palette in PALETTES.items()
+        ],
+        "slide_types": [
+            {"id": tid, "name": t["name"], "fields": t["fields"], "default": t["default"]}
+            for tid, t in SLIDE_TYPE_DEFS.items()
+        ],
+        "tones": ["professional", "persuasive", "inspiring", "analytical", "simple"],
+        "default_template": "midnight_executive",
+    }
 
 
 # ── Endpoint 1: Generate slide JSON ───────────────────────────────────────────
