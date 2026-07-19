@@ -1,212 +1,294 @@
 import os
 import re
 import io
-import fitz                          # PyMuPDF — reads PDFs
-import docx                          # python-docx — reads Word files
-import pptx                          # python-pptx — reads PowerPoint files
+import csv
+import fitz
+import docx
+import pptx
+import openpyxl
 import voyageai
+import time
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from typing import Optional
 from supabase import create_client
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from dotenv import load_dotenv
+import httpx
 
 load_dotenv()
 
 router = APIRouter()
 
-# ── Clients ────────────────────────────────────────────────────────────────────
-# We use the SERVICE KEY here (not anon key) because:
-# - We need to download files from private Supabase storage
-# - We need to write to the document_chunks table
-# This key must NEVER be sent to the frontend — it lives only here on the server.
 supabase = create_client(
     os.getenv("SUPABASE_URL"),
     os.getenv("SUPABASE_SERVICE_KEY")
 )
-
 voyage = voyageai.Client(api_key=os.getenv("VOYAGE_API_KEY"))
 
 
-# ── Request shape ──────────────────────────────────────────────────────────────
-# This is what Lovable sends to /ingest after a file is uploaded.
-# All of these values are already available in Lovable right after the insert.
 class IngestRequest(BaseModel):
-    document_id: str   # id from asset_documents table
-    storage_path: str  # e.g. "abc123/uuid-filename.pdf"
-    mime_type: str     # e.g. "application/pdf"
-    file_name: str     # e.g. "Employee Handbook.pdf"
-    asset_id: str      # which asset/folder this belongs to
+    document_id:  str
+    signed_url:   str
+    mime_type:    str
+    file_name:    str
+    asset_id:     str
+    workspace_id: str   # ← REQUIRED — isolates chunks per company
 
 
-# ── Step 1: Download ───────────────────────────────────────────────────────────
-def download_file(storage_path: str) -> bytes:
+def download_file(signed_url: str) -> bytes:
+    response = httpx.get(signed_url, timeout=60)
+    response.raise_for_status()
+    return response.content
+
+
+def extract_xlsx(file_bytes: bytes) -> str:
     """
-    Downloads the raw file bytes from Supabase Storage.
-    storage_path is the path inside the 'asset-documents' bucket.
-    Returns the file as raw bytes in memory.
+    Reads every sheet in the workbook and converts each row to a readable
+    'Column: Value' line, grouped by sheet. Skips fully empty rows.
+    This is intentionally verbose/readable rather than compact CSV, since
+    the text goes straight into embedding + LLM context — readable text
+    embeds and retrieves better than raw comma-separated values.
     """
-    file_bytes = supabase.storage.from_("knowledge-files").download(storage_path)
-    return file_bytes
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
+    sections = []
+
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            continue
+
+        # First non-empty row is treated as the header
+        header = None
+        data_rows = []
+        for row in rows:
+            if all(cell is None for cell in row):
+                continue
+            if header is None:
+                header = [str(c).strip() if c is not None else f"col{i}" for i, c in enumerate(row)]
+                continue
+            data_rows.append(row)
+
+        if header is None or not data_rows:
+            continue
+
+        lines = [f"[Sheet: {sheet_name}]"]
+        for row in data_rows:
+            pairs = []
+            for col_name, value in zip(header, row):
+                if value is None or str(value).strip() == "":
+                    continue
+                pairs.append(f"{col_name}: {value}")
+            if pairs:
+                lines.append(" | ".join(pairs))
+
+        if len(lines) > 1:
+            sections.append("\n".join(lines))
+
+    wb.close()
+    return "\n\n".join(sections)
 
 
-# ── Step 2: Extract text ───────────────────────────────────────────────────────
+def extract_csv(file_bytes: bytes) -> str:
+    """Same 'Column: Value' readable format as extract_xlsx, for consistency."""
+    text = file_bytes.decode("utf-8", errors="ignore")
+    reader = csv.reader(io.StringIO(text))
+    rows = list(reader)
+    if not rows:
+        return ""
+
+    header = rows[0]
+    lines = []
+    for row in rows[1:]:
+        pairs = []
+        for col_name, value in zip(header, row):
+            if value is None or str(value).strip() == "":
+                continue
+            pairs.append(f"{col_name}: {value}")
+        if pairs:
+            lines.append(" | ".join(pairs))
+
+    return "\n".join(lines)
+
+
 def extract_text(file_bytes: bytes, mime_type: str, file_name: str) -> str:
-    """
-    Converts raw file bytes into a plain text string.
-    Uses different tools depending on the file type.
-    """
+    name_lower = file_name.lower()
 
-    # PDF → PyMuPDF reads each page and pulls all text
-    if mime_type == "application/pdf" or file_name.lower().endswith(".pdf"):
+    if mime_type == "application/pdf" or name_lower.endswith(".pdf"):
         doc = fitz.open(stream=file_bytes, filetype="pdf")
-        pages = []
-        for page in doc:
-            pages.append(page.get_text())
-        return "\n".join(pages)
+        return "\n".join(page.get_text() for page in doc)
 
-    # Word document → python-docx reads each paragraph
     elif mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" \
-         or file_name.lower().endswith(".docx"):
+         or name_lower.endswith(".docx"):
         document = docx.Document(io.BytesIO(file_bytes))
-        paragraphs = [p.text for p in document.paragraphs if p.text.strip()]
-        return "\n".join(paragraphs)
+        return "\n".join(p.text for p in document.paragraphs if p.text.strip())
 
-    # PowerPoint → python-pptx reads slide by slide, shape by shape
     elif mime_type == "application/vnd.openxmlformats-officedocument.presentationml.presentation" \
-         or file_name.lower().endswith(".pptx"):
+         or name_lower.endswith(".pptx"):
         presentation = pptx.Presentation(io.BytesIO(file_bytes))
         slides_text = []
-        for slide_num, slide in enumerate(presentation.slides, 1):
+        for i, slide in enumerate(presentation.slides, 1):
             slide_content = []
             for shape in slide.shapes:
                 if hasattr(shape, "text") and shape.text.strip():
                     slide_content.append(shape.text)
             if slide_content:
-                slides_text.append(f"[Slide {slide_num}]\n" + "\n".join(slide_content))
+                slides_text.append(f"[Slide {i}]\n" + "\n".join(slide_content))
         return "\n\n".join(slides_text)
 
-    # Plain text → decode directly
-    elif mime_type == "text/plain" or file_name.lower().endswith(".txt"):
+    elif mime_type in (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-excel",
+    ) or name_lower.endswith((".xlsx", ".xlsm")):
+        return extract_xlsx(file_bytes)
+
+    elif mime_type == "text/csv" or name_lower.endswith(".csv"):
+        return extract_csv(file_bytes)
+
+    elif mime_type == "text/plain" or name_lower.endswith(".txt"):
         return file_bytes.decode("utf-8", errors="ignore")
 
     else:
-        raise ValueError(f"Unsupported file type: {mime_type}. Supported: PDF, DOCX, PPTX, TXT")
+        raise ValueError(
+            f"Unsupported file type: {mime_type or 'unknown'} ({file_name}). "
+            f"Supported: PDF, DOCX, PPTX, XLSX, CSV, TXT."
+        )
 
 
-# ── Step 3: Clean text ─────────────────────────────────────────────────────────
 def clean_text(text: str) -> str:
-    """
-    Removes noise from extracted text.
-    - Collapses 3+ newlines into 2 (removes excessive blank lines)
-    - Collapses multiple spaces into one
-    - Replaces tabs with spaces
-    - Strips whitespace from start and end
-    """
-    text = re.sub(r'\n{3,}', '\n\n', text)   # max 2 newlines in a row
-    text = re.sub(r' {2,}', ' ', text)        # max 1 space in a row
-    text = re.sub(r'\t', ' ', text)           # no tabs
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r' {2,}', ' ', text)
+    text = re.sub(r'\t', ' ', text)
     return text.strip()
 
 
-# ── Step 4: Chunk text ─────────────────────────────────────────────────────────
 def chunk_text(text: str) -> list[str]:
-    """
-    Splits the cleaned text into smaller meaningful pieces.
-
-    chunk_size=1000    → each chunk is ~200 words
-    chunk_overlap=100  → chunks share 20 words at boundaries
-                         so context is never lost at the edge of a chunk
-
-    Separators priority: paragraph break → line break → sentence → word → character
-    This means it tries to cut at natural points first.
-    """
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
         chunk_overlap=100,
         separators=["\n\n", "\n", ". ", " ", ""]
     )
-    chunks = splitter.create_documents([text])
-    return [chunk.page_content for chunk in chunks]
+    return [c.page_content for c in splitter.create_documents([text])]
 
 
-# ── Step 5: Embed chunks ───────────────────────────────────────────────────────
 def embed_chunks(chunks: list[str]) -> list[list[float]]:
     """
-    Sends each chunk to Voyage AI and gets back a vector (list of 1024 numbers).
-    Voyage AI allows max 128 chunks per API call, so we batch.
-
-    input_type="document" tells Voyage this is content being stored, not a query.
-    This matters — Voyage uses different internal settings for documents vs queries.
+    Embeds in batches of 50 with retry/backoff on rate limits.
+    For large documents (many chunks), this can take a while — that's
+    expected and handled by retries, not a bug. If a batch permanently
+    fails after retries, the whole request fails loudly (500) rather than
+    silently dropping chunks, so partial/corrupt documents never get stored.
     """
     all_embeddings = []
-    batch_size = 128
+    batch_size = 50
+    delay = 1.0
 
-    for i in range(0, len(chunks), batch_size):
+    i = 0
+    while i < len(chunks):
         batch = chunks[i:i + batch_size]
-        result = voyage.embed(batch, model="voyage-3", input_type="document")
-        all_embeddings.extend(result.embeddings)
-
+        max_retries = 4
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                result = voyage.embed(batch, model="voyage-3", input_type="document")
+                all_embeddings.extend(result.embeddings)
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+                if "RateLimitError" in str(type(e)) or "rate limit" in str(e).lower():
+                    wait = (attempt + 1) * 5
+                    print(f"[ingest] Rate limit on batch {i}-{i+batch_size}, retrying in {wait}s (attempt {attempt+1}/{max_retries})")
+                    time.sleep(wait)
+                else:
+                    print(f"[ingest] Embedding error on batch {i}-{i+batch_size}: {e}")
+                    raise
+        if last_error is not None:
+            # Exhausted retries on a rate limit — fail loudly, don't silently truncate
+            raise RuntimeError(
+                f"Voyage AI embedding failed after {max_retries} retries on batch "
+                f"{i}-{i+batch_size}: {last_error}"
+            )
+        i += batch_size
+        if i < len(chunks):
+            time.sleep(delay)
     return all_embeddings
 
 
-# ── Main route ─────────────────────────────────────────────────────────────────
 @router.post("/ingest")
 async def ingest_document(request: IngestRequest):
     """
-    Called by Lovable after a file is uploaded.
-    Runs the full pipeline: download → extract → clean → chunk → embed → store.
+    Processes a document and stores chunks in the vector DB.
+    workspace_id is stored with every chunk — this is what isolates
+    each company's data from all other companies.
+
+    Supported formats: PDF, DOCX, PPTX, XLSX, CSV, TXT.
     """
     try:
-        # 1. Download raw file from Supabase Storage
-        file_bytes = download_file(request.storage_path)
+        if not request.workspace_id:
+            raise HTTPException(
+                status_code=400,
+                detail="workspace_id is required. Every document must belong to a workspace."
+            )
 
-        # 2. Convert file to plain text
-        raw_text = extract_text(file_bytes, request.mime_type, request.file_name)
+        file_bytes = download_file(request.signed_url)
+        raw_text   = extract_text(file_bytes, request.mime_type, request.file_name)
 
         if not raw_text.strip():
-            raise HTTPException(status_code=400, detail="No text could be extracted from this file.")
+            raise HTTPException(
+                status_code=400,
+                detail="No text could be extracted. The file may be empty, image-only "
+                       "(scanned PDF with no OCR layer), or a spreadsheet with no data rows."
+            )
 
-        # 3. Remove noise
         cleaned = clean_text(raw_text)
-
-        # 4. Cut into chunks
-        chunks = chunk_text(cleaned)
+        chunks  = chunk_text(cleaned)
 
         if not chunks:
             raise HTTPException(status_code=400, detail="Document too short to process.")
 
-        # 5. Convert chunks to vectors
+        print(f"[ingest] {request.file_name}: {len(chunks)} chunks to embed")
         embeddings = embed_chunks(chunks)
 
-        # 6. Build rows to insert into Supabase
         rows = [
             {
-                "document_id": request.document_id,
-                "asset_id":    request.asset_id,
-                "content":     chunks[i],
-                "embedding":   embeddings[i],
-                "chunk_index": i,
+                "document_id":  request.document_id,
+                "asset_id":     request.asset_id,
+                "workspace_id": request.workspace_id,  # ← stored with every chunk
+                "content":      chunks[i],
+                "embedding":    embeddings[i],
+                "chunk_index":  i,
                 "metadata": {
                     "file_name":    request.file_name,
                     "chunk_index":  i,
-                    "total_chunks": len(chunks)
+                    "total_chunks": len(chunks),
+                    "workspace_id": request.workspace_id,
                 }
             }
             for i in range(len(chunks))
         ]
 
-        # 7. Store all rows in Supabase
-        supabase.table("document_chunks").insert(rows).execute()
+        # Insert in batches of 200 rows — avoids one giant request for very
+        # large documents (e.g. big spreadsheets can produce thousands of chunks)
+        INSERT_BATCH = 200
+        for i in range(0, len(rows), INSERT_BATCH):
+            supabase.table("document_chunks").insert(rows[i:i + INSERT_BATCH]).execute()
 
         return {
             "success":        True,
             "document_id":    request.document_id,
+            "workspace_id":   request.workspace_id,
             "chunks_created": len(chunks),
-            "message":        f"Successfully processed '{request.file_name}' into {len(chunks)} chunks."
+            "message":        f"Processed '{request.file_name}' into {len(chunks)} chunks."
         }
 
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
+        import traceback
+        print(f"INGEST ERROR: {str(e)}")
+        print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
