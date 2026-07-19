@@ -1,6 +1,7 @@
 import os
 import json
 import ai
+import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional
@@ -12,12 +13,14 @@ load_dotenv()
 
 router = APIRouter()
 
+UNSPLASH_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "")
+
 
 # ── Template definitions ─────────────────────────────────────────────────────────
 # Templates differ in WHAT content to prioritize and HOW quizzes/exercises are
-# framed — not in the underlying slot structure. Every course gets the same
-# shape: modules with reading, quiz, exercise, plus placeholder video slots
-# for Phase 2/3.
+# framed — not in the underlying block structure. Every course gets the same
+# interactive blocks: intro, expandable sections, key takeaways, flashcards,
+# scenario quiz, exercise.
 TEMPLATES = {
     "sales_training": {
         "name": "Sales Training",
@@ -71,27 +74,245 @@ async def list_templates():
     }
 
 
+# ── Unsplash (per-module hero image) ────────────────────────────────────────────
+
+def fetch_unsplash_image_url(query: str) -> Optional[dict]:
+    """
+    Returns {url, thumb, credit, credit_link} for one landscape photo, or
+    None on any failure. Unlike presentation.py (which embeds bytes into
+    PPTX), trainings render in the browser — so we return URLs and the
+    attribution Unsplash requires.
+    """
+    if not UNSPLASH_KEY:
+        return None
+    try:
+        res = httpx.get(
+            "https://api.unsplash.com/search/photos",
+            params={"query": query, "per_page": 1, "orientation": "landscape"},
+            headers={"Authorization": f"Client-ID {UNSPLASH_KEY}"},
+            timeout=10,
+        )
+        results = res.json().get("results") or []
+        if not results:
+            return None
+        photo = results[0]
+
+        # Unsplash API guidelines: register a download event when a photo
+        # is used. Best-effort — never fail course generation over this.
+        download_location = photo.get("links", {}).get("download_location")
+        if download_location:
+            try:
+                httpx.get(download_location,
+                          headers={"Authorization": f"Client-ID {UNSPLASH_KEY}"},
+                          timeout=10)
+            except Exception:
+                pass
+
+        return {
+            "url":         photo["urls"]["regular"],
+            "thumb":       photo["urls"]["small"],
+            "credit":      photo.get("user", {}).get("name", "Unsplash"),
+            "credit_link": photo.get("user", {}).get("links", {}).get("html", "https://unsplash.com"),
+        }
+    except Exception as e:
+        print(f"[course] Unsplash fetch failed for '{query}': {e}")
+        return None
+
+
 # ── Request shape ──────────────────────────────────────────────────────────────
 class GenerateCourseRequest(BaseModel):
     template_id:        str             # one of the keys in TEMPLATES
     document_ids:       list[str]       # which processed documents to build the course from
     course_title:       Optional[str] = None  # optional hint for the course title
     additional_context: Optional[str] = None  # free-text guidance from the course creator
-                                                # (focus areas, tone, specific topics to emphasize)
+    enable_images:      Optional[bool] = True # fetch an Unsplash hero image per module
+
+
+# ── Generation phase 1: course outline ─────────────────────────────────────────
+
+def generate_outline(template: dict, combined_content: str,
+                     course_title: Optional[str], additional_context: Optional[str]) -> dict:
+    system_prompt = f"""You are an instructional designer planning a "{template['name']}" \
+course from company documents. This template focuses on: {template['focus']}.
+
+Plan a course with 3-5 modules. Respond ONLY with valid JSON, no markdown fences:
+{{
+  "title": "overall course title",
+  "description": "1-2 sentence overview",
+  "modules": [
+    {{
+      "title": "module title",
+      "objectives": ["2-3 learning objectives"],
+      "focus": "one sentence: exactly what this module should cover from the source documents",
+      "image_query": "2-4 word Unsplash stock-photo search phrase that visually fits this module (e.g. 'sales handshake meeting')",
+      "source_documents": ["file names this module draws from"]
+    }}
+  ]
+}}"""
+    title_hint   = f"\nThe course should be titled around: {course_title}" if course_title else ""
+    context_hint = f"\nAdditional guidance from the course creator: {additional_context}" if additional_context else ""
+
+    user_prompt = f"""Source content:
+
+{combined_content}
+{title_hint}{context_hint}
+
+Plan the {template['name']} course. Respond only with the JSON object."""
+
+    return ai.chat_json(
+        messages=[{"role": "user", "content": user_prompt}],
+        system=system_prompt,
+        max_tokens=1500,
+        temperature=0.4,
+    )
+
+
+# ── Generation phase 2: one module's interactive content ───────────────────────
+
+def generate_module_content(template: dict, combined_content: str, module_plan: dict) -> dict:
+    system_prompt = f"""You are writing one module of a "{template['name']}" course.
+Write clear, engaging learning content based ONLY on the source documents.
+
+Respond ONLY with valid JSON in this exact structure, no markdown fences:
+{{
+  "intro": "1-2 sentence hook introducing this module",
+  "sections": [
+    {{
+      "title": "short section heading",
+      "content": "150-250 words of clear teaching content for this section, written directly to the learner. Use short paragraphs. You may use simple markdown (**bold**, bullet lists starting with '- ')."
+    }}
+  ],
+  "key_takeaways": ["3-5 one-sentence takeaways"],
+  "flashcards": [
+    {{ "front": "term, concept, or question", "back": "concise answer or definition (max 30 words)" }}
+  ],
+  "quiz": [
+    {{
+      "question": "the question text",
+      "options": ["exactly 4 answer choices"],
+      "correct_answer": "the correct option, must match one option exactly",
+      "explanation": "one sentence explaining why this is correct"
+    }}
+  ],
+  "exercise": {{ "type": "short label for the exercise type", "prompt": "the exercise instructions" }},
+  "duration_minutes": 8
+}}
+
+Rules:
+- 2-4 sections, 4-6 flashcards, exactly 3 quiz questions.
+- Quiz style: {template['quiz_style']}
+- Exercise style: {template['exercise_style']}
+- duration_minutes: realistic estimate to complete this module."""
+
+    user_prompt = f"""Source documents:
+
+{combined_content}
+
+Write the module "{module_plan.get('title', '')}".
+Module focus: {module_plan.get('focus', '')}
+Learning objectives: {json.dumps(module_plan.get('objectives', []))}
+
+Respond only with the JSON object."""
+
+    return ai.chat_json(
+        messages=[{"role": "user", "content": user_prompt}],
+        system=system_prompt,
+        max_tokens=2500,
+        temperature=0.4,
+    )
+
+
+def _normalize_quiz(quiz: list) -> list:
+    """
+    Guarantees every question has exactly 4 options and a correct_answer
+    that matches one of them — the frontend compares strings directly,
+    so a mismatch would make a question unanswerable.
+    """
+    normalized = []
+    for q in quiz or []:
+        options = [str(o) for o in (q.get("options") or [])][:4]
+        if len(options) < 2:
+            continue
+        correct = str(q.get("correct_answer", ""))
+        if correct not in options:
+            match = next((o for o in options if o.strip().lower() == correct.strip().lower()), None)
+            if match:
+                correct = match
+            else:
+                print(f"[course] quiz correct_answer mismatch, defaulting to first option: {correct!r}")
+                correct = options[0]
+        normalized.append({
+            "question":       str(q.get("question", "")),
+            "options":        options,
+            "correct_answer": correct,
+            "explanation":    str(q.get("explanation", "")),
+        })
+    return normalized
+
+
+def _module_to_blocks(content: dict) -> list[dict]:
+    """
+    Assembles the module's content into an ordered list of typed blocks.
+    Lovable renders blocks generically by type, so new block types can be
+    added later without breaking saved courses:
+      intro | expand (checkable) | key_takeaways | flashcards | quiz | exercise
+    """
+    blocks = []
+    if content.get("intro"):
+        blocks.append({"type": "intro", "text": str(content["intro"])})
+
+    for section in content.get("sections") or []:
+        blocks.append({
+            "type":      "expand",
+            "title":     str(section.get("title", "Section")),
+            "content":   str(section.get("content", "")),
+            "checkable": True,   # learner ticks it off after reading → progress
+        })
+
+    takeaways = [str(t) for t in (content.get("key_takeaways") or [])]
+    if takeaways:
+        blocks.append({"type": "key_takeaways", "points": takeaways})
+
+    cards = [
+        {"front": str(c.get("front", "")), "back": str(c.get("back", ""))}
+        for c in (content.get("flashcards") or [])
+        if c.get("front") and c.get("back")
+    ]
+    if cards:
+        blocks.append({"type": "flashcards", "cards": cards})
+
+    quiz = _normalize_quiz(content.get("quiz"))
+    if quiz:
+        blocks.append({"type": "quiz", "questions": quiz})
+
+    exercise = content.get("exercise") or {}
+    if exercise.get("prompt"):
+        blocks.append({
+            "type":          "exercise",
+            "exercise_type": str(exercise.get("type", "Practice")),
+            "prompt":        str(exercise.get("prompt", "")),
+        })
+
+    return blocks
 
 
 # ── Main route ─────────────────────────────────────────────────────────────────
+# NOTE: plain `def`, not `async def` — this endpoint makes several sequential
+# blocking LLM calls (30-60s total for a 5-module course). FastAPI runs sync
+# endpoints in a threadpool, so the event loop stays free for other requests.
 @router.post("/generate-course")
-async def generate_course(request: GenerateCourseRequest):
+def generate_course(request: GenerateCourseRequest):
     """
-    Takes a template + a list of already-ingested document_ids, reads ALL
-    their content, and asks the AI to assemble a complete course following
-    that template: modules with reading material, a quiz, and a practical
-    exercise — framed according to the template's focus area.
+    Interactive course generation (format: interactive_v2).
 
-    video_clip and explainer_video are always included as null placeholders.
-    These are Phase 2/3 features (meeting clips, AI explainer videos) — the
-    schema is stable now so the frontend can be built against it today.
+    Two-phase generation for reliability: one outline call plans the
+    modules, then each module's content is generated in its own call —
+    small JSON responses parse far more reliably than one giant one, and
+    a single module's retry doesn't throw away the whole course.
+
+    Each module = ordered interactive blocks (expand sections with check
+    marks, key takeaways, flashcards, scenario quiz, exercise) plus an
+    Unsplash hero image. No audio/video — that was the old V1 format.
     """
     try:
         if request.template_id not in TEMPLATES:
@@ -106,88 +327,56 @@ async def generate_course(request: GenerateCourseRequest):
 
         template = TEMPLATES[request.template_id]
 
-        # Fetch and combine all document content (shared helper)
         combined_content = fetch_combined_content(request.document_ids)
 
-        # Safety check — full course generation produces more output than
-        # /generate-path (reading + quiz + exercise per module), so we
-        # reserve a larger output budget, which means a smaller safe input size.
-        OUTPUT_BUDGET = 3000
+        OUTPUT_BUDGET = 2500  # largest single-call output (one module)
         check_tpm_budget(combined_content, OUTPUT_BUDGET)
 
-        # ── Build the template-aware system prompt ──────────────────────────────
-        system_prompt = f"""You are an instructional designer creating a "{template['name']}" \
-course from company documents.
-
-This template focuses on: {template['focus']}.
-
-Design a complete course with 3-6 modules. For EACH module, generate:
-
-1. "title" - module title
-2. "objectives" - array of 2-3 learning objectives
-3. "reading" - object with:
-   - "summary": one sentence overview
-   - "content": a concise reading passage (100-200 words) covering this module's topic, written clearly for learners
-4. "quiz" - array of exactly 3 multiple-choice questions, each with:
-   - "question": the question text
-   - "options": array of exactly 4 answer choices
-   - "correct_answer": the correct option (must match one of the options exactly)
-   - "explanation": one sentence explaining why this is correct
-   Quiz style: {template['quiz_style']}
-5. "exercise" - object with:
-   - "type": short label for the exercise type
-   - "prompt": the exercise instructions. Style: {template['exercise_style']}
-6. "duration_minutes" - realistic estimate for this module
-7. "source_documents" - array of file names this module draws from
-
-Respond ONLY with valid JSON in this exact structure, nothing else, no markdown fences:
-{{
-  "title": "string - overall course title",
-  "description": "string - 1-2 sentence overview",
-  "modules": [
-    {{
-      "title": "...",
-      "objectives": ["...", "..."],
-      "reading": {{ "summary": "...", "content": "..." }},
-      "quiz": [
-        {{ "question": "...", "options": ["...","...","...","..."], "correct_answer": "...", "explanation": "..." }}
-      ],
-      "exercise": {{ "type": "...", "prompt": "..." }},
-      "duration_minutes": number,
-      "source_documents": ["..."]
-    }}
-  ],
-  "total_duration_minutes": number
-}}"""
-
-        title_hint = f"\nThe course should be titled around: {request.course_title}" if request.course_title else ""
-        context_hint = f"\nAdditional context from the course creator (use this to guide focus, tone, and emphasis): {request.additional_context}" if request.additional_context else ""
-
-        user_prompt = f"""Source content:
-
-{combined_content}
-{title_hint}{context_hint}
-
-Design a {template['name']} course following the structure described in the system prompt. \
-Respond only with the JSON object."""
-
-        course_data = ai.chat_json(
-            messages=[{"role": "user", "content": user_prompt}],
-            system=system_prompt,
-            max_tokens=OUTPUT_BUDGET,
-            temperature=0.4,
+        # Phase 1 — outline
+        outline = generate_outline(
+            template, combined_content, request.course_title, request.additional_context
         )
+        module_plans = (outline.get("modules") or [])[:5]
+        if not module_plans:
+            raise HTTPException(status_code=500, detail="AI returned no modules in the course outline.")
 
-        # ── Add template id + placeholder video slots ───────────────────────────
-        # Always present, always null for now — Phase 2/3 will populate these
-        # without requiring any schema change on the frontend.
-        course_data["template"] = request.template_id
+        # Phase 2 — module content + image, one module at a time
+        modules = []
+        total_minutes = 0
+        for plan in module_plans:
+            content = generate_module_content(template, combined_content, plan)
+            blocks  = _module_to_blocks(content)
 
-        for module in course_data.get("modules", []):
-            module["video_clip"] = None       # Phase 2 — meeting/training clips
-            module["explainer_video"] = None  # Phase 3 — AI-generated explainer
+            duration = content.get("duration_minutes") or 8
+            try:
+                duration = max(1, int(duration))
+            except (TypeError, ValueError):
+                duration = 8
+            total_minutes += duration
 
-        return course_data
+            image = None
+            if request.enable_images:
+                image = fetch_unsplash_image_url(plan.get("image_query") or plan.get("title", ""))
+
+            modules.append({
+                "title":            str(plan.get("title", "Module")),
+                "objectives":       [str(o) for o in (plan.get("objectives") or [])],
+                "image":            image,   # {url, thumb, credit, credit_link} or null
+                "duration_minutes": duration,
+                "source_documents": [str(s) for s in (plan.get("source_documents") or [])],
+                "blocks":           blocks,
+                # how many blocks count toward the module's progress bar
+                "progress_total":   sum(1 for b in blocks if b.get("checkable")) + 1,  # +1 for the quiz
+            })
+
+        return {
+            "format":                 "interactive_v2",
+            "template":               request.template_id,
+            "title":                  str(outline.get("title", request.course_title or "Training Course")),
+            "description":            str(outline.get("description", "")),
+            "modules":                modules,
+            "total_duration_minutes": total_minutes,
+        }
 
     except HTTPException:
         raise
