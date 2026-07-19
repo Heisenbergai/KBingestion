@@ -50,6 +50,15 @@
 
   let conversationId = null;
 
+  // Conversation memory — sent with every request so the bot can handle
+  // follow-up questions. Kept client-side only (page session), last 10
+  // messages, matching MAX_HISTORY_MESSAGES in chatbot.py.
+  const history = [];
+  function remember(role, content) {
+    history.push({ role: role, content: content });
+    if (history.length > 20) history.splice(0, history.length - 20);
+  }
+
   // ── Inject CSS ───────────────────────────────────────────────────────────────
   function injectStyles(primaryColor) {
     const color = primaryColor || '#1E2761';
@@ -209,6 +218,11 @@
     input.disabled = true;
     appendMessage('user', question);
 
+    // Snapshot history BEFORE adding the current question — the backend
+    // appends the question itself, so including it here would duplicate it.
+    const pastHistory = history.slice(-10);
+    remember('user', question);
+
     const typing = appendMessage('bot', 'Thinking...', null);
     typing.classList.add('typing');
 
@@ -217,11 +231,12 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          question:        question,
-          session_id:      sessionId,
-          bot_config:      botConfig,        // ← full object, not bot_id
-          conversation_id: conversationId,
-          token:           cfg.token,
+          question:             question,
+          session_id:           sessionId,
+          bot_config:           botConfig,        // ← full object, not bot_id
+          conversation_id:      conversationId,
+          token:                cfg.token,
+          conversation_history: pastHistory,
         }),
       });
 
@@ -233,6 +248,7 @@
         appendMessage('bot', data.detail || 'Sorry, something went wrong. Please try again.');
       } else {
         appendMessage('bot', data.answer, data.sources);
+        remember('assistant', data.answer);
         conversationId = data.conversation_id;
       }
     } catch (e) {

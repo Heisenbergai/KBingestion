@@ -11,13 +11,14 @@ supabase = create_client(
     os.getenv("SUPABASE_SERVICE_KEY")
 )
 
-# ── Groq free-tier rate limit constants ─────────────────────────────────────────
-# llama-3.1-8b-instant: 6,000 TPM, 128K context window.
-# gemma2-9b-it (which had a higher 15K TPM allowance) was decommissioned by
-# Groq in favor of llama-3.1-8b-instant — so this is the model to use.
-# At this size, TPM (6,000) is the binding constraint, not context (128K).
-TPM_LIMIT      = 6000
-CONTEXT_WINDOW = 128000
+# ── Model input budget constants ────────────────────────────────────────────────
+# AWS Bedrock / Amazon Nova Lite: 300K token context window, and on-demand
+# Bedrock has no tight per-minute token cap like Groq's free tier did —
+# throttling is handled by boto3 retries in ai.py. So the context window is
+# the only binding constraint now. We still cap input well below 300K to
+# keep responses fast and cheap (cost scales with input tokens).
+TPM_LIMIT      = 200000   # effective per-request input cap (cost/speed guard)
+CONTEXT_WINDOW = 300000
 SAFETY_MARGIN  = 500   # buffer for system prompt + formatting overhead
 
 
@@ -67,30 +68,23 @@ def fetch_combined_content(document_ids: list[str]) -> str:
 
 def check_tpm_budget(combined_content: str, output_budget: int) -> int:
     """
-    Raises HTTPException if the request would exceed either:
-    - Groq's free-tier TPM limit (15,000 tokens/minute for gemma2-9b-it), or
-    - The model's context window (8,192 tokens for gemma2-9b-it)
-
-    Whichever is smaller wins. Returns the approximate input token count
-    if within budget.
+    Raises HTTPException if the request's input would exceed the safe
+    per-request budget (see constants above). Returns the approximate
+    input token count if within budget.
 
     Rough estimate: ~4 characters per token.
     """
     approx_input_tokens = len(combined_content) // 4
     approx_total = approx_input_tokens + output_budget + SAFETY_MARGIN
 
-    max_by_tpm     = TPM_LIMIT - output_budget - SAFETY_MARGIN
-    max_by_context = CONTEXT_WINDOW - output_budget - SAFETY_MARGIN
-    max_safe_input_tokens = min(max_by_tpm, max_by_context)
+    max_safe_input_tokens = min(TPM_LIMIT, CONTEXT_WINDOW) - output_budget - SAFETY_MARGIN
 
     if approx_total > TPM_LIMIT or approx_total > CONTEXT_WINDOW:
-        binding_constraint = "context window (8K)" if max_by_context < max_by_tpm else "rate limit (15K TPM)"
         raise HTTPException(
             status_code=400,
             detail=(
-                f"This document set (~{approx_input_tokens} tokens) exceeds the current "
-                f"free-tier limit of ~{max_safe_input_tokens} tokens per request "
-                f"(binding constraint: {binding_constraint}). "
+                f"This document set (~{approx_input_tokens} tokens) exceeds the "
+                f"per-request limit of ~{max_safe_input_tokens} tokens. "
                 f"Select fewer or shorter documents, or split into multiple courses/paths."
             )
         )

@@ -1,6 +1,5 @@
 import os
-import voyageai
-from groq import Groq
+import ai
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional
@@ -15,8 +14,6 @@ supabase = create_client(
     os.getenv("SUPABASE_URL"),
     os.getenv("SUPABASE_SERVICE_KEY")
 )
-voyage = voyageai.Client(api_key=os.getenv("VOYAGE_API_KEY"))
-groq   = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 
 class QueryRequest(BaseModel):
@@ -39,13 +36,8 @@ async def query_documents(request: QueryRequest):
                 detail="workspace_id is required for all queries."
             )
 
-        # Embed the question
-        result = voyage.embed(
-            [request.question],
-            model="voyage-3",
-            input_type="query"
-        )
-        question_embedding = result.embeddings[0]
+        # Embed the question (Bedrock Titan v2 via ai.py)
+        question_embedding = ai.embed_texts([request.question])[0]
 
         # Search ONLY this workspace's chunks
         search_result = supabase.rpc("match_chunks_workspace", {
@@ -70,10 +62,7 @@ async def query_documents(request: QueryRequest):
             context_parts.append(f"[Source: {file_name}]\n{chunk['content']}")
         context = "\n\n---\n\n".join(context_parts)
 
-        response = groq.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            max_tokens=1000,
-            system="""You are a helpful assistant for employees at this company.
+        system_prompt = """You are a helpful assistant for employees at this company.
 Answer questions based ONLY on the document excerpts provided below.
 
 Content rules:
@@ -86,14 +75,17 @@ Formatting rules:
 1. Match format to content — steps use numbered lists, options use bullets, comparisons use tables.
 2. Use **bold** for key terms and numbers.
 3. Start longer answers with a one-sentence summary.
-4. Write in markdown. Keep paragraphs short.""",
+4. Write in markdown. Keep paragraphs short."""
+
+        answer = ai.chat(
             messages=[{
                 "role": "user",
                 "content": f"Document excerpts:\n{context}\n\nQuestion: {request.question}\n\nAnswer:"
-            }]
+            }],
+            system=system_prompt,
+            max_tokens=1000,
+            temperature=0.2,
         )
-
-        answer  = response.content[0].text if hasattr(response, 'content') else response.choices[0].message.content
         sources = list(set([
             chunk["metadata"].get("file_name", "Unknown")
             for chunk in chunks

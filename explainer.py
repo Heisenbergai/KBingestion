@@ -1,15 +1,13 @@
 import os
 import json
+import ai
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from groq import Groq
 from dotenv import load_dotenv
 
 load_dotenv()
 
 router = APIRouter()
-
-groq = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 
 # ── Request shape ──────────────────────────────────────────────────────────────
@@ -66,19 +64,12 @@ Content:
 
 Create the slide deck as described."""
 
-        response = groq.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            response_format={"type": "json_object"},
+        slide_data = ai.chat_json(
+            messages=[{"role": "user", "content": user_prompt}],
+            system=system_prompt,
             max_tokens=1200,
-            temperature=0.4
+            temperature=0.4,
         )
-
-        raw_output = response.choices[0].message.content
-        slide_data = json.loads(raw_output)
 
         return slide_data
 

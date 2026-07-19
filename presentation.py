@@ -8,7 +8,7 @@ from botocore.config import Config
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional
-from groq import Groq
+import ai
 from PIL import Image as PILImage
 from pptx import Presentation
 from pptx.util import Inches, Pt, Emu
@@ -23,7 +23,6 @@ load_dotenv()
 
 router = APIRouter()
 
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 UNSPLASH_KEY     = os.getenv("UNSPLASH_ACCESS_KEY", "")
 R2_ACCOUNT_ID    = os.getenv("R2_ACCOUNT_ID")
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
@@ -611,19 +610,12 @@ Source content from company documents:
 Generate {request.num_slides} slides. Use only information from the source content above.
 Respond with JSON only."""
 
-        response = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            response_format={"type": "json_object"},
+        data = ai.chat_json(
+            messages=[{"role": "user", "content": user_prompt}],
+            system=system_prompt,
             max_tokens=3000,
-            temperature=0.3
+            temperature=0.3,
         )
-
-        raw = response.choices[0].message.content
-        data = json.loads(raw)
 
         return {
             "title":  data.get("title", request.query),
@@ -663,19 +655,12 @@ Context: {request.context}
 
 Return the updated slide JSON only."""
 
-        response = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            response_format={"type": "json_object"},
+        updated_slide = ai.chat_json(
+            messages=[{"role": "user", "content": user_prompt}],
+            system=system_prompt,
             max_tokens=1000,
-            temperature=0.4
+            temperature=0.4,
         )
-
-        raw = response.choices[0].message.content
-        updated_slide = json.loads(raw)
         return updated_slide
 
     except json.JSONDecodeError as e:

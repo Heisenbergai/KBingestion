@@ -1,9 +1,9 @@
 import os
 import json
+import ai
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional
-from groq import Groq
 from dotenv import load_dotenv
 
 from shared import fetch_combined_content, check_tpm_budget
@@ -11,8 +11,6 @@ from shared import fetch_combined_content, check_tpm_budget
 load_dotenv()
 
 router = APIRouter()
-
-groq = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 
 # ── Request shape ──────────────────────────────────────────────────────────────
@@ -39,7 +37,7 @@ async def generate_path(request: GeneratePathRequest):
         # Fetch and combine all document content (shared helper)
         combined_content = fetch_combined_content(request.document_ids)
 
-        # Safety check against Groq's free-tier rate limit
+        # Safety check against the model's context window
         OUTPUT_BUDGET = 2000
         check_tpm_budget(combined_content, OUTPUT_BUDGET)
 
@@ -78,19 +76,12 @@ Respond ONLY with valid JSON in this exact structure, nothing else, no markdown 
 
 Respond only with the JSON object described in the system prompt."""
 
-        response = groq.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            response_format={"type": "json_object"},
+        path_data = ai.chat_json(
+            messages=[{"role": "user", "content": user_prompt}],
+            system=system_prompt,
             max_tokens=OUTPUT_BUDGET,
-            temperature=0.3
+            temperature=0.3,
         )
-
-        raw_output = response.choices[0].message.content
-        path_data = json.loads(raw_output)
 
         return path_data
 

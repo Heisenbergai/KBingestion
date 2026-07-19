@@ -1,9 +1,9 @@
 import os
 import json
+import ai
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional
-from groq import Groq
 from dotenv import load_dotenv
 
 from shared import fetch_combined_content, check_tpm_budget
@@ -11,8 +11,6 @@ from shared import fetch_combined_content, check_tpm_budget
 load_dotenv()
 
 router = APIRouter()
-
-groq = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 
 # ── Template definitions ─────────────────────────────────────────────────────────
@@ -173,19 +171,12 @@ Respond ONLY with valid JSON in this exact structure, nothing else, no markdown 
 Design a {template['name']} course following the structure described in the system prompt. \
 Respond only with the JSON object."""
 
-        response = groq.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            response_format={"type": "json_object"},
+        course_data = ai.chat_json(
+            messages=[{"role": "user", "content": user_prompt}],
+            system=system_prompt,
             max_tokens=OUTPUT_BUDGET,
-            temperature=0.4
+            temperature=0.4,
         )
-
-        raw_output = response.choices[0].message.content
-        course_data = json.loads(raw_output)
 
         # ── Add template id + placeholder video slots ───────────────────────────
         # Always present, always null for now — Phase 2/3 will populate these
