@@ -158,6 +158,10 @@ class BrandingSettings(BaseModel):
     primary_color: Optional[str]  = None   # override hex e.g. "1E2761"
     company_name:  Optional[str]  = ""
     font:          Optional[str]  = "Calibri"   # safe font
+    # Full custom palette (from /parse-template brand extraction). When set,
+    # it replaces the named palette entirely. Keys: primary, secondary,
+    # accent, dark_text, light_text — hex values with or without '#'.
+    custom_colors: Optional[dict] = None
 
 
 class GeneratePresentationRequest(BaseModel):
@@ -797,6 +801,14 @@ async def export_pptx(request: ExportPptxRequest):
 
         palette = PALETTES.get(branding.palette or "midnight_executive",
                                PALETTES["midnight_executive"]).copy()
+
+        # Extracted company brand colors take precedence over named palettes.
+        # Fill any missing keys from the base palette so a partial dict is safe.
+        if branding.custom_colors:
+            for key in palette:
+                value = branding.custom_colors.get(key)
+                if value:
+                    palette[key] = str(value).lstrip("#")
 
         if branding.primary_color:
             palette["primary"] = branding.primary_color.lstrip("#")
