@@ -149,13 +149,25 @@ def run_rag_query(
         search_text = _retrieval_text(question.strip(), history_messages)
         question_embedding = ai.embed_texts([search_text])[0]
 
-        # Use workspace-scoped RPC function
-        search_result = supabase.rpc("match_chunks_workspace", {
-            "query_embedding":     question_embedding,
-            "match_count":         8,
-            "filter_asset_id":     None,
-            "filter_workspace_id": bot.workspace_id,  # ← workspace isolation
-        }).execute()
+        # Hybrid retrieval (vector + keyword + tier/freshness boosts), still
+        # workspace-isolated. Falls back to the old vector-only RPC if the
+        # hybrid function isn't deployed yet.
+        try:
+            search_result = supabase.rpc("match_chunks_hybrid", {
+                "query_text":          search_text,
+                "query_embedding":     question_embedding,
+                "match_count":         8,
+                "filter_workspace_id": bot.workspace_id,  # ← workspace isolation
+                "filter_asset_id":     None,
+            }).execute()
+        except Exception as e:
+            print(f"[chatbot] hybrid search unavailable, vector-only fallback: {e}")
+            search_result = supabase.rpc("match_chunks_workspace", {
+                "query_embedding":     question_embedding,
+                "match_count":         8,
+                "filter_asset_id":     None,
+                "filter_workspace_id": bot.workspace_id,
+            }).execute()
 
         all_chunks = search_result.data or []
 
@@ -203,7 +215,10 @@ def run_rag_query(
             context_parts = []
             for chunk in chunks:
                 file_name = chunk.get("metadata", {}).get("file_name", "Company document")
-                context_parts.append(f"[{file_name}]\n{chunk['content']}")
+                stype = chunk.get("source_type") or chunk.get("metadata", {}).get("source_type") or "document"
+                label = {"document": "official document", "meeting": "meeting note",
+                         "slack": "team chat", "note": "curated note"}.get(stype, stype)
+                context_parts.append(f"[{file_name} — {label}]\n{chunk['content']}")
             context_block = "\n\n---\n\n".join(context_parts)
 
     except HTTPException:

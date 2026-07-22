@@ -58,6 +58,12 @@ class IngestRequest(BaseModel):
     file_name:    str
     asset_id:     str
     workspace_id: str   # ← REQUIRED — isolates chunks per company
+    # Provenance for hybrid-search tiering (Phase 1 / company brain).
+    # Uploaded documents are tier-1 (most trusted); connectors override
+    # these (e.g. Slack notes = tier 3, meeting notes = tier 2).
+    source_type:  Optional[str] = "document"
+    source_tier:  Optional[int] = 1
+    doc_date:     Optional[str] = None   # ISO date; falls back to created_at
     # wait=True runs synchronously and returns the full result in one response
     # (old behavior — fine for small files and curl testing). Default is
     # background mode: returns a job_id immediately so large documents can't
@@ -382,11 +388,15 @@ def process_document(request: IngestRequest, job: Optional[dict] = None) -> dict
             "content":      chunks[i],
             "embedding":    embeddings[i],
             "chunk_index":  i,
+            "source_type":  request.source_type or "document",
+            "source_tier":  request.source_tier or 1,
+            "doc_date":     request.doc_date,      # None → DB default (created_at)
             "metadata": {
                 "file_name":    request.file_name,
                 "chunk_index":  i,
                 "total_chunks": len(chunks),
                 "workspace_id": request.workspace_id,
+                "source_type":  request.source_type or "document",
             }
         }
         for i in range(len(chunks))
