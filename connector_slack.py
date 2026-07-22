@@ -113,8 +113,9 @@ async def slack_install(workspace_id: str, user_id: str = ""):
 @router.get("/slack/oauth/callback")
 async def slack_callback(code: str = "", state: str = "", error: str = ""):
     """Exchanges the OAuth code for a token and stores the connection."""
+    from integrations import oauth_complete_html
     if error:
-        return RedirectResponse(f"{APP_REDIRECT_URL}?slack=error")
+        return oauth_complete_html("slack", "error")
     st = _decode_state(state)
     workspace_id, user_id = st["w"], st.get("u", "")
 
@@ -125,7 +126,7 @@ async def slack_callback(code: str = "", state: str = "", error: str = ""):
     data = res.json()
     if not data.get("ok"):
         print(f"[slack] oauth exchange failed: {data.get('error')}")
-        return RedirectResponse(f"{APP_REDIRECT_URL}?slack=error")
+        return oauth_complete_html("slack", "error")
 
     team = data.get("team", {})
     access_token = data.get("access_token")  # bot token (xoxb-…)
@@ -147,7 +148,7 @@ async def slack_callback(code: str = "", state: str = "", error: str = ""):
         row, on_conflict="workspace_id,provider,external_team_id"
     ).execute()
 
-    return RedirectResponse(f"{APP_REDIRECT_URL}?slack=connected")
+    return oauth_complete_html("slack", "connected")
 
 
 def _get_conn_token(connection_id: str) -> tuple[dict, str]:
