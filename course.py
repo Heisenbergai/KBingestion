@@ -135,13 +135,20 @@ def generate_outline(template: dict, combined_content: str,
     system_prompt = f"""You are an instructional designer planning a "{template['name']}" \
 course from company documents. This template focuses on: {template['focus']}.
 
-Plan a course with 3-5 modules. Respond ONLY with valid JSON, no markdown fences:
+Plan a course with 3-5 modules that build on each other — foundational
+concepts first, applied/advanced material later, so the sequence forms a
+real learning path. Respond ONLY with valid JSON, no markdown fences:
 {{
   "title": "overall course title",
   "description": "1-2 sentence overview",
+  "outcomes": ["3-5 concrete 'what you'll be able to do' statements, each starting with a verb"],
+  "audience": "one short phrase: who this course is for",
+  "level": "Beginner | Intermediate | Advanced",
+  "image_query": "2-4 word Unsplash search phrase for the course cover image",
   "modules": [
     {{
       "title": "module title",
+      "summary": "one sentence: what the learner gets from this module (shown in the syllabus)",
       "objectives": ["2-3 learning objectives"],
       "focus": "one sentence: exactly what this module should cover from the source documents",
       "image_query": "2-4 word Unsplash stock-photo search phrase that visually fits this module (e.g. 'sales handshake meeting')",
@@ -360,6 +367,7 @@ def generate_course(request: GenerateCourseRequest):
 
             modules.append({
                 "title":            str(plan.get("title", "Module")),
+                "summary":          str(plan.get("summary", "")),
                 "objectives":       [str(o) for o in (plan.get("objectives") or [])],
                 "image":            image,   # {url, thumb, credit, credit_link} or null
                 "duration_minutes": duration,
@@ -369,11 +377,28 @@ def generate_course(request: GenerateCourseRequest):
                 "progress_total":   sum(1 for b in blocks if b.get("checkable")) + 1,  # +1 for the quiz
             })
 
+        # Course-level cover image (falls back to first module's image query)
+        cover = None
+        if request.enable_images:
+            cover = fetch_unsplash_image_url(
+                outline.get("image_query")
+                or module_plans[0].get("image_query")
+                or str(outline.get("title", "business training"))
+            )
+
+        level = str(outline.get("level", "Beginner"))
+        if level not in ("Beginner", "Intermediate", "Advanced"):
+            level = "Beginner"
+
         return {
             "format":                 "interactive_v2",
             "template":               request.template_id,
             "title":                  str(outline.get("title", request.course_title or "Training Course")),
             "description":            str(outline.get("description", "")),
+            "outcomes":               [str(o) for o in (outline.get("outcomes") or [])],
+            "audience":               str(outline.get("audience", "")),
+            "level":                  level,
+            "cover_image":            cover,   # {url, thumb, credit, credit_link} or null
             "modules":                modules,
             "total_duration_minutes": total_minutes,
         }
