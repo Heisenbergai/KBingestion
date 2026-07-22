@@ -253,6 +253,74 @@ Use the conversation history to stay consistent with what was already discussed.
     return answer, sources
 
 
+def log_usage_event(bot: BotConfig, source: str, domain: str = None,
+                    user_id: str = None, session_id: str = None):
+    """
+    Records one analytics row per bot query (powers GET /bot-analytics:
+    chats per bot, internal vs external, which domains the widget runs on).
+    Strictly best-effort — analytics must never break a chat.
+    """
+    try:
+        supabase.table("bot_usage_events").insert({
+            "bot_id":       bot.id,
+            "workspace_id": bot.workspace_id,
+            "source":       source,
+            "domain":       (domain or None),
+            "user_id":      user_id,
+            "session_id":   session_id,
+        }).execute()
+    except Exception as e:
+        print(f"[chatbot] usage event logging failed (non-fatal): {e}")
+
+
+@router.get("/bot-analytics")
+async def bot_analytics(workspace_id: str, days: int = 30):
+    """
+    Usage analytics for all bots in a workspace, keyed by bot_id
+    (Lovable joins display names from its own chatbots table):
+    {
+      bots: { "<bot_id>": { total_chats, internal_chats, widget_chats,
+                            domains: {"example.com": n}, last_used } },
+      daily: [ {bot_id, day, chats} ]   # last `days` days, for charts
+    }
+    """
+    try:
+        if not workspace_id:
+            raise HTTPException(status_code=400, detail="workspace_id is required.")
+
+        summary = supabase.rpc("bot_usage_summary",
+                               {"filter_workspace_id": workspace_id}).execute().data or []
+        daily = supabase.rpc("bot_usage_daily",
+                             {"filter_workspace_id": workspace_id, "days": days}).execute().data or []
+
+        bots: dict = {}
+        for row in summary:
+            b = bots.setdefault(row["bot_id"], {
+                "total_chats": 0, "internal_chats": 0, "widget_chats": 0,
+                "domains": {}, "last_used": None,
+            })
+            chats = row["chats"]
+            b["total_chats"] += chats
+            if row["source"] == "widget":
+                b["widget_chats"] += chats
+                if row["domain"]:
+                    b["domains"][row["domain"]] = b["domains"].get(row["domain"], 0) + chats
+            else:
+                b["internal_chats"] += chats
+            if b["last_used"] is None or row["last_used"] > b["last_used"]:
+                b["last_used"] = row["last_used"]
+
+        return {"workspace_id": workspace_id, "bots": bots, "daily": daily}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"BOT-ANALYTICS ERROR: {e}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Analytics failed: {e}")
+
+
 def verify_domain(bot: BotConfig, request: Request):
     allowed = bot.allowed_domains or []
     if not allowed:
@@ -276,6 +344,9 @@ async def widget_query(request: Request, body: WidgetQueryRequest):
             history=body.conversation_history,
             strict_folders=True,   # public bots never fall back outside their scope
         )
+        origin = request.headers.get("origin") or request.headers.get("referer") or ""
+        domain = origin.split("//")[-1].split("/")[0] if origin else None
+        log_usage_event(body.bot_config, "widget", domain=domain, session_id=body.session_id)
         return {
             "answer":          answer,
             "sources":         sources,
@@ -303,6 +374,7 @@ async def internal_query(body: InternalQueryRequest):
             history=body.conversation_history,
             strict_folders=False,  # internal users can see workspace docs anyway
         )
+        log_usage_event(body.bot_config, "internal", user_id=body.user_id)
         return {
             "answer":          answer,
             "sources":         sources,
