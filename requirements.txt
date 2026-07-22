@@ -13,3 +13,4 @@ Pillow==10.4.0
 boto3>=1.34.0
 botocore>=1.34.0
 certifi>=2025.0.0
+cryptography>=42.0.0

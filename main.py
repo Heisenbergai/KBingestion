@@ -13,6 +13,8 @@ from presentation import router as presentation_router
 from templates import router as templates_router
 from visuals import router as visuals_router
 from decks import router as decks_router
+from brain_connectors import router as connectors_router
+from connector_slack import router as slack_router
 from chatbot import router as chatbot_router
 from admin import router as admin_router
 
@@ -39,6 +41,8 @@ app.include_router(presentation_router)
 app.include_router(templates_router)
 app.include_router(visuals_router)
 app.include_router(decks_router)
+app.include_router(connectors_router)
+app.include_router(slack_router)
 app.include_router(chatbot_router)
 app.include_router(admin_router)
 
