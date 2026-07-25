@@ -116,12 +116,22 @@ class GenerateCardRequest(BaseModel):
     chunks:        list[str]
     tone:          Optional[str]  = "professional"
     enable_images: Optional[bool] = True
+    # Layout control (added for Presentation Studio V2). The frontend sends the
+    # layouts its chosen template actually offers; the model picks ONE and
+    # writes blocks that fit it. Position lets it reserve cover/closing.
+    available_layouts: Optional[list[str]] = None
+    template_slant:    Optional[str]       = None
+    position:          Optional[int]       = None   # 0-based index of this card
+    total_cards:       Optional[int]       = None
 
 
 class EditCardRequest(BaseModel):
     card:        dict
     instruction: str
     chunks:      Optional[list[str]] = []
+    # An instruction like "make this a timeline" legitimately changes the
+    # layout, but only to one the chosen template actually offers.
+    available_layouts: Optional[list[str]] = None
 
 
 class ExportDeckRequest(BaseModel):
@@ -131,9 +141,68 @@ class ExportDeckRequest(BaseModel):
     theme:    Optional[str] = "aurora_light"
 
 
+# ── Layout catalogue ────────────────────────────────────────────────────────────
+# A layout is an ARRANGEMENT, not a slide number. The model picks one per card
+# from whatever its template offers, and writes blocks that suit it. Each entry
+# states what the layout is for and what block shape it needs, because the model
+# choosing "stats" without emitting a stats block produces an empty slide.
+
+LAYOUT_SPECS: dict[str, str] = {
+    "cover":         "Opening slide. Just a strong title and at most ONE short text block. No bullets.",
+    "section":       "Divider announcing a new part. Short title, at most one short text block.",
+    "title_content": "The general-purpose slide. Title plus 2-4 blocks of any kind.",
+    "text_image":    "A photo beside the words. MUST include exactly one image block plus text or bullets.",
+    "two_column":    "Two balanced groups side by side. MUST include two bullets blocks.",
+    "stats":         "Dominated by big numbers. MUST include a stats block (2-4 figures).",
+    "timeline":      "A chronological sequence. MUST include a bullets block whose items each begin with a period or date label.",
+    "comparison":    "Two options weighed against each other. MUST include a table (2-3 columns) or two bullets blocks.",
+    "process":       "Ordered steps. MUST include a bullets block whose items are sequential steps.",
+    "chart":         "The chart is the point. MUST include a chart block; keep other blocks to one short insight.",
+    "quote":         "One memorable line. MUST include a quote block and little else.",
+    "closing":       "Final slide: takeaways or next steps. Bullets or a callout work best.",
+}
+
+ALL_LAYOUTS = list(LAYOUT_SPECS.keys())
+
+# Kept so decks saved before layouts existed still render.
+LEGACY_LAYOUTS = {"default": "title_content", "image_right": "text_image"}
+
+
+def _coerce_layout(value, allowed: Optional[list[str]], blocks: list[dict]) -> str:
+    """Validates the model's layout choice against the template, then against
+    what the card actually contains. A 'chart' layout with no chart block is a
+    broken slide, so we fall back rather than trust the label."""
+    allowed_set = [l for l in (allowed or ALL_LAYOUTS) if l in LAYOUT_SPECS] or ["title_content"]
+    layout = LEGACY_LAYOUTS.get(str(value), str(value))
+
+    if layout not in allowed_set:
+        layout = None
+
+    types = {b["type"] for b in blocks}
+    requires = {
+        "chart":      "chart",
+        "stats":      "stats",
+        "quote":      "quote",
+        "text_image": "image",
+    }
+    need = requires.get(layout)
+    if need and need not in types:
+        layout = None                      # claimed a layout it can't fill
+
+    if layout is None:
+        # Derive from content: same precedence the frontend rules use.
+        for cand, btype in (("chart", "chart"), ("stats", "stats"),
+                            ("quote", "quote"), ("text_image", "image")):
+            if btype in types and cand in allowed_set:
+                return cand
+        return "title_content" if "title_content" in allowed_set else allowed_set[0]
+    return layout
+
+
 # ── Normalization ───────────────────────────────────────────────────────────────
 
-def normalize_card(card: dict, enable_images: bool = True) -> dict:
+def normalize_card(card: dict, enable_images: bool = True,
+                   allowed_layouts: Optional[list[str]] = None) -> dict:
     """Coerces an AI-produced card into the strict block schema the
     frontend and exporter rely on. Invalid blocks are dropped, never fatal."""
     blocks = []
@@ -194,11 +263,10 @@ def normalize_card(card: dict, enable_images: bool = True) -> dict:
                 if img:
                     blocks.append({"type": "image", "query": query, **img})
 
-    layout = card.get("layout") if card.get("layout") in ("default", "image_right") else "default"
     return {
         "id":     card.get("id") or f"card_{uuid.uuid4().hex[:8]}",
         "title":  str(card.get("title", "Card")),
-        "layout": layout,
+        "layout": _coerce_layout(card.get("layout"), allowed_layouts, blocks),
         "blocks": blocks,
     }
 
@@ -283,8 +351,35 @@ def generate_card(request: GenerateCardRequest):
             raise HTTPException(status_code=400, detail="chunks cannot be empty.")
         context = "\n\n---\n\n".join(request.chunks[:12])
 
+        # Layouts this template offers, described so the model knows what each
+        # arrangement needs. It chooses one and writes blocks that fill it.
+        allowed = [l for l in (request.available_layouts or ALL_LAYOUTS) if l in LAYOUT_SPECS] \
+                  or ["title_content"]
+        layout_menu = "\n".join(f'- "{l}": {LAYOUT_SPECS[l]}' for l in allowed)
+
+        position_hint = ""
+        if request.position is not None and request.total_cards:
+            if request.position == 0 and "cover" in allowed:
+                position_hint = "\nThis is the FIRST card — prefer the cover layout."
+            elif request.position == request.total_cards - 1 and "closing" in allowed:
+                position_hint = "\nThis is the LAST card — prefer the closing layout."
+            else:
+                position_hint = (f"\nThis is card {request.position + 1} of {request.total_cards} "
+                                 f"— do not use cover or closing.")
+
+        slant = f"\nTemplate style: {request.template_slant}" if request.template_slant else ""
+
         system_prompt = f"""You are writing ONE card of the presentation "{request.deck_title}".
-Tone: {request.tone}. Audience: CEOs and senior managers. Cards are concise — 2 to 4 blocks.
+Tone: {request.tone}. Audience: CEOs and senior managers. Cards are concise — 2 to 4 blocks.{slant}
+
+FIRST choose the layout that best fits what this card has to say, then write blocks that fill it.
+Pick the arrangement the CONTENT calls for, not the one that comes next in a sequence.
+
+Available layouts:
+{layout_menu}{position_hint}
+
+The layout you choose dictates the blocks you MUST emit — a "chart" layout with no chart
+block, or a "stats" layout with no stats block, produces a broken slide.
 
 Available block types (use the best 2-4 for THIS card, vary across the deck):
 - {{"type": "text", "text": "short paragraph, max 60 words"}}
@@ -298,12 +393,13 @@ Available block types (use the best 2-4 for THIS card, vary across the deck):
 
 Rules:
 - Use ONLY facts from the source content; mark estimates "(est.)".
-- Charts/stats only where the source has real numbers.
+- Charts/stats only where the source has real numbers — never invent figures to justify a layout.
 - At most one image block, only if a photo genuinely helps.
-- layout: "image_right" if the card has an image plus text/bullets, else "default".
+- If the content does not suit any specialised layout, use "title_content". That is
+  a good answer, not a failure.
 
 Respond ONLY with valid JSON, no markdown fences:
-{{"title": "card title", "layout": "default", "blocks": [ ... ]}}"""
+{{"title": "card title", "layout": "one of the layouts above", "blocks": [ ... ]}}"""
 
         user_prompt = f"""Card to write: "{request.card.title}"
 This card should show: {request.card.brief}
@@ -320,7 +416,8 @@ Respond only with the JSON object."""
         data["id"] = request.card.id
         if not data.get("title"):
             data["title"] = request.card.title
-        card = normalize_card(data, enable_images=request.enable_images)
+        card = normalize_card(data, enable_images=request.enable_images,
+                              allowed_layouts=allowed)
         if not card["blocks"]:
             card["blocks"] = [{"type": "text", "text": request.card.brief}]
         return card
@@ -339,10 +436,23 @@ def edit_card(request: EditCardRequest):
         context = ""
         if request.chunks:
             context = "\n\nSource content (for factual additions):\n" + "\n---\n".join(request.chunks[:6])
-        system_prompt = """You edit one presentation card based on a user instruction.
-Keep the same JSON structure: {"id", "title", "layout", "blocks": [...]} with the same
+        edit_allowed = [l for l in (request.available_layouts or ALL_LAYOUTS)
+                        if l in LAYOUT_SPECS] or ["title_content"]
+        edit_menu = "\n".join(f'- "{l}": {LAYOUT_SPECS[l]}' for l in edit_allowed)
+
+        system_prompt = f"""You edit one presentation card based on a user instruction.
+Keep the same JSON structure: {{"id", "title", "layout", "blocks": [...]}} with the same
 block type vocabulary already used in the card. Keep the same id. Only change what the
-instruction asks. Respond ONLY with the updated card JSON, no markdown fences."""
+instruction asks.
+
+If the instruction implies a different arrangement ("make this a timeline", "turn these
+into big numbers"), change "layout" to match AND emit the blocks that layout requires.
+Otherwise keep the existing layout.
+
+Layouts available:
+{edit_menu}
+
+Respond ONLY with the updated card JSON, no markdown fences."""
         user_prompt = f"""Current card:
 {json.dumps(request.card, indent=1)}
 
@@ -354,7 +464,9 @@ Return the updated card JSON only."""
             system=system_prompt, max_tokens=1800, temperature=0.4,
         )
         data["id"] = request.card.get("id") or data.get("id")
-        card = normalize_card(data)
+        if not data.get("layout"):
+            data["layout"] = request.card.get("layout")
+        card = normalize_card(data, allowed_layouts=edit_allowed)
         if not card["blocks"]:
             raise HTTPException(status_code=500, detail="Edit produced an empty card — try rephrasing the instruction.")
         return card
@@ -382,7 +494,250 @@ def _download_image(url: str) -> Optional[bytes]:
         return None
 
 
+# ── Layout-specific slide renderers ─────────────────────────────────────────────
+# Each mirrors what the web editor draws for that layout, so the exported deck
+# matches what the user approved on screen. They all take a fresh slide and own
+# the whole canvas — no shared title bar, because several layouts (cover,
+# section, quote) deliberately do not have one.
+
+def _blank_slide(prs, colors):
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    set_slide_background(slide, colors["bg"])
+    return slide
+
+
+def _first(blocks, btype):
+    return next((b for b in blocks if b["type"] == btype), None)
+
+
+def _accent_rule(slide, colors, left=0.9, top=3.05, width=1.5, height=0.06):
+    from pptx.enum.shapes import MSO_SHAPE
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(left), Inches(top),
+                                 Inches(width), Inches(height))
+    bar.fill.solid(); bar.fill.fore_color.rgb = _rgb(colors["accent"])
+    bar.line.fill.background()
+
+
+def _render_cover(prs, card, colors, fonts):
+    """Full-bleed opening: oversized title, accent rule, one supporting line."""
+    slide = _blank_slide(prs, colors)
+    title = card.get("title", "")
+    size, height, _ = headline_fit(title, box_width_in=10.5, max_font=54)
+    add_text_box(slide, title, Inches(0.9), Inches(2.3), Inches(10.5), Inches(max(height, 1.4)),
+                 font_name=fonts["heading"], font_size=size, bold=True, color=colors["text"])
+    _accent_rule(slide, colors, top=2.3 + max(height, 1.4) + 0.15)
+    sub = _first(card.get("blocks") or [], "text")
+    if sub:
+        add_text_box(slide, sub["text"][:220], Inches(0.9), Inches(2.3 + max(height, 1.4) + 0.45),
+                     Inches(9.0), Inches(1.0), font_name=fonts["body"], font_size=17,
+                     color=colors["muted"])
+
+
+def _render_section(prs, card, colors, fonts):
+    """Divider: accent band down the left, large title, optional one-liner."""
+    from pptx.enum.shapes import MSO_SHAPE
+    slide = _blank_slide(prs, colors)
+    band = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(0.55), SLIDE_H)
+    band.fill.solid(); band.fill.fore_color.rgb = _rgb(colors["accent"]); band.line.fill.background()
+
+    title = card.get("title", "")
+    size, height, _ = headline_fit(title, box_width_in=10.5, max_font=42)
+    add_text_box(slide, title, Inches(1.3), Inches(2.9), Inches(10.5), Inches(max(height, 1.1)),
+                 font_name=fonts["heading"], font_size=size, bold=True, color=colors["text"])
+    sub = _first(card.get("blocks") or [], "text")
+    if sub:
+        add_text_box(slide, sub["text"][:180], Inches(1.3), Inches(2.9 + max(height, 1.1) + 0.2),
+                     Inches(9.5), Inches(0.9), font_name=fonts["body"], font_size=15,
+                     color=colors["muted"])
+
+
+def _render_quote(prs, card, colors, fonts):
+    """One memorable line, set large and centred."""
+    slide = _blank_slide(prs, colors)
+    q = _first(card.get("blocks") or [], "quote")
+    text = q["text"] if q else card.get("title", "")
+    add_text_box(slide, "“", Inches(0.9), Inches(1.3), Inches(2.0), Inches(1.4),
+                 font_name=fonts["heading"], font_size=90, bold=True, color=colors["accent"])
+    size, height, _ = headline_fit(text, box_width_in=10.6, max_font=32)
+    add_text_box(slide, text, Inches(1.35), Inches(2.5), Inches(10.6), Inches(max(height, 1.8)),
+                 font_name=fonts["heading"], font_size=size, italic=True, color=colors["text"])
+    if q and q.get("attribution"):
+        add_text_box(slide, f"— {q['attribution']}", Inches(1.35),
+                     Inches(2.5 + max(height, 1.8) + 0.25), Inches(8.0), Inches(0.5),
+                     font_name=fonts["body"], font_size=15, color=colors["muted"])
+
+
+def _render_stats(prs, card, colors, fonts):
+    """Numbers are the message: title small, figures very large."""
+    slide = _blank_slide(prs, colors)
+    add_text_box(slide, card.get("title", ""), Inches(0.9), Inches(0.7), Inches(11.5), Inches(0.9),
+                 font_name=fonts["heading"], font_size=26, bold=True, color=colors["text"])
+    _accent_rule(slide, colors, top=1.65, width=1.2)
+
+    stats = (_first(card.get("blocks") or [], "stats") or {}).get("items", [])
+    if stats:
+        col_w = 11.5 / max(len(stats), 1)
+        for i, s in enumerate(stats):
+            x = 0.9 + i * col_w
+            add_text_box(slide, str(s.get("value", "")), Inches(x), Inches(2.6),
+                         Inches(col_w - 0.3), Inches(1.5),
+                         font_name=fonts["heading"], font_size=60, bold=True, color=colors["accent"])
+            add_text_box(slide, str(s.get("label", "")), Inches(x), Inches(4.15),
+                         Inches(col_w - 0.3), Inches(0.5),
+                         font_name=fonts["body"], font_size=15, bold=True, color=colors["text"])
+            if s.get("sublabel"):
+                add_text_box(slide, str(s["sublabel"]), Inches(x), Inches(4.65),
+                             Inches(col_w - 0.3), Inches(0.5),
+                             font_name=fonts["body"], font_size=12, color=colors["muted"])
+
+    note = _first(card.get("blocks") or [], "text")
+    if note:
+        add_text_box(slide, note["text"][:200], Inches(0.9), Inches(5.6), Inches(11.5), Inches(0.8),
+                     font_name=fonts["body"], font_size=13, color=colors["muted"])
+
+
+def _render_timeline(prs, card, colors, fonts):
+    """Horizontal rail with a marker per step."""
+    from pptx.enum.shapes import MSO_SHAPE
+    slide = _blank_slide(prs, colors)
+    add_text_box(slide, card.get("title", ""), Inches(0.9), Inches(0.7), Inches(11.5), Inches(0.9),
+                 font_name=fonts["heading"], font_size=26, bold=True, color=colors["text"])
+
+    items = (_first(card.get("blocks") or [], "bullets") or {}).get("items", [])[:5]
+    if not items:
+        return _stack_blocks(slide, card, colors, fonts, start_y=1.9)
+
+    rail_y = 3.4
+    rail = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(1.0), Inches(rail_y),
+                                  Inches(11.3), Inches(0.045))
+    rail.fill.solid(); rail.fill.fore_color.rgb = _rgb(colors["muted"]); rail.line.fill.background()
+
+    step_w = 11.3 / len(items)
+    for i, item in enumerate(items):
+        cx = 1.0 + i * step_w + step_w / 2
+        dot = slide.shapes.add_shape(MSO_SHAPE.OVAL, Inches(cx - 0.13), Inches(rail_y - 0.11),
+                                     Inches(0.26), Inches(0.26))
+        dot.fill.solid(); dot.fill.fore_color.rgb = _rgb(colors["accent"]); dot.line.fill.background()
+        # Alternate above/below so longer labels do not collide.
+        top = rail_y - 1.45 if i % 2 == 0 else rail_y + 0.45
+        add_text_box(slide, str(item), Inches(cx - step_w / 2 + 0.15), Inches(top),
+                     Inches(step_w - 0.3), Inches(1.2),
+                     font_name=fonts["body"], font_size=13, color=colors["text"])
+
+
+def _render_process(prs, card, colors, fonts):
+    """Numbered steps flowing left to right."""
+    from pptx.enum.shapes import MSO_SHAPE
+    slide = _blank_slide(prs, colors)
+    add_text_box(slide, card.get("title", ""), Inches(0.9), Inches(0.7), Inches(11.5), Inches(0.9),
+                 font_name=fonts["heading"], font_size=26, bold=True, color=colors["text"])
+
+    items = (_first(card.get("blocks") or [], "bullets") or {}).get("items", [])[:4]
+    if not items:
+        return _stack_blocks(slide, card, colors, fonts, start_y=1.9)
+
+    gap = 0.25
+    box_w = (11.5 - gap * (len(items) - 1)) / len(items)
+    for i, item in enumerate(items):
+        x = 0.9 + i * (box_w + gap)
+        box = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(2.5),
+                                     Inches(box_w), Inches(2.4))
+        box.fill.solid(); box.fill.fore_color.rgb = _rgb(colors.get("card", colors["bg"]))
+        box.line.color.rgb = _rgb(colors["accent"]); box.line.width = Pt(1.25)
+        add_text_box(slide, str(i + 1), Inches(x + 0.25), Inches(2.7), Inches(0.9), Inches(0.7),
+                     font_name=fonts["heading"], font_size=32, bold=True, color=colors["accent"])
+        add_text_box(slide, str(item), Inches(x + 0.25), Inches(3.45), Inches(box_w - 0.5), Inches(1.3),
+                     font_name=fonts["body"], font_size=13, color=colors["text"])
+
+
+def _render_two_panel(prs, card, colors, fonts, comparison: bool):
+    """Two balanced columns. In comparison mode each side gets a header bar."""
+    from pptx.enum.shapes import MSO_SHAPE
+    slide = _blank_slide(prs, colors)
+    add_text_box(slide, card.get("title", ""), Inches(0.9), Inches(0.7), Inches(11.5), Inches(0.9),
+                 font_name=fonts["heading"], font_size=26, bold=True, color=colors["text"])
+
+    blocks = card.get("blocks") or []
+    table = _first(blocks, "table")
+    bullet_blocks = [b for b in blocks if b["type"] == "bullets"][:2]
+
+    # A 2-3 column table reads naturally as two sides; otherwise use two bullet lists.
+    if comparison and table and len(table.get("columns", [])) >= 2:
+        cols = table["columns"][:2]
+        sides = [[r[i] for r in table["rows"]] for i in range(2)]
+        headers = cols
+    elif len(bullet_blocks) >= 2:
+        sides = [bullet_blocks[0]["items"], bullet_blocks[1]["items"]]
+        headers = ["", ""]
+    else:
+        return _stack_blocks(slide, card, colors, fonts, start_y=1.9)
+
+    panel_w = 5.6
+    for i in range(2):
+        x = 0.9 + i * (panel_w + 0.3)
+        y = 2.0
+        if comparison and headers[i]:
+            hdr = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(y),
+                                         Inches(panel_w), Inches(0.6))
+            hdr.fill.solid(); hdr.fill.fore_color.rgb = _rgb(colors["accent"])
+            hdr.line.fill.background()
+            add_text_box(slide, str(headers[i]), Inches(x + 0.2), Inches(y + 0.1),
+                         Inches(panel_w - 0.4), Inches(0.45),
+                         font_name=fonts["heading"], font_size=15, bold=True, color=colors["bg"])
+            y += 0.85
+        for item in sides[i][:6]:
+            add_text_box(slide, f"•  {item}", Inches(x + 0.15), Inches(y),
+                         Inches(panel_w - 0.3), Inches(0.55),
+                         font_name=fonts["body"], font_size=13, color=colors["text"])
+            y += 0.58
+
+
+def _render_closing(prs, card, colors, fonts):
+    """Final slide: centred takeaways."""
+    slide = _blank_slide(prs, colors)
+    title = card.get("title", "")
+    size, height, _ = headline_fit(title, box_width_in=10.0, max_font=40)
+    add_text_box(slide, title, Inches(1.6), Inches(1.6), Inches(10.0), Inches(max(height, 1.0)),
+                 font_name=fonts["heading"], font_size=size, bold=True, color=colors["text"])
+    _accent_rule(slide, colors, left=1.6, top=1.6 + max(height, 1.0) + 0.2)
+
+    y = 1.6 + max(height, 1.0) + 0.7
+    for block in (card.get("blocks") or []):
+        if y > 6.4:
+            break
+        if block["type"] == "bullets":
+            for item in block["items"][:5]:
+                add_text_box(slide, f"•  {item}", Inches(1.7), Inches(y), Inches(9.8), Inches(0.55),
+                             font_name=fonts["body"], font_size=16, color=colors["text"])
+                y += 0.6
+        elif block["type"] in ("text", "callout"):
+            add_text_box(slide, block["text"][:300], Inches(1.7), Inches(y), Inches(9.8), Inches(0.9),
+                         font_name=fonts["body"], font_size=16, color=colors["text"])
+            y += 1.0
+
+
 def _render_card_slide(prs, card: dict, colors: dict, fonts: dict):
+    """Dispatches to the renderer for this card's layout. Layouts that are just
+    'title plus content' (title_content, text_image, chart, ...) fall through to
+    the original stacked renderer, which already handles images and charts."""
+    layout = LEGACY_LAYOUTS.get(card.get("layout"), card.get("layout")) or "title_content"
+    special = {
+        "cover":      _render_cover,
+        "section":    _render_section,
+        "quote":      _render_quote,
+        "stats":      _render_stats,
+        "timeline":   _render_timeline,
+        "process":    _render_process,
+        "closing":    _render_closing,
+    }
+    if layout in special:
+        return special[layout](prs, card, colors, fonts)
+    if layout in ("comparison", "two_column"):
+        return _render_two_panel(prs, card, colors, fonts, comparison=(layout == "comparison"))
+    return _render_stacked_slide(prs, card, colors, fonts)
+
+
+def _render_stacked_slide(prs, card: dict, colors: dict, fonts: dict):
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     set_slide_background(slide, colors["bg"])
 
@@ -398,17 +753,29 @@ def _render_card_slide(prs, card: dict, colors: dict, fonts: dict):
 
     y = 0.35 + box_height + 0.25
 
-    # image_right layout: reserve right column for the first image block
+    # text_image (formerly image_right): reserve the right column for the image
     blocks = list(card.get("blocks") or [])
     image_block = next((b for b in blocks if b["type"] == "image"), None)
     content_width_in = 12.0
-    if card.get("layout") == "image_right" and image_block:
+    layout = LEGACY_LAYOUTS.get(card.get("layout"), card.get("layout"))
+    if layout == "text_image" and image_block:
         content_width_in = 7.2
         img_bytes = _download_image(image_block.get("url", ""))
         if img_bytes:
             add_picture_fit(slide, img_bytes, Inches(8.0), Inches(y), Inches(4.7), Inches(4.9))
         blocks = [b for b in blocks if b is not image_block]
 
+    _stack_blocks(slide, {"blocks": blocks}, colors, fonts,
+                  start_y=y, content_width_in=content_width_in)
+
+
+def _stack_blocks(slide, card: dict, colors: dict, fonts: dict,
+                  start_y: float = 1.9, content_width_in: float = 12.0):
+    """Stacks blocks top-down on an existing slide. Shared by the default
+    renderer and used as the fallback when a specialised layout is missing the
+    block it needs (e.g. a 'timeline' card with no bullets)."""
+    y = start_y
+    blocks = list(card.get("blocks") or [])
     body_font = fonts["body"]
     for block in blocks:
         if y > 6.6:
@@ -506,7 +873,9 @@ def _render_card_slide(prs, card: dict, colors: dict, fonts: dict):
                              font_name=body_font, font_size=12, color=colors["muted"])
                 y += 0.45
 
-        elif btype == "image" and card.get("layout") != "image_right":
+        # The caller already removes the image when it owns the right column,
+        # so anything reaching here is meant to sit inline.
+        elif btype == "image":
             img_bytes = _download_image(block.get("url", ""))
             h = min(3.2, 6.9 - y)
             if img_bytes and h >= 1.5:
