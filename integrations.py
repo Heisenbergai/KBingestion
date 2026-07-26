@@ -61,16 +61,23 @@ PROVIDERS: dict[str, dict] = {
     },
     "google_drive": {
         "name": "Google Drive", "category": "Documents", "auth_method": "oauth",
-        "status": "coming_soon", "icon": "google-drive", "accent": "#1FA463",
+        "status": "available", "icon": "google-drive", "accent": "#1FA463",
         "description": "Auto-ingest documents from selected Drive folders.",
         "captures": "Docs, Sheets, Slides, PDFs in chosen folders",
-        "install_path": "/google/install", "needs_channel_selection": True,
-    },
-    "google_meet": {
-        "name": "Google Meet", "category": "Meetings", "auth_method": "oauth",
-        "status": "coming_soon", "icon": "google-meet", "accent": "#00897B",
-        "description": "Turn meeting transcripts into knowledge notes.",
-        "captures": "Meet recordings & transcripts", "install_path": "/google/install",
+        "install_path": "/google/install", "needs_folder_selection": True,
+        "setup_hint": "If Meet recordings are enabled for your Google Workspace, they "
+                      "save transcripts into a \"Meet Recordings\" folder automatically — "
+                      "add that folder here too and Meet transcripts are covered for free.",
+        # Single-tenant model: this workspace's OWN Google Cloud OAuth client.
+        # No webhook_secret needed (unlike Slack) — this polls on a schedule
+        # rather than receiving push events, so there is no shared inbound
+        # endpoint whose signature needs per-customer verification.
+        "needs_own_app": True,
+        "redirect_path": "/google/oauth/callback",
+        "setup_fields": [
+            {"key": "client_id", "label": "Client ID"},
+            {"key": "client_secret", "label": "Client Secret", "secret": True},
+        ],
     },
     "google_calendar": {
         "name": "Google Calendar", "category": "Meetings", "auth_method": "oauth",
@@ -131,6 +138,7 @@ def _provider_public(pid: str, p: dict) -> dict:
         "description": p.get("description", ""),
         "captures": p.get("captures", ""),
         "needs_channel_selection": p.get("needs_channel_selection", False),
+        "needs_folder_selection": p.get("needs_folder_selection", False),
         "install_path": p.get("install_path"),
         # How the UI should start an OAuth flow: POST here with {workspace_id,
         # provider}, then open the returned url in a popup. install_path is kept
@@ -175,13 +183,17 @@ async def list_integrations(workspace_id: str,
         entry["credentials_configured"] = pid in configured_providers
         conn = by_provider.get(pid)
         if conn and p["status"] == "available":
-            channels = (conn.get("config") or {}).get("channels", [])
-            entry["status"] = "connected"
+            cfg = conn.get("config") or {}
+            entry["status"] = "connected" if conn.get("status") == "active" else conn.get("status", "connected")
             entry["connection"] = {
                 "id": conn["id"],
                 "team": conn.get("external_team_name"),
                 "connected_at": conn.get("created_at"),
-                "channels_selected": len(channels),
+                # "resources_selected" covers both Slack's channels and Drive's
+                # folders — one generic count so the frontend doesn't need a
+                # provider-specific field name for what is conceptually the
+                # same thing (how many things this connection watches).
+                "resources_selected": len(cfg.get("channels", cfg.get("folders", []))),
                 "error": conn.get("error_detail"),
             }
         else:
@@ -333,9 +345,11 @@ async def oauth_url(body: OAuthUrlRequest,
     if body.provider == "slack":
         import connector_slack
         url = connector_slack.build_install_url(body.workspace_id, body.user_id or "")
+    elif body.provider == "google_drive":
+        import connector_google
+        url = connector_google.build_install_url(body.workspace_id, body.user_id or "")
     else:
-        # Unreachable while slack is the only "available" oauth provider; this is
-        # the one line each new connector must add.
+        # This is the one line each new OAuth connector must add here.
         raise HTTPException(status_code=400, detail=f"No OAuth builder for '{body.provider}'.")
 
     return {"url": url, "provider": body.provider}

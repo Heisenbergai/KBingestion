@@ -76,16 +76,12 @@ SLACK_SCOPES = "channels:read,channels:history,users:read,team:read"
 BACKFILL_DAYS = 90
 
 
-# ── OAuth state (workspace_id + user_id, Fernet-signed so it can't be forged) ──
-def _encode_state(workspace_id: str, user_id: str) -> str:
-    return bc.encrypt_secret(json.dumps({"w": workspace_id, "u": user_id, "t": int(time.time())}))
-
-
-def _decode_state(state: str) -> dict:
-    try:
-        return json.loads(bc.decrypt_secret(state))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid OAuth state.")
+# ── OAuth state ─────────────────────────────────────────────────────────────────
+# Shared helper now lives in brain_connectors.py (encode_oauth_state/
+# decode_oauth_state) — every OAuth connector uses the same Fernet-signed
+# {workspace_id, user_id, timestamp} shape.
+_encode_state = bc.encode_oauth_state
+_decode_state = bc.decode_oauth_state
 
 
 # ── Slack Web API helpers ───────────────────────────────────────────────────────

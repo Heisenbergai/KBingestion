@@ -352,8 +352,33 @@ def process_document(request: IngestRequest, job: Optional[dict] = None) -> dict
     set_stage("downloading")
     file_bytes = download_file(request.signed_url)
 
+    return process_document_bytes(
+        file_bytes, document_id=request.document_id, asset_id=request.asset_id,
+        workspace_id=request.workspace_id, mime_type=request.mime_type,
+        file_name=request.file_name, source_type=request.source_type or "document",
+        source_tier=request.source_tier or 1, doc_date=request.doc_date, job=job,
+    )
+
+
+def process_document_bytes(
+    file_bytes: bytes, document_id: str, asset_id: str, workspace_id: str,
+    mime_type: str, file_name: str, source_type: str = "document",
+    source_tier: int = 1, doc_date: Optional[str] = None, job: Optional[dict] = None,
+) -> dict:
+    """
+    The extract → clean → chunk → embed → store tail of process_document(),
+    factored out so a caller that already HAS the bytes (no signed_url to
+    download from) can skip straight to it. First real caller: connector_google
+    fetches/exports a Drive file's bytes directly from Google's API — routing
+    that through a signed Supabase Storage URL just to satisfy the download
+    step would be a pointless extra upload/download round trip.
+    """
+    def set_stage(stage: str):
+        if job is not None:
+            job["stage"] = stage
+
     set_stage("extracting")
-    raw_text = extract_text(file_bytes, request.mime_type, request.file_name)
+    raw_text = extract_text(file_bytes, mime_type, file_name)
 
     if not raw_text.strip():
         raise ValueError(
@@ -370,7 +395,7 @@ def process_document(request: IngestRequest, job: Optional[dict] = None) -> dict
     if job is not None:
         job["chunks_total"] = len(chunks)
 
-    print(f"[ingest] {request.file_name}: {len(chunks)} chunks to embed")
+    print(f"[ingest] {file_name}: {len(chunks)} chunks to embed")
 
     set_stage("embedding")
 
@@ -378,7 +403,7 @@ def process_document(request: IngestRequest, job: Optional[dict] = None) -> dict
         if job is not None:
             job["chunks_embedded"] = done
 
-    embeddings = embed_chunks(chunks, on_progress=on_progress, workspace_id=request.workspace_id)
+    embeddings = embed_chunks(chunks, on_progress=on_progress, workspace_id=workspace_id)
 
     set_stage("storing")
 
@@ -388,26 +413,26 @@ def process_document(request: IngestRequest, job: Optional[dict] = None) -> dict
     # workspace_id=null chunks instead of stacking on top of them.
     supabase.table("document_chunks") \
         .delete() \
-        .eq("document_id", request.document_id) \
+        .eq("document_id", document_id) \
         .execute()
 
     rows = [
         {
-            "document_id":  request.document_id,
-            "asset_id":     request.asset_id,
-            "workspace_id": request.workspace_id,  # ← stored with every chunk
+            "document_id":  document_id,
+            "asset_id":     asset_id,
+            "workspace_id": workspace_id,  # ← stored with every chunk
             "content":      chunks[i],
             "embedding":    embeddings[i],
             "chunk_index":  i,
-            "source_type":  request.source_type or "document",
-            "source_tier":  request.source_tier or 1,
-            "doc_date":     request.doc_date,      # None → DB default (created_at)
+            "source_type":  source_type,
+            "source_tier":  source_tier,
+            "doc_date":     doc_date,      # None → DB default (created_at)
             "metadata": {
-                "file_name":    request.file_name,
+                "file_name":    file_name,
                 "chunk_index":  i,
                 "total_chunks": len(chunks),
-                "workspace_id": request.workspace_id,
-                "source_type":  request.source_type or "document",
+                "workspace_id": workspace_id,
+                "source_type":  source_type,
             }
         }
         for i in range(len(chunks))
@@ -421,10 +446,10 @@ def process_document(request: IngestRequest, job: Optional[dict] = None) -> dict
 
     return {
         "success":        True,
-        "document_id":    request.document_id,
-        "workspace_id":   request.workspace_id,
+        "document_id":    document_id,
+        "workspace_id":   workspace_id,
         "chunks_created": len(chunks),
-        "message":        f"Processed '{request.file_name}' into {len(chunks)} chunks."
+        "message":        f"Processed '{file_name}' into {len(chunks)} chunks."
     }
 
 

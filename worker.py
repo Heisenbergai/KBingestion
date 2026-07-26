@@ -26,17 +26,22 @@ WHAT IT DOES, IN ORDER
 -----------------------
 1. run_pending_filtration() — for every active connection with pending
    ingest_items, runs the existing filtration pipeline (brain_connectors.
-   run_filtration). This is the main job; everything else is upkeep.
-2. flag_expiring_tokens() — logs (does not yet refresh) connections whose
-   token_expires_at is approaching. No provider that needs this exists yet
-   (Slack bot tokens don't expire), so this is deliberately a warning log,
-   not a fake refresh implementation for a provider this codebase can't
-   yet test against. Wire the real refresh call here when Google/Zoom/
-   Microsoft connectors are built — the shape (find expiring, act, update
-   token_expires_at) will be the same for all of them.
-3. flag_expiring_webhooks() — same treatment for webhook_subscriptions.
-   Not used by Slack (Events API has no expiry); will matter for Microsoft
-   Graph (~3 days) and Google Drive watch channels (~7 days).
+   run_filtration). Slack-shaped (chat → keep/discard → notes).
+2. run_google_drive_polling() — for every active google_drive connection,
+   runs connector_google.sync_connection(): lists each selected folder,
+   embeds new/changed files via the existing document pipeline. This is
+   Drive's equivalent of step 1 — different shape (documents, not chat
+   needing filtration) but the same "continuous without a human clicking
+   Sync" purpose.
+3. refresh_expiring_tokens() — connections whose token_expires_at is
+   approaching get a REAL refresh for providers that implement one
+   (connector_google.refresh_access_token, the first real implementation —
+   Slack bot tokens never expire so never reach this path). A provider with
+   no refresh function yet gets a warning log instead of a fake refresh.
+4. flag_expiring_webhooks() — same log-only treatment for webhook_subscriptions.
+   Not used by Slack (Events API has no expiry) or Drive (polling, not
+   push); will matter for Microsoft Graph (~3 days) and Google Drive watch
+   channels (~7 days), IF Drive ever moves off polling.
 
 Every step is wrapped so one bad connection can't stop the run; every
 outcome is written to sync_runs for later inspection.
@@ -46,6 +51,7 @@ import traceback
 from datetime import datetime, timezone, timedelta
 
 import brain_connectors as bc
+import connector_google
 
 # How soon is "expiring soon" for the flag-only checks below.
 TOKEN_EXPIRY_WARNING_WINDOW = timedelta(hours=2)
@@ -100,25 +106,76 @@ def run_pending_filtration() -> dict:
     return {"connections_checked": len(connections), "processed": processed, "failed": failed}
 
 
-def flag_expiring_tokens() -> dict:
+def run_google_drive_polling() -> dict:
     """
-    Logs connections whose access token expires soon. Slack bot tokens never
-    expire (token_expires_at stays NULL for them), so this currently only
-    matters once a Google/Zoom/Microsoft connector sets it. Deliberately NOT
-    implementing a refresh call yet — there is no real provider to test one
-    against, and a fake one would be worse than an honest warning log.
+    The Drive equivalent of run_pending_filtration(): every active Drive
+    connection gets its selected folders checked for new/changed files,
+    without anyone clicking Sync. See connector_google.sync_connection().
+    """
+    connections = bc.supabase.table("connections").select("id, workspace_id") \
+        .eq("provider", "google_drive").eq("status", "active").execute().data or []
+
+    processed = failed = 0
+    for conn in connections:
+        run_id = _start_run("drive_poll", conn["id"], conn["workspace_id"])
+        try:
+            result = connector_google.sync_connection(conn["id"])
+            _finish_run(run_id, "completed", stats=result)
+            processed += 1
+            print(f"[worker] drive poll OK connection={conn['id']} {result}")
+        except Exception as e:
+            _finish_run(run_id, "failed", error=str(e))
+            failed += 1
+            print(f"[worker] drive poll FAILED connection={conn['id']}: {e}")
+            print(traceback.format_exc())
+
+    return {"connections_checked": len(connections), "processed": processed, "failed": failed}
+
+
+# Provider -> real refresh function, for providers that have one implemented.
+# A provider absent from this dict just gets the warning log below instead of
+# a refresh attempt — that is the honest state for a provider with no tested
+# refresh flow yet (currently: none besides google_drive; Slack bot tokens
+# never expire so never appear here at all).
+_TOKEN_REFRESHERS = {
+    "google_drive": connector_google.refresh_access_token,
+}
+
+
+def refresh_expiring_tokens() -> dict:
+    """
+    Refreshes connections whose access token expires soon, for providers
+    with a real refresh implementation; logs a warning for the rest. See
+    _TOKEN_REFRESHERS above and connector_google.refresh_access_token for
+    the first real one.
     """
     cutoff = (datetime.now(timezone.utc) + TOKEN_EXPIRY_WARNING_WINDOW).isoformat()
-    expiring = bc.supabase.table("connections").select("id, workspace_id, provider, token_expires_at") \
+    expiring = bc.supabase.table("connections").select("*") \
         .eq("status", "active").not_.is_("token_expires_at", "null") \
         .lte("token_expires_at", cutoff).execute().data or []
 
+    refreshed = failed = warned = 0
     for conn in expiring:
-        print(f"[worker] TOKEN EXPIRING SOON: connection={conn['id']} provider={conn['provider']} "
-              f"workspace={conn['workspace_id']} expires_at={conn['token_expires_at']} "
-              f"-- no refresh implemented for '{conn['provider']}' yet, connection will start failing")
+        refresher = _TOKEN_REFRESHERS.get(conn["provider"])
+        if not refresher:
+            warned += 1
+            print(f"[worker] TOKEN EXPIRING SOON: connection={conn['id']} provider={conn['provider']} "
+                  f"workspace={conn['workspace_id']} expires_at={conn['token_expires_at']} "
+                  f"-- no refresh implemented for '{conn['provider']}' yet, connection will start failing")
+            continue
+        try:
+            new_token = refresher(conn)
+            if new_token:
+                refreshed += 1
+                print(f"[worker] token refreshed OK connection={conn['id']} provider={conn['provider']}")
+            else:
+                failed += 1  # refresher already marked the connection 'error' and logged why
+        except Exception as e:
+            failed += 1
+            print(f"[worker] token refresh threw for connection={conn['id']}: {e}")
+            print(traceback.format_exc())
 
-    return {"expiring_soon": len(expiring)}
+    return {"expiring_soon": len(expiring), "refreshed": refreshed, "failed": failed, "no_refresher": warned}
 
 
 def flag_expiring_webhooks() -> dict:
@@ -142,7 +199,8 @@ def main() -> int:
 
     for name, fn in (
         ("filtration", run_pending_filtration),
-        ("token_check", flag_expiring_tokens),
+        ("drive_poll", run_google_drive_polling),
+        ("token_refresh", refresh_expiring_tokens),
         ("webhook_check", flag_expiring_webhooks),
     ):
         try:

@@ -18,6 +18,7 @@ Railway owns all of this end to end — no Lovable DB access required.
 """
 import os
 import json
+import time
 import threading
 import ai
 from datetime import datetime, timezone
@@ -123,6 +124,22 @@ def has_provider_credentials(workspace_id: str, provider: str) -> bool:
     row = supabase.table("provider_credentials").select("id") \
         .eq("workspace_id", workspace_id).eq("provider", provider).execute().data
     return bool(row)
+
+
+# ── OAuth state (workspace_id + user_id, Fernet-signed so it can't be forged) ──
+# Shared by every OAuth connector (connector_slack.py, connector_google.py, …) —
+# the shape (which workspace + which user started the flow, plus a timestamp)
+# is identical regardless of provider.
+def encode_oauth_state(workspace_id: str, user_id: str) -> str:
+    return encrypt_secret(json.dumps({"w": workspace_id, "u": user_id, "t": int(time.time())}))
+
+
+def decode_oauth_state(state: str) -> dict:
+    from fastapi import HTTPException
+    try:
+        return json.loads(decrypt_secret(state))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid OAuth state.")
 
 
 def get_provider_credentials_by_external_team(provider: str, external_team_id: str) -> Optional[dict]:
