@@ -573,6 +573,67 @@ CALLOUT_FILL = {"info": "DBEAFE", "success": "D1FAE5", "warning": "FEF3C7"}
 CALLOUT_TEXT = {"info": "1E40AF", "success": "065F46", "warning": "92400E"}
 
 
+# ── Text fitting ────────────────────────────────────────────────────────────────
+# python-pptx cannot measure rendered text — there is no layout engine behind it.
+# So we ESTIMATE from font metrics, the same approach headline_fit() uses, and
+# deliberately overestimate width so text wraps slightly early rather than
+# spilling out of its shape.
+#
+# This exists because the old exporter did two harmful things: it assumed a flat
+# 95 characters per line regardless of font size or box width, and when it ran
+# out of vertical room it silently dropped the remaining blocks. Content
+# disappearing without a trace is worse than content being small.
+
+CONTENT_BOTTOM_IN = 6.95        # keep a margin above the 7.5" slide edge
+MIN_BODY_PT = 9
+
+# Scales tried in order. 1.0 is the design intent; anything lower is a
+# compromise made to keep the slide readable rather than overflowing.
+FIT_SCALES = (1.0, 0.92, 0.84, 0.76, 0.68, 0.6)
+
+
+def _chars_per_line(font_pt: float, box_w_in: float) -> int:
+    avg_char_w_in = (font_pt * 0.52) / 72.0
+    return max(8, int(box_w_in / avg_char_w_in))
+
+
+def _line_count(text: str, font_pt: float, box_w_in: float) -> int:
+    """Counts wrapped lines, honouring explicit newlines."""
+    cpl = _chars_per_line(font_pt, box_w_in)
+    total = 0
+    for para in str(text).split("\n"):
+        total += max(1, -(-len(para) // cpl))     # ceil division
+    return max(1, total)
+
+
+def _text_height_in(lines: int, font_pt: float, leading: float = 1.3) -> float:
+    return 0.08 + lines * (font_pt * leading) / 72.0
+
+
+def _truncate_to_fit(text: str, font_pt: float, box_w_in: float, max_h_in: float) -> str:
+    """Last resort when even the smallest size will not fit: cut at a word
+    boundary and mark the cut, so the slide stays clean and the loss is visible
+    rather than silent."""
+    cpl = _chars_per_line(font_pt, box_w_in)
+    max_lines = max(1, int((max_h_in - 0.08) / ((font_pt * 1.3) / 72.0)))
+    budget = cpl * max_lines - 1
+    if len(text) <= budget:
+        return text
+    cut = text[:max(0, budget - 1)]
+    if " " in cut:
+        cut = cut[:cut.rfind(" ")]
+    return cut.rstrip(" ,;:.") + "…"
+
+
+def _stats_height(scale: float, has_sublabel: bool) -> tuple[float, float, float]:
+    """One source of truth for stats geometry, used by BOTH the measure pass and
+    the renderer. Returns (value_row_h, label_row_h, total_h)."""
+    value_h = 0.7 * scale + 0.15
+    label_h = 0.4
+    sub_h = 0.35 if has_sublabel else 0.0
+    return value_h, label_h, value_h + label_h + sub_h + 0.15
+
+
 def _pp_align(align: Optional[str]):
     """Maps the editor's alignment onto python-pptx's enum."""
     from pptx.enum.text import PP_ALIGN
@@ -768,9 +829,12 @@ def _render_two_panel(prs, card, colors, fonts, comparison: bool):
         return _stack_blocks(slide, card, colors, fonts, start_y=1.9)
 
     panel_w = 5.6
+    top_y = 2.0
+    # Fit the panel contents to the space that actually exists rather than
+    # assuming a fixed row height: long bullets used to run off the slide.
     for i in range(2):
         x = 0.9 + i * (panel_w + 0.3)
-        y = 2.0
+        y = top_y
         if comparison and headers[i]:
             hdr = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(y),
                                          Inches(panel_w), Inches(0.6))
@@ -780,35 +844,75 @@ def _render_two_panel(prs, card, colors, fonts, comparison: bool):
                          Inches(panel_w - 0.4), Inches(0.45),
                          font_name=fonts["heading"], font_size=15, bold=True, color=colors["bg"])
             y += 0.85
-        for item in sides[i][:6]:
-            add_text_box(slide, f"•  {item}", Inches(x + 0.15), Inches(y),
-                         Inches(panel_w - 0.3), Inches(0.55),
-                         font_name=fonts["body"], font_size=13, color=colors["text"])
-            y += 0.58
+
+        items = [str(it) for it in sides[i][:6]]
+        box_w = panel_w - 0.3
+        available = CONTENT_BOTTOM_IN - y
+
+        # Shrink until the whole column fits, then truncate anything still over.
+        pt = 13
+        while pt > MIN_BODY_PT:
+            need = sum(_text_height_in(_line_count("•  " + it, pt, box_w), pt) + 0.06
+                       for it in items)
+            if need <= available:
+                break
+            pt -= 1
+
+        for it in items:
+            if CONTENT_BOTTOM_IN - y <= 0.25:
+                break
+            line = "•  " + it
+            h = _text_height_in(_line_count(line, pt, box_w), pt)
+            if h > CONTENT_BOTTOM_IN - y:
+                line = _truncate_to_fit(line, pt, box_w, CONTENT_BOTTOM_IN - y)
+                h = _text_height_in(_line_count(line, pt, box_w), pt)
+            add_text_box(slide, line, Inches(x + 0.15), Inches(y),
+                         Inches(box_w), Inches(h),
+                         font_name=fonts["body"], font_size=pt, color=colors["text"])
+            y += h + 0.06
 
 
 def _render_closing(prs, card, colors, fonts):
-    """Final slide: centred takeaways."""
+    """Final slide: centred takeaways, fitted to the space left under the title."""
     slide = _blank_slide(prs, colors)
     title = card.get("title", "")
     size, height, _ = headline_fit(title, box_width_in=10.0, max_font=40)
-    add_text_box(slide, title, Inches(1.6), Inches(1.6), Inches(10.0), Inches(max(height, 1.0)),
+    height = max(height, 1.0)
+    add_text_box(slide, title, Inches(1.6), Inches(1.6), Inches(10.0), Inches(height),
                  font_name=fonts["heading"], font_size=size, bold=True, color=colors["text"])
-    _accent_rule(slide, colors, left=1.6, top=1.6 + max(height, 1.0) + 0.2)
+    _accent_rule(slide, colors, left=1.6, top=1.6 + height + 0.2)
 
-    y = 1.6 + max(height, 1.0) + 0.7
+    y = 1.6 + height + 0.7
+    box_w = 9.8
+    pt = 16
+
+    # Shrink once for the whole set, then check every individual line.
+    lines = []
     for block in (card.get("blocks") or []):
-        if y > 6.4:
-            break
         if block["type"] == "bullets":
-            for item in block["items"][:5]:
-                add_text_box(slide, f"•  {item}", Inches(1.7), Inches(y), Inches(9.8), Inches(0.55),
-                             font_name=fonts["body"], font_size=16, color=colors["text"])
-                y += 0.6
+            lines.extend("•  " + str(i) for i in block["items"][:5])
         elif block["type"] in ("text", "callout"):
-            add_text_box(slide, block["text"][:300], Inches(1.7), Inches(y), Inches(9.8), Inches(0.9),
-                         font_name=fonts["body"], font_size=16, color=colors["text"])
-            y += 1.0
+            lines.append(str(block.get("text", ""))[:300])
+    if not lines:
+        return
+
+    available = CONTENT_BOTTOM_IN - y
+    while pt > MIN_BODY_PT:
+        need = sum(_text_height_in(_line_count(l, pt, box_w), pt) + 0.1 for l in lines)
+        if need <= available:
+            break
+        pt -= 1
+
+    for line in lines:
+        if CONTENT_BOTTOM_IN - y <= 0.25:
+            break
+        h = _text_height_in(_line_count(line, pt, box_w), pt)
+        if h > CONTENT_BOTTOM_IN - y:
+            line = _truncate_to_fit(line, pt, box_w, CONTENT_BOTTOM_IN - y)
+            h = _text_height_in(_line_count(line, pt, box_w), pt)
+        add_text_box(slide, line, Inches(1.7), Inches(y), Inches(box_w), Inches(h),
+                     font_name=fonts["body"], font_size=pt, color=colors["text"])
+        y += h + 0.1
 
 
 def _render_card_slide(prs, card: dict, colors: dict, fonts: dict):
@@ -864,61 +968,138 @@ def _render_stacked_slide(prs, card: dict, colors: dict, fonts: dict):
                   start_y=y, content_width_in=content_width_in)
 
 
-def _stack_blocks(slide, card: dict, colors: dict, fonts: dict,
-                  start_y: float = 1.9, content_width_in: float = 12.0):
-    """Stacks blocks top-down on an existing slide. Shared by the default
-    renderer and used as the fallback when a specialised layout is missing the
-    block it needs (e.g. a 'timeline' card with no bullets)."""
-    y = start_y
-    blocks = list(card.get("blocks") or [])
-    body_font = fonts["body"]
+def _measure_blocks(blocks, content_width_in: float, scale: float,
+                    available_in: float) -> float:
+    """Total vertical inches the blocks need at this scale. Pure estimate, no
+    drawing - used to decide how much to shrink BEFORE anything is rendered."""
+    total = 0.0
     for block in blocks:
-        if y > 6.6:
-            break  # never overflow the slide
         btype = block["type"]
+        st = block.get("style") if isinstance(block.get("style"), dict) else {}
+        pt = STYLE_PT.get(st.get("size"), 14) * scale
+        frac = STYLE_FRACTION.get(st.get("width"), 1.0)
 
         if btype == "text":
-            st = block.get("style") or {}
-            pt = STYLE_PT.get(st.get("size"), 14)
-            frac = STYLE_FRACTION.get(st.get("width"), 1.0)
+            w = (content_width_in - 0.85) * frac
+            total += _text_height_in(_line_count(block["text"], pt, w), pt) + 0.15
+        elif btype == "bullets":
+            w = (content_width_in - 1.0) * frac
+            for item in block["items"]:
+                total += _text_height_in(_line_count("•  " + str(item), pt, w), pt) + 0.06
+            total += 0.1
+        elif btype == "stats":
+            has_sub = any(s.get("sublabel") for s in block.get("items", []))
+            total += _stats_height(scale, has_sub)[2]
+        elif btype == "chart":
+            total += min(3.4, max(1.6, available_in * 0.55)) + 0.1
+            if block.get("insight"):
+                total += 0.5
+        elif btype == "table":
+            total += 0.38 * scale * (len(block["rows"]) + 1) + 0.15
+        elif btype == "callout":
+            w = content_width_in - 1.5
+            p = 13 * scale
+            total += _text_height_in(_line_count(block["text"], p, w), p) + 0.35
+        elif btype == "quote":
+            w = content_width_in - 1.4
+            p = 17 * scale
+            total += _text_height_in(_line_count(block["text"], p, w), p) + 0.15
+            if block.get("attribution"):
+                total += 0.45
+        elif btype == "image":
+            total += min(3.2, max(1.2, available_in * 0.5)) + 0.15
+    return total
+
+
+def _stack_blocks(slide, card: dict, colors: dict, fonts: dict,
+                  start_y: float = 1.9, content_width_in: float = 12.0):
+    """Stacks blocks top-down, fitted to the space actually left on the slide.
+
+    Two passes: measure everything, choose the largest scale that fits, then
+    draw. Nothing is silently dropped - content that cannot fit even at the
+    smallest size is truncated at a word boundary with an ellipsis, so the loss
+    is visible on the slide rather than vanishing without trace.
+    """
+    blocks = list(card.get("blocks") or [])
+    if not blocks:
+        return
+
+    available = max(0.8, CONTENT_BOTTOM_IN - start_y)
+
+    scale = FIT_SCALES[-1]
+    for candidate in FIT_SCALES:
+        if _measure_blocks(blocks, content_width_in, candidate, available) <= available:
+            scale = candidate
+            break
+
+    y = start_y
+    body_font = fonts["body"]
+
+    for block in blocks:
+        remaining = CONTENT_BOTTOM_IN - y
+        if remaining <= 0.25:
+            break
+        btype = block["type"]
+        st = block.get("style") if isinstance(block.get("style"), dict) else {}
+        pt = max(MIN_BODY_PT, round(STYLE_PT.get(st.get("size"), 14) * scale))
+        frac = STYLE_FRACTION.get(st.get("width"), 1.0)
+        align = _pp_align(st.get("align"))
+
+        if btype == "text":
             box_w = (content_width_in - 0.85) * frac
-            # chars-per-line scales with both point size and column width
-            per_line = max(20, int(95 * (14 / pt) * frac))
-            lines = max(1, len(block["text"]) // per_line + 1)
-            h = (pt / 14) * 0.32 * lines + 0.1
-            add_text_box(slide, block["text"], Inches(0.85), Inches(y),
-                         Inches(box_w), Inches(h),
-                         font_name=body_font, font_size=pt, color=colors["text"],
-                         align=_pp_align(st.get("align")))
+            text = block["text"]
+            h = _text_height_in(_line_count(text, pt, box_w), pt)
+            if h > remaining:
+                text = _truncate_to_fit(text, pt, box_w, remaining)
+                h = _text_height_in(_line_count(text, pt, box_w), pt)
+            add_text_box(slide, text, Inches(0.85), Inches(y), Inches(box_w), Inches(h),
+                         font_name=body_font, font_size=pt, color=colors["text"], align=align)
             y += h + 0.15
 
         elif btype == "bullets":
-            st = block.get("style") or {}
-            pt = STYLE_PT.get(st.get("size"), 14)
-            frac = STYLE_FRACTION.get(st.get("width"), 1.0)
             box_w = (content_width_in - 1.0) * frac
-            row_h = (pt / 14) * 0.52
             for item in block["items"]:
-                add_text_box(slide, f"•  {item}", Inches(0.95), Inches(y),
-                             Inches(box_w), Inches(max(0.5, row_h)),
-                             font_name=body_font, font_size=pt, color=colors["text"],
-                             align=_pp_align(st.get("align")))
-                y += row_h
+                if CONTENT_BOTTOM_IN - y <= 0.25:
+                    break
+                line = "•  " + str(item)
+                h = _text_height_in(_line_count(line, pt, box_w), pt)
+                if h > CONTENT_BOTTOM_IN - y:
+                    line = _truncate_to_fit(line, pt, box_w, CONTENT_BOTTOM_IN - y)
+                    h = _text_height_in(_line_count(line, pt, box_w), pt)
+                add_text_box(slide, line, Inches(0.95), Inches(y), Inches(box_w), Inches(h),
+                             font_name=body_font, font_size=pt, color=colors["text"], align=align)
+                y += h + 0.06
             y += 0.1
 
         elif btype == "stats":
             items = block["items"]
             col_w = (content_width_in - 0.85) / max(len(items), 1)
+            # Drop sublabels first if the full stack will not fit - losing a
+            # caption is better than pushing the row off the slide.
+            has_sub = any(s.get("sublabel") for s in items)
+            value_h, label_h, total_h = _stats_height(scale, has_sub)
+            if total_h > remaining and has_sub:
+                has_sub = False
+                value_h, label_h, total_h = _stats_height(scale, False)
+            v_pt = max(14, round(30 * scale))
+            l_pt = max(9, round(12 * scale))
             for i, stat in enumerate(items):
                 x = 0.85 + i * col_w
-                add_text_box(slide, stat["value"], Inches(x), Inches(y), Inches(col_w - 0.2), Inches(0.7),
-                             font_name=fonts["heading"], font_size=30, bold=True, color=colors["accent"])
-                add_text_box(slide, stat["label"], Inches(x), Inches(y + 0.7), Inches(col_w - 0.2), Inches(0.35),
-                             font_name=body_font, font_size=12, bold=True, color=colors["text"])
-                if stat.get("sublabel"):
-                    add_text_box(slide, stat["sublabel"], Inches(x), Inches(y + 1.05), Inches(col_w - 0.2), Inches(0.3),
-                                 font_name=body_font, font_size=10, color=colors["muted"])
-            y += 1.6
+                add_text_box(slide, str(stat["value"]), Inches(x), Inches(y),
+                             Inches(col_w - 0.2), Inches(value_h),
+                             font_name=fonts["heading"], font_size=v_pt, bold=True,
+                             color=colors["accent"])
+                label = _truncate_to_fit(str(stat["label"]), l_pt, col_w - 0.2, label_h)
+                add_text_box(slide, label, Inches(x), Inches(y + value_h),
+                             Inches(col_w - 0.2), Inches(label_h),
+                             font_name=body_font, font_size=l_pt, bold=True, color=colors["text"])
+                if has_sub and stat.get("sublabel"):
+                    s_pt = max(8, l_pt - 2)
+                    sub = _truncate_to_fit(str(stat["sublabel"]), s_pt, col_w - 0.2, 0.35)
+                    add_text_box(slide, sub, Inches(x), Inches(y + value_h + label_h),
+                                 Inches(col_w - 0.2), Inches(0.35),
+                                 font_name=body_font, font_size=s_pt, color=colors["muted"])
+            y += total_h
 
         elif btype == "chart":
             chart_spec = block["chart"]
@@ -928,65 +1109,82 @@ def _stack_blocks(slide, card: dict, colors: dict, fonts: dict,
                 cd.add_series(ds["label"], [v if v is not None else 0 for v in ds["data"]])
             xl_map = {"bar": XL_CHART_TYPE.BAR_CLUSTERED, "column": XL_CHART_TYPE.COLUMN_CLUSTERED,
                       "line": XL_CHART_TYPE.LINE, "pie": XL_CHART_TYPE.PIE}
-            h = min(3.4, 6.9 - y)
-            if h >= 2.0:
-                slide.shapes.add_chart(xl_map.get(chart_spec["type"], XL_CHART_TYPE.COLUMN_CLUSTERED),
-                                       Inches(0.85), Inches(y), Inches(content_width_in - 0.85), Inches(h), cd)
+            h = min(3.4, remaining - (0.5 if block.get("insight") else 0.0))
+            if h >= 1.6:
+                slide.shapes.add_chart(
+                    xl_map.get(chart_spec["type"], XL_CHART_TYPE.COLUMN_CLUSTERED),
+                    Inches(0.85), Inches(y), Inches(content_width_in - 0.85), Inches(h), cd)
                 y += h + 0.1
-            if block.get("insight") and y < 6.6:
+            if block.get("insight") and CONTENT_BOTTOM_IN - y >= 0.4:
                 add_text_box(slide, block["insight"], Inches(0.85), Inches(y),
                              Inches(content_width_in - 0.85), Inches(0.4),
-                             font_name=body_font, font_size=12, italic=True, color=colors["muted"])
+                             font_name=body_font, font_size=max(10, round(12 * scale)),
+                             italic=True, color=colors["muted"])
                 y += 0.5
 
         elif btype == "table":
             cols, rows = block["columns"], block["rows"]
-            n_rows = min(len(rows) + 1, int((6.9 - y) / 0.38))
+            row_h = 0.38 * scale
+            n_rows = min(len(rows) + 1, max(2, int(remaining / row_h)))
             if n_rows >= 2:
                 shape = slide.shapes.add_table(n_rows, len(cols), Inches(0.85), Inches(y),
-                                               Inches(content_width_in - 0.85), Inches(0.38 * n_rows))
+                                               Inches(content_width_in - 0.85),
+                                               Inches(row_h * n_rows))
                 table = shape.table
                 for c, name in enumerate(cols):
-                    cell = table.cell(0, c); cell.text = name
-                    cell.text_frame.paragraphs[0].runs[0].font.size = Pt(12)
+                    cell = table.cell(0, c); cell.text = str(name)
+                    cell.text_frame.paragraphs[0].runs[0].font.size = Pt(max(9, round(12 * scale)))
                     cell.text_frame.paragraphs[0].runs[0].font.bold = True
                 for r in range(1, n_rows):
                     for c in range(len(cols)):
-                        cell = table.cell(r, c); cell.text = rows[r - 1][c]
-                        cell.text_frame.paragraphs[0].runs[0].font.size = Pt(11)
-                y += 0.38 * n_rows + 0.15
+                        cell = table.cell(r, c); cell.text = str(rows[r - 1][c])
+                        cell.text_frame.paragraphs[0].runs[0].font.size = Pt(max(8, round(11 * scale)))
+                y += row_h * n_rows + 0.15
 
         elif btype == "callout":
-            fill = CALLOUT_FILL[block["style"]]; text_c = CALLOUT_TEXT[block["style"]]
-            lines = max(1, len(block["text"]) // 90 + 1)
-            h = 0.35 * lines + 0.25
-            box = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.85), Inches(y),
-                                         Inches(content_width_in - 0.85), Inches(h))
-            box.fill.solid(); box.fill.fore_color.rgb = _rgb(fill); box.line.fill.background()
-            add_text_box(slide, block["text"], Inches(1.05), Inches(y + 0.08),
-                         Inches(content_width_in - 1.3), Inches(h - 0.16),
-                         font_name=body_font, font_size=13, bold=True, color=text_c)
+            from pptx.enum.shapes import MSO_SHAPE
+            box_w = content_width_in - 1.5
+            c_pt = max(10, round(13 * scale))
+            text = block["text"]
+            h = _text_height_in(_line_count(text, c_pt, box_w), c_pt) + 0.2
+            if h > remaining:
+                text = _truncate_to_fit(text, c_pt, box_w, max(0.3, remaining - 0.2))
+                h = _text_height_in(_line_count(text, c_pt, box_w), c_pt) + 0.2
+            key = block.get("style") if isinstance(block.get("style"), str) else block.get("variant")
+            shape = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.85), Inches(y),
+                                           Inches(content_width_in - 0.85), Inches(h))
+            shape.fill.solid()
+            shape.fill.fore_color.rgb = _rgb(CALLOUT_FILL.get(key, CALLOUT_FILL["info"]))
+            shape.line.fill.background()
+            add_text_box(slide, text, Inches(1.1), Inches(y + 0.08), Inches(box_w), Inches(h - 0.1),
+                         font_name=body_font, font_size=c_pt, bold=True,
+                         color=CALLOUT_TEXT.get(key, CALLOUT_TEXT["info"]))
             y += h + 0.15
 
         elif btype == "quote":
-            lines = max(1, len(block["text"]) // 80 + 1)
-            h = 0.4 * lines
-            add_text_box(slide, f'“{block["text"]}”', Inches(1.1), Inches(y),
-                         Inches(content_width_in - 1.4), Inches(h),
-                         font_name=fonts["heading"], font_size=17, italic=True, color=colors["accent"])
+            box_w = content_width_in - 1.4
+            q_pt = max(12, round(17 * scale))
+            text = block["text"]
+            h = _text_height_in(_line_count(text, q_pt, box_w), q_pt)
+            if h > remaining:
+                text = _truncate_to_fit(text, q_pt, box_w, remaining)
+                h = _text_height_in(_line_count(text, q_pt, box_w), q_pt)
+            add_text_box(slide, "“" + text + "”", Inches(1.1), Inches(y),
+                         Inches(box_w), Inches(h),
+                         font_name=fonts["heading"], font_size=q_pt, italic=True,
+                         color=colors["accent"])
             y += h + 0.05
-            if block.get("attribution"):
-                add_text_box(slide, f'— {block["attribution"]}', Inches(1.1), Inches(y),
-                             Inches(content_width_in - 1.4), Inches(0.35),
-                             font_name=body_font, font_size=12, color=colors["muted"])
+            if block.get("attribution") and CONTENT_BOTTOM_IN - y >= 0.35:
+                add_text_box(slide, "— " + str(block["attribution"]), Inches(1.1), Inches(y),
+                             Inches(box_w), Inches(0.35),
+                             font_name=body_font, font_size=max(9, round(12 * scale)),
+                             color=colors["muted"])
                 y += 0.45
 
-        # The caller already removes the image when it owns the right column,
-        # so anything reaching here is meant to sit inline.
         elif btype == "image":
             img_bytes = _download_image(block.get("url", ""))
-            h = min(3.2, 6.9 - y)
-            if img_bytes and h >= 1.5:
+            h = min(3.2, remaining - 0.1)
+            if img_bytes and h >= 1.2:
                 add_picture_fit(slide, img_bytes, Inches(0.85), Inches(y),
                                 Inches(content_width_in - 0.85), Inches(h))
                 y += h + 0.15
