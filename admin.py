@@ -1,9 +1,11 @@
 import os
-from fastapi import APIRouter, HTTPException, Header
+from fastapi import APIRouter, HTTPException, Header, Depends
 from pydantic import BaseModel
 from typing import Optional
 from supabase import create_client
 from dotenv import load_dotenv
+
+from auth import AuthContext, current_user
 
 load_dotenv()
 
@@ -55,28 +57,23 @@ class CheckUsageRequest(BaseModel):
 
 
 @router.post("/check-usage")
-async def check_usage(body: CheckUsageRequest):
+async def check_usage(body: CheckUsageRequest,
+                      auth: AuthContext = Depends(current_user)):
     """
-    Called by Lovable BEFORE every AI feature call.
-    Returns { allowed: true } or { allowed: false, message, reason, upgrade_available }
-    Lovable shows the upgrade popup when allowed=false and upgrade_available=true.
+    DEAD STUB — a Lovable-era passthrough that always answers "allowed" and reads
+    nothing. Lovable is gone, no caller in the current frontend references it, and
+    quota enforcement was never moved here. It is authorised anyway so no endpoint
+    in this service takes an unchecked workspace_id, but the real fix is to delete
+    it or implement it against the app DB. See 06_immediate_next_steps.md.
 
     Features: ai_search | chatbot_internal | chatbot_external |
               presentation | course_generation | video_generation | document_ingestion
     """
-    try:
-        # This calls the SQL function in Lovable's Supabase
-        # Since we can't call Lovable's DB from Railway,
-        # this endpoint is a PASSTHROUGH — Lovable calls it with workspace context
-        # and Lovable itself calls check_and_increment_usage() via its own DB client.
-        # Railway just returns the structure Lovable needs.
-        # ACTUAL enforcement happens in Lovable via the SQL function.
-        return {
-            "allowed": True,
-            "note": "Enforcement handled by Lovable via check_and_increment_usage() SQL function"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    auth.assert_workspace(body.workspace_id)
+    return {
+        "allowed": True,
+        "note": "Stub — no quota enforcement is implemented in this service.",
+    }
 
 
 # ── Super admin endpoints (protected by SUPER_ADMIN_SECRET header) ─────────────

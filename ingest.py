@@ -10,7 +10,8 @@ import openpyxl
 import threading
 import ai
 from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from auth import AuthContext, current_user
 from pydantic import BaseModel
 from typing import Optional
 from supabase import create_client
@@ -444,7 +445,8 @@ def _run_ingest_job(job_id: str, request: IngestRequest):
 # ── Routes ──────────────────────────────────────────────────────────────────────
 
 @router.post("/ingest")
-async def ingest_document(request: IngestRequest):
+async def ingest_document(request: IngestRequest,
+                          auth: AuthContext = Depends(current_user)):
     """
     Processes a document and stores chunks in the vector DB.
     workspace_id is stored with every chunk — this is what isolates
@@ -465,6 +467,10 @@ async def ingest_document(request: IngestRequest):
             status_code=400,
             detail="workspace_id is required. Every document must belong to a workspace."
         )
+
+    # Chunks are written with this workspace_id, so an unauthorised caller could
+    # otherwise inject documents into someone else's brain, not just read one.
+    auth.assert_workspace(request.workspace_id)
 
     if request.wait:
         try:
@@ -512,13 +518,17 @@ async def ingest_document(request: IngestRequest):
 
 
 @router.get("/ingest-status/{job_id}")
-async def ingest_status(job_id: str):
+async def ingest_status(job_id: str,
+                        auth: AuthContext = Depends(current_user)):
     """
     Live status of a background ingestion job.
     status: processing | completed | failed
     stage:  queued | downloading | extracting | embedding | storing | completed
     While embedding, chunks_embedded / chunks_total gives real progress
     for a percentage bar in the UI.
+
+    The job record carries file_name and workspace_id, so it is authorised like
+    any other workspace read. A random job UUID is not a credential.
     """
     job = INGEST_JOBS.get(job_id)
     if job is None:
@@ -526,4 +536,5 @@ async def ingest_status(job_id: str):
             status_code=404,
             detail="Unknown job_id. The server may have restarted — re-upload the document."
         )
+    auth.assert_workspace(job["workspace_id"])
     return job

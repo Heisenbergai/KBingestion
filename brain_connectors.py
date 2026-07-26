@@ -21,7 +21,8 @@ import json
 import threading
 import ai
 from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from auth import AuthContext, current_user
 from pydantic import BaseModel
 from typing import Optional
 from supabase import create_client
@@ -303,19 +304,36 @@ def delete_note(note_id: str) -> None:
 # ── Generic REST routes (frontend drives these; Railway is the API) ─────────────
 
 @router.get("/connections")
-async def list_connections(workspace_id: str):
+async def list_connections(workspace_id: str,
+                           auth: AuthContext = Depends(current_user)):
     """All external connections for a workspace (status shown in Settings)."""
     if not workspace_id:
         raise HTTPException(status_code=400, detail="workspace_id is required.")
+    auth.assert_workspace(workspace_id)
     rows = supabase.table("connections").select(
         "id, provider, external_team_name, status, error_detail, config, connected_by, created_at"
     ).eq("workspace_id", workspace_id).execute().data or []
     return {"connections": rows}
 
 
+def _connection_workspace(connection_id: str) -> str:
+    """
+    Resolves which workspace owns a connection, so routes keyed only by an opaque
+    id can still be authorised. Without this, knowing a connection UUID was enough
+    to revoke someone else's integration.
+    """
+    row = supabase.table("connections").select("workspace_id") \
+        .eq("id", connection_id).execute().data
+    if not row:
+        raise HTTPException(status_code=404, detail="Connection not found.")
+    return row[0]["workspace_id"]
+
+
 @router.delete("/connections/{connection_id}")
-async def disconnect(connection_id: str, delete_notes: bool = False):
+async def disconnect(connection_id: str, delete_notes: bool = False,
+                     auth: AuthContext = Depends(current_user)):
     """Revokes a connection. Optionally deletes all knowledge notes it produced."""
+    auth.assert_workspace(_connection_workspace(connection_id))
     if delete_notes:
         notes = supabase.table("knowledge_notes").select("id") \
             .eq("connection_id", connection_id).execute().data or []
@@ -326,10 +344,12 @@ async def disconnect(connection_id: str, delete_notes: bool = False):
 
 
 @router.get("/knowledge-notes")
-async def list_knowledge_notes(workspace_id: str, limit: int = 100):
+async def list_knowledge_notes(workspace_id: str, limit: int = 100,
+                               auth: AuthContext = Depends(current_user)):
     """Distilled notes captured from integrations — shown in Library."""
     if not workspace_id:
         raise HTTPException(status_code=400, detail="workspace_id is required.")
+    auth.assert_workspace(workspace_id)
     rows = supabase.table("knowledge_notes").select(
         "id, provider, source_type, category, title, body, participants, source_ref, occurred_at, created_at"
     ).eq("workspace_id", workspace_id).eq("status", "active") \
@@ -338,8 +358,14 @@ async def list_knowledge_notes(workspace_id: str, limit: int = 100):
 
 
 @router.delete("/knowledge-notes/{note_id}")
-async def delete_knowledge_note(note_id: str):
+async def delete_knowledge_note(note_id: str,
+                                auth: AuthContext = Depends(current_user)):
     """Deletes a note and its chunks (admin curation)."""
+    row = supabase.table("knowledge_notes").select("workspace_id") \
+        .eq("id", note_id).execute().data
+    if not row:
+        raise HTTPException(status_code=404, detail="Note not found.")
+    auth.assert_workspace(row[0]["workspace_id"])
     delete_note(note_id)
     return {"success": True}
 
@@ -349,7 +375,8 @@ class SyncRequest(BaseModel):
 
 
 @router.post("/connectors/sync")
-async def trigger_filtration(body: SyncRequest):
+async def trigger_filtration(body: SyncRequest,
+                             auth: AuthContext = Depends(current_user)):
     """
     Runs filtration over any pending captured items for a connection
     (in the background). Provider-specific FETCH (pulling new messages into
@@ -360,6 +387,8 @@ async def trigger_filtration(body: SyncRequest):
     if not conn:
         raise HTTPException(status_code=404, detail="Connection not found.")
     conn = conn[0]
+
+    auth.assert_workspace(conn["workspace_id"])
 
     import uuid as _uuid
     job_id = str(_uuid.uuid4())
@@ -380,8 +409,11 @@ async def trigger_filtration(body: SyncRequest):
 
 
 @router.get("/connectors/sync-status/{job_id}")
-async def sync_status(job_id: str):
+async def sync_status(job_id: str,
+                      auth: AuthContext = Depends(current_user)):
+    """Progress of a filtration/backfill job, authorised via the connection it runs on."""
     job = SYNC_JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Unknown job id.")
+    auth.assert_workspace(_connection_workspace(job["connection_id"]))
     return job

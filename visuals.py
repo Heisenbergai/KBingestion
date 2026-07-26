@@ -16,7 +16,8 @@ GET /workspace-stats/{workspace_id}
 import os
 import json
 import ai
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from auth import AuthContext, current_user
 from pydantic import BaseModel
 from typing import Optional
 from supabase import create_client
@@ -162,8 +163,10 @@ Respond only with the JSON object."""
 
 
 @router.get("/workspace-stats/{workspace_id}")
-async def workspace_stats(workspace_id: str):
+async def workspace_stats(workspace_id: str,
+                          auth: AuthContext = Depends(current_user)):
     """Documents + chunks indexed in the vector DB for this workspace."""
+    auth.assert_workspace(workspace_id)
     try:
         result = supabase.rpc("workspace_doc_stats",
                               {"filter_workspace_id": workspace_id}).execute()

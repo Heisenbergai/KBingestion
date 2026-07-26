@@ -1,6 +1,9 @@
 import os
 import ai
-from fastapi import APIRouter, HTTPException, Request
+import httpx
+import auth as auth_mod
+from fastapi import APIRouter, HTTPException, Request, Depends
+from auth import AuthContext, current_user
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional
@@ -289,7 +292,8 @@ def log_usage_event(bot: BotConfig, source: str, domain: str = None,
 
 
 @router.get("/bot-analytics")
-async def bot_analytics(workspace_id: str, days: int = 30):
+async def bot_analytics(workspace_id: str, days: int = 30,
+                        auth: AuthContext = Depends(current_user)):
     """
     Usage analytics for all bots in a workspace, keyed by bot_id
     (Lovable joins display names from its own chatbots table):
@@ -302,6 +306,8 @@ async def bot_analytics(workspace_id: str, days: int = 30):
     try:
         if not workspace_id:
             raise HTTPException(status_code=400, detail="workspace_id is required.")
+
+        auth.assert_workspace(workspace_id)
 
         summary = supabase.rpc("bot_usage_summary",
                                {"filter_workspace_id": workspace_id}).execute().data or []
@@ -347,25 +353,82 @@ def verify_domain(bot: BotConfig, request: Request):
         raise HTTPException(status_code=403, detail="Domain not allowed.")
 
 
+def resolve_public_bot(token: str) -> dict:
+    """
+    Turns a widget's public_token into the REAL bot record from the app DB.
+
+    This exists because /widget-query is genuinely public — there is no user
+    session to authenticate — so the workspace it reads must come from the server,
+    never from the embedding page. Previously bot_config arrived from the browser,
+    which meant anyone could POST an arbitrary workspace_id and read that whole
+    workspace. The token is the bearer credential; get_public_bot() matches it
+    exactly and only returns active bots.
+    """
+    if not token or len(token) < 16:
+        raise HTTPException(status_code=401, detail="Invalid bot token.")
+
+    if not auth_mod.APP_SUPABASE_URL or not auth_mod.APP_SUPABASE_ANON_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="Server auth is misconfigured (APP_SUPABASE_URL / APP_SUPABASE_ANON_KEY).",
+        )
+
+    try:
+        with httpx.Client(timeout=10) as client:
+            res = client.post(
+                f"{auth_mod.APP_SUPABASE_URL}/rest/v1/rpc/get_public_bot",
+                json={"_token": token},
+                headers={
+                    "apikey":       auth_mod.APP_SUPABASE_ANON_KEY,
+                    "Content-Type": "application/json",
+                },
+            )
+            res.raise_for_status()
+            rows = res.json()
+    except Exception as e:
+        print(f"WIDGET-BOT-RESOLVE ERROR: {e}")
+        raise HTTPException(status_code=503, detail="Could not verify this bot.")
+
+    if not rows:
+        raise HTTPException(status_code=401, detail="Invalid bot token.")
+    return rows[0]
+
+
 @router.post("/widget-query")
 async def widget_query(request: Request, body: WidgetQueryRequest):
     try:
         if not body.question.strip():
             raise HTTPException(status_code=400, detail="Question cannot be empty")
-        verify_domain(body.bot_config, request)
+
+        # Server-resolved identity wins over anything the page sent. linked_folder_ids
+        # is the ONE field still taken from the client, and it can only narrow the
+        # search within the resolved workspace — never widen it past the boundary.
+        record = resolve_public_bot(body.token)
+        bot = BotConfig(
+            id                = str(record["id"]),
+            name              = record.get("name") or "Assistant",
+            workspace_id      = str(record["workspace_id"]),
+            system_prompt     = record.get("system_prompt") or "",
+            greeting_message  = record.get("greeting_message") or "",
+            allowed_domains   = record.get("allowed_domains") or [],
+            linked_folder_ids = body.bot_config.linked_folder_ids or [],
+            public_token      = None,
+        )
+
+        verify_domain(bot, request)
         answer, sources = run_rag_query(
             body.question,
-            body.bot_config,
+            bot,
             history=body.conversation_history,
             strict_folders=True,   # public bots never fall back outside their scope
         )
         origin = request.headers.get("origin") or request.headers.get("referer") or ""
         domain = origin.split("//")[-1].split("/")[0] if origin else None
-        log_usage_event(body.bot_config, "widget", domain=domain, session_id=body.session_id)
+        log_usage_event(bot, "widget", domain=domain, session_id=body.session_id)
         return {
             "answer":          answer,
             "sources":         sources,
-            "bot_name":        body.bot_config.name,
+            "bot_name":        bot.name,
             "conversation_id": body.conversation_id,
             "session_id":      body.session_id,
         }
@@ -379,10 +442,17 @@ async def widget_query(request: Request, body: WidgetQueryRequest):
 
 
 @router.post("/internal-query")
-async def internal_query(body: InternalQueryRequest):
+async def internal_query(body: InternalQueryRequest,
+                         auth: AuthContext = Depends(current_user)):
     try:
         if not body.question.strip():
             raise HTTPException(status_code=400, detail="Question cannot be empty")
+
+        # bot_config is client-supplied, so its workspace_id is a claim, not a fact.
+        # This is the check whose absence let an unauthenticated caller read any
+        # workspace's documents by naming its UUID.
+        auth.assert_workspace(body.bot_config.workspace_id)
+
         answer, sources = run_rag_query(
             body.question,
             body.bot_config,

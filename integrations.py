@@ -16,7 +16,8 @@ brain_connectors.py); tokens are Fernet-encrypted. The captured-knowledge
 pipeline (filtration → notes → embeddings) is shared across all providers.
 """
 import os
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from auth import AuthContext, current_user
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional
@@ -111,13 +112,18 @@ def _provider_public(pid: str, p: dict) -> dict:
         "captures": p.get("captures", ""),
         "needs_channel_selection": p.get("needs_channel_selection", False),
         "install_path": p.get("install_path"),
+        # How the UI should start an OAuth flow: POST here with {workspace_id,
+        # provider}, then open the returned url in a popup. install_path is kept
+        # only for non-browser callers — a popup cannot send an auth header.
+        "oauth_url_path": "/integrations/oauth-url" if p["auth_method"] == "oauth" else None,
         "api_key_label": p.get("api_key_label"),
         "setup_hint": p.get("setup_hint"),
     }
 
 
 @router.get("/integrations")
-async def list_integrations(workspace_id: str):
+async def list_integrations(workspace_id: str,
+                            auth: AuthContext = Depends(current_user)):
     """
     Everything the admin Integrations page needs: every provider with its
     live connection status for this workspace. The page renders purely from
@@ -125,6 +131,7 @@ async def list_integrations(workspace_id: str):
     """
     if not workspace_id:
         raise HTTPException(status_code=400, detail="workspace_id is required.")
+    auth.assert_workspace(workspace_id)
 
     conns = bc.supabase.table("connections").select(
         "id, provider, external_team_name, status, error_detail, config, created_at"
@@ -165,12 +172,15 @@ class ApiKeyConnectRequest(BaseModel):
 
 
 @router.post("/integrations/connect-key")
-async def connect_api_key(body: ApiKeyConnectRequest):
+async def connect_api_key(body: ApiKeyConnectRequest,
+                          auth: AuthContext = Depends(current_user)):
     """
     Connect an API-key-based provider (e.g. Confluence). OAuth providers use
     their own /{provider}/install popup instead. Stored encrypted, same as
     OAuth tokens. Refuses providers that aren't 'available' yet.
     """
+    auth.assert_workspace(body.workspace_id)
+
     p = PROVIDERS.get(body.provider)
     if not p:
         raise HTTPException(status_code=404, detail=f"Unknown provider '{body.provider}'.")
@@ -192,6 +202,46 @@ async def connect_api_key(body: ApiKeyConnectRequest):
     }
     bc.supabase.table("connections").insert(row).execute()
     return {"success": True, "provider": body.provider}
+
+
+class OAuthUrlRequest(BaseModel):
+    workspace_id: str
+    provider:     str
+    user_id:      Optional[str] = ""
+
+
+@router.post("/integrations/oauth-url")
+async def oauth_url(body: OAuthUrlRequest,
+                    auth: AuthContext = Depends(current_user)):
+    """
+    Mints the provider's OAuth consent URL for one workspace.
+
+    This exists because a popup navigation cannot carry an Authorization header,
+    so the old "just open /{provider}/install?workspace_id=…" pattern could not be
+    authenticated at all — any workspace UUID was enough to start a flow that
+    attached the attacker's Slack team to that workspace. The membership check
+    happens here, and the workspace is then sealed into the Fernet-signed state,
+    so the popup itself carries no credential and needs none.
+    """
+    auth.assert_workspace(body.workspace_id)
+
+    p = PROVIDERS.get(body.provider)
+    if not p:
+        raise HTTPException(status_code=404, detail=f"Unknown provider '{body.provider}'.")
+    if p["auth_method"] != "oauth":
+        raise HTTPException(status_code=400, detail=f"{p['name']} connects with an API key, not OAuth.")
+    if p["status"] != "available":
+        raise HTTPException(status_code=400, detail=f"{p['name']} integration is coming soon.")
+
+    if body.provider == "slack":
+        import connector_slack
+        url = connector_slack.build_install_url(body.workspace_id, body.user_id or "")
+    else:
+        # Unreachable while slack is the only "available" oauth provider; this is
+        # the one line each new connector must add.
+        raise HTTPException(status_code=400, detail=f"No OAuth builder for '{body.provider}'.")
+
+    return {"url": url, "provider": body.provider}
 
 
 def oauth_complete_html(provider: str, status: str) -> HTMLResponse:

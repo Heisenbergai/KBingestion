@@ -2,11 +2,17 @@
 Slack connector (Phase 2, first integration).
 
 Flow:
-  1. GET  /slack/install         → redirect user to Slack's OAuth consent
+  1. POST /integrations/oauth-url → (authenticated) mint the consent URL, open it
+                                    in a popup. GET /slack/install does the same
+                                    thing as a redirect, for non-browser callers.
   2. GET  /slack/oauth/callback  → exchange code, store encrypted token, back to app
   3. GET  /slack/channels        → list channels for the admin to pick
   4. POST /slack/channels/select → save selection + backfill (background) + filtration
   5. POST /slack/events          → Slack Events API webhook: live messages → ingest_items
+
+Steps 1, 3 and 4 require the caller's Supabase token and check membership of the
+owning workspace (see auth.py). Step 2 is authenticated by the Fernet-signed
+state minted in step 1; step 5 by Slack's own request signature.
 
 Everything Slack-specific lives here; the shared pipeline (capture, filtration,
 notes, embedding) is in brain_connectors.py.
@@ -28,11 +34,13 @@ import hashlib
 import threading
 import httpx
 from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Depends
 from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 from typing import Optional
 from dotenv import load_dotenv
+
+from auth import AuthContext, current_user
 
 import brain_connectors as bc
 
@@ -99,15 +107,34 @@ def _user_name_map(token: str) -> dict:
 
 # ── Routes ──────────────────────────────────────────────────────────────────────
 
-@router.get("/slack/install")
-async def slack_install(workspace_id: str, user_id: str = ""):
-    """Redirects the admin to Slack's consent screen."""
+def build_install_url(workspace_id: str, user_id: str = "") -> str:
+    """
+    The Slack consent URL for one workspace, with the workspace baked into a
+    Fernet-signed state so the callback cannot be pointed at someone else's
+    workspace. Shared with POST /integrations/oauth-url, which is what the
+    browser actually uses — a popup navigation cannot carry an Authorization
+    header, so the URL is minted by an authenticated call and only then opened.
+    """
     if not SLACK_CLIENT_ID:
         raise HTTPException(status_code=500, detail="SLACK_CLIENT_ID not configured on the server.")
     state = _encode_state(workspace_id, user_id)
-    url = (f"https://slack.com/oauth/v2/authorize?client_id={SLACK_CLIENT_ID}"
-           f"&scope={SLACK_SCOPES}&redirect_uri={REDIRECT_URI}&state={state}")
-    return RedirectResponse(url)
+    return (f"https://slack.com/oauth/v2/authorize?client_id={SLACK_CLIENT_ID}"
+            f"&scope={SLACK_SCOPES}&redirect_uri={REDIRECT_URI}&state={state}")
+
+
+@router.get("/slack/install")
+async def slack_install(workspace_id: str, user_id: str = "",
+                        auth: AuthContext = Depends(current_user)):
+    """
+    Redirects the admin to Slack's consent screen.
+
+    Authenticated: without this check anyone could mint a valid state for a
+    workspace they do not belong to and bind their own Slack team to it —
+    injecting messages into that company's brain. Browser popups should use
+    POST /integrations/oauth-url instead, which returns the same URL as JSON.
+    """
+    auth.assert_workspace(workspace_id)
+    return RedirectResponse(build_install_url(workspace_id, user_id))
 
 
 @router.get("/slack/oauth/callback")
@@ -161,9 +188,17 @@ def _get_conn_token(connection_id: str) -> tuple[dict, str]:
 
 
 @router.get("/slack/channels")
-async def slack_channels(connection_id: str):
-    """Public channels the admin can choose to ingest from."""
+async def slack_channels(connection_id: str,
+                         auth: AuthContext = Depends(current_user)):
+    """
+    Public channels the admin can choose to ingest from.
+
+    The connection UUID is an opaque id, not a credential — the workspace that
+    owns it is resolved from the row and authorised before any Slack call is
+    made with that workspace's bot token.
+    """
     conn, token = _get_conn_token(connection_id)
+    auth.assert_workspace(conn["workspace_id"])
     data = _slack_get("conversations.list", token,
                       {"types": "public_channel", "limit": 200, "exclude_archived": "true"})
     channels = [{"id": c["id"], "name": c["name"], "num_members": c.get("num_members", 0),
@@ -179,9 +214,17 @@ class SelectChannelsRequest(BaseModel):
 
 
 @router.post("/slack/channels/select")
-async def slack_select_channels(body: SelectChannelsRequest):
-    """Saves the channel selection and kicks off a background backfill + filtration."""
+async def slack_select_channels(body: SelectChannelsRequest,
+                                auth: AuthContext = Depends(current_user)):
+    """
+    Saves the channel selection and kicks off a background backfill + filtration.
+
+    Authorised on the connection's owning workspace: this both reads Slack
+    history and writes notes into that workspace's brain, so it is the most
+    damaging of the three Slack routes to leave open.
+    """
     conn, token = _get_conn_token(body.connection_id)
+    auth.assert_workspace(conn["workspace_id"])
 
     bc.supabase.table("connections").update(
         {"config": {"channels": body.channels}}

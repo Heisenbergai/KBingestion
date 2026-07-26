@@ -1,7 +1,8 @@
 import os
 import re
 import ai
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from auth import AuthContext, current_user
 from pydantic import BaseModel
 from typing import Optional
 from supabase import create_client
@@ -88,7 +89,8 @@ def split_answer_and_gaps(text: str) -> tuple[str, Optional[str]]:
 
 
 @router.post("/query")
-async def query_documents(request: QueryRequest):
+async def query_documents(request: QueryRequest,
+                          auth: AuthContext = Depends(current_user)):
     """
     Company-brain search over ONLY the caller's workspace. Returns a
     synthesized answer with inline [n] citations, a structured citations
@@ -98,6 +100,10 @@ async def query_documents(request: QueryRequest):
     try:
         if not request.workspace_id:
             raise HTTPException(status_code=400, detail="workspace_id is required for all queries.")
+
+        # The workspace_id below decides which chunks are searched, so it has to be
+        # authorised before it is used — not merely present.
+        auth.assert_workspace(request.workspace_id)
 
         chunks = hybrid_search(
             request.question, request.workspace_id,
