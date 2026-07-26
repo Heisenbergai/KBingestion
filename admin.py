@@ -1,11 +1,9 @@
 import os
-from fastapi import APIRouter, HTTPException, Header, Depends
+from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel
 from typing import Optional
 from supabase import create_client
 from dotenv import load_dotenv
-
-from auth import AuthContext, current_user
 
 load_dotenv()
 
@@ -47,33 +45,6 @@ class SuspendWorkspaceRequest(BaseModel):
     workspace_id:    str
     suspend:         bool
     reason:          Optional[str] = None
-
-
-# ── Usage check endpoint (called by Lovable before every AI feature) ───────────
-class CheckUsageRequest(BaseModel):
-    workspace_id:  str
-    feature:       str
-    user_id:       Optional[str] = None
-
-
-@router.post("/check-usage")
-async def check_usage(body: CheckUsageRequest,
-                      auth: AuthContext = Depends(current_user)):
-    """
-    DEAD STUB — a Lovable-era passthrough that always answers "allowed" and reads
-    nothing. Lovable is gone, no caller in the current frontend references it, and
-    quota enforcement was never moved here. It is authorised anyway so no endpoint
-    in this service takes an unchecked workspace_id, but the real fix is to delete
-    it or implement it against the app DB. See 06_immediate_next_steps.md.
-
-    Features: ai_search | chatbot_internal | chatbot_external |
-              presentation | course_generation | video_generation | document_ingestion
-    """
-    auth.assert_workspace(body.workspace_id)
-    return {
-        "allowed": True,
-        "note": "Stub — no quota enforcement is implemented in this service.",
-    }
 
 
 # ── Super admin endpoints (protected by SUPER_ADMIN_SECRET header) ─────────────
