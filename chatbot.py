@@ -2,6 +2,7 @@ import os
 import ai
 import httpx
 import auth as auth_mod
+from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Request, Depends
 from auth import AuthContext, current_user
 from fastapi.responses import FileResponse
@@ -115,7 +116,7 @@ def run_rag_query(
     strict_folders: bool = False,
     user_id: Optional[str] = None,
     feature: str = "chatbot_internal",
-) -> tuple[str, list[str]]:
+) -> tuple[str, list[str], str]:
     """
     Searches ONLY document chunks belonging to the bot's workspace.
     workspace_id in bot_config is the single source of truth for isolation.
@@ -130,6 +131,11 @@ def run_rag_query(
     same 'chatbot_internal'/'chatbot_external' vocabulary check_and_increment_usage
     already uses, so a workspace's quota checks and its token spend can be
     correlated by feature without translating between two naming schemes.
+
+    Returns (answer, sources, confidence). confidence reuses query.py's exact
+    scheme (high/medium/low/none, from top chunk similarity) rather than
+    inventing a second one, so the caller can escalate a low/none answer into
+    the admin's unanswered-questions queue.
     """
     if not bot.workspace_id:
         raise HTTPException(
@@ -186,11 +192,17 @@ def run_rag_query(
         # Additionally filter by linked documents if specified.
         # See the comment on BotConfig.linked_folder_ids — this only works
         # if Lovable resolved folder IDs to document/asset IDs first.
+        # A chunk from a note this SPECIFIC bot learned (bot_learning.py,
+        # via create_note_and_embed's extra_metadata) always stays in scope —
+        # it has no knowledge_folders placement to filter by, and it was
+        # taught to this bot directly in response to its own escalated
+        # question, so folder-scoping shouldn't hide it from that bot.
         if bot.linked_folder_ids and all_chunks:
             filtered = [
                 c for c in all_chunks
                 if c.get("document_id") in bot.linked_folder_ids
                 or c.get("asset_id") in bot.linked_folder_ids
+                or c.get("metadata", {}).get("learned_for_bot_id") == bot.id
             ]
             if filtered:
                 chunks = filtered
@@ -238,6 +250,31 @@ def run_rag_query(
     except Exception as e:
         print(f"[chatbot] RAG search error: {str(e)}")
 
+    # Confidence mirrors query.py's exact thresholds (query.py:158-160) — reused
+    # rather than reinvented, so "answered well" means the same thing across AI
+    # Search and chatbots. No chunks at all is "none"; otherwise it's driven by
+    # the best-matching chunk's semantic similarity.
+    #
+    # similarity is normally a float, but PostgREST serialises NaN/Infinity as
+    # the STRING "NaN"/"Infinity" (JSON has no such literals) — confirmed while
+    # testing this locally with a degenerate query embedding. Coerced safely
+    # here so a NaN similarity degrades to "no confidence" instead of crashing
+    # run_rag_query with an unhandled TypeError and breaking the chat response.
+    def _safe_similarity(c: dict) -> float:
+        try:
+            v = float(c.get("similarity") or 0)
+            return v if v == v else 0.0  # NaN != NaN
+        except (TypeError, ValueError):
+            return 0.0
+
+    top_sim = max((_safe_similarity(c) for c in chunks), default=0.0)
+    confidence = (
+        "none" if not chunks else
+        "high" if top_sim >= 0.45 else
+        "medium" if top_sim >= 0.3 else
+        "low"
+    )
+
     if context_block:
         system_content = f"""{base_personality}
 
@@ -278,15 +315,23 @@ Use the conversation history to stay consistent with what was already discussed.
         if c.get("metadata", {}).get("file_name")
     ]))
 
-    return answer, sources
+    return answer, sources, confidence
 
 
-def log_usage_event(bot: BotConfig, source: str, domain: str = None,
-                    user_id: str = None, session_id: str = None):
+def log_usage_event(bot: BotConfig, source: str, question: str, confidence: str,
+                    domain: str = None, user_id: str = None, session_id: str = None):
     """
-    Records one analytics row per bot query (powers GET /bot-analytics:
-    chats per bot, internal vs external, which domains the widget runs on).
-    Strictly best-effort — analytics must never break a chat.
+    Records one analytics row per bot query (powers GET /bot-analytics: chats
+    per bot, internal vs external, which domains the widget runs on, top
+    questions asked, and per-bot answer-rate). The question TEXT is logged for
+    every query, not just failures — confirmed with Tanmay: this is the bot
+    owner's own data about their own bot, and enables "top questions asked" +
+    future training-content mining, not just failure triage.
+
+    When confidence is "none" or "low", the same question is also escalated
+    into bot_unanswered_questions — the admin-facing learning queue (answer,
+    upload a document, or transfer to a teammate). Both writes are strictly
+    best-effort: analytics/escalation must never break a chat response.
     """
     try:
         supabase.table("bot_usage_events").insert({
@@ -296,9 +341,25 @@ def log_usage_event(bot: BotConfig, source: str, domain: str = None,
             "domain":       (domain or None),
             "user_id":      user_id,
             "session_id":   session_id,
+            "question":     question[:MAX_MESSAGE_CHARS],
+            "confidence":   confidence,
         }).execute()
     except Exception as e:
         print(f"[chatbot] usage event logging failed (non-fatal): {e}")
+
+    if confidence in ("none", "low"):
+        try:
+            supabase.table("bot_unanswered_questions").insert({
+                "workspace_id": bot.workspace_id,
+                "bot_id":       bot.id,
+                "question":     question[:MAX_MESSAGE_CHARS],
+                "source":       source,
+                "session_id":   session_id,
+                "user_id":      user_id,
+                "confidence":   confidence,
+            }).execute()
+        except Exception as e:
+            print(f"[chatbot] escalation logging failed (non-fatal): {e}")
 
 
 @router.get("/bot-analytics")
@@ -309,9 +370,18 @@ async def bot_analytics(workspace_id: str, days: int = 30,
     (Lovable joins display names from its own chatbots table):
     {
       bots: { "<bot_id>": { total_chats, internal_chats, widget_chats,
-                            domains: {"example.com": n}, last_used } },
+                            domains: {"example.com": n}, last_used,
+                            top_questions: [{question, count}],   # last `days`
+                            confidence_breakdown: {high, medium, low, none},
+                            unanswered_count, answer_rate } },
       daily: [ {bot_id, day, chats} ]   # last `days` days, for charts
     }
+
+    top_questions/confidence_breakdown/unanswered_count/answer_rate are
+    computed directly from bot_usage_events (not a new RPC — cheap at current
+    volume, and keeps bot_usage_summary/daily untouched). answer_rate is
+    1 - unanswered/total, over queries that have a confidence value recorded
+    (older rows predating this column are excluded, not counted as failures).
     """
     try:
         if not workspace_id:
@@ -340,6 +410,40 @@ async def bot_analytics(workspace_id: str, days: int = 30,
                 b["internal_chats"] += chats
             if b["last_used"] is None or row["last_used"] > b["last_used"]:
                 b["last_used"] = row["last_used"]
+
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        events = supabase.table("bot_usage_events") \
+            .select("bot_id, question, confidence") \
+            .eq("workspace_id", workspace_id).gte("created_at", since) \
+            .execute().data or []
+
+        for bot_id, b in bots.items():
+            bot_events = [e for e in events if e["bot_id"] == bot_id]
+
+            confidence_breakdown: dict[str, int] = {}
+            question_groups: dict[str, dict] = {}
+            for e in bot_events:
+                conf = e.get("confidence")
+                if conf:
+                    confidence_breakdown[conf] = confidence_breakdown.get(conf, 0) + 1
+                qtext = (e.get("question") or "").strip()
+                if qtext:
+                    key = qtext.lower()
+                    g = question_groups.setdefault(key, {"question": qtext, "count": 0})
+                    g["count"] += 1
+
+            total_with_confidence = sum(confidence_breakdown.values())
+            unanswered = confidence_breakdown.get("none", 0) + confidence_breakdown.get("low", 0)
+
+            b["confidence_breakdown"] = confidence_breakdown
+            b["unanswered_count"] = unanswered
+            b["answer_rate"] = (
+                round(1 - unanswered / total_with_confidence, 3)
+                if total_with_confidence else None
+            )
+            b["top_questions"] = sorted(
+                question_groups.values(), key=lambda g: g["count"], reverse=True
+            )[:5]
 
         return {"workspace_id": workspace_id, "bots": bots, "daily": daily}
 
@@ -410,9 +514,14 @@ async def widget_query(request: Request, body: WidgetQueryRequest):
         if not body.question.strip():
             raise HTTPException(status_code=400, detail="Question cannot be empty")
 
-        # Server-resolved identity wins over anything the page sent. linked_folder_ids
-        # is the ONE field still taken from the client, and it can only narrow the
-        # search within the resolved workspace — never widen it past the boundary.
+        # Server-resolved identity wins over anything the page sent. Folder scoping
+        # is now ALSO fully server-resolved: get_public_bot's RPC (app DB) resolves
+        # linked_departments (folder IDs) against knowledge_items itself and returns
+        # resolved_document_ids, since it lives in the same Postgres instance as
+        # knowledge_folders/knowledge_items and Railway does not. The client-sent
+        # bot_config.linked_folder_ids is no longer trusted at all for the widget
+        # path — this closes the gap where a folder-scoped external bot previously
+        # returned zero results (raw folder UUIDs never matched document/asset IDs).
         record = resolve_public_bot(body.token)
         bot = BotConfig(
             id                = str(record["id"]),
@@ -421,12 +530,12 @@ async def widget_query(request: Request, body: WidgetQueryRequest):
             system_prompt     = record.get("system_prompt") or "",
             greeting_message  = record.get("greeting_message") or "",
             allowed_domains   = record.get("allowed_domains") or [],
-            linked_folder_ids = body.bot_config.linked_folder_ids or [],
+            linked_folder_ids = [str(i) for i in (record.get("resolved_document_ids") or [])],
             public_token      = None,
         )
 
         verify_domain(bot, request)
-        answer, sources = run_rag_query(
+        answer, sources, confidence = run_rag_query(
             body.question,
             bot,
             history=body.conversation_history,
@@ -435,7 +544,8 @@ async def widget_query(request: Request, body: WidgetQueryRequest):
         )
         origin = request.headers.get("origin") or request.headers.get("referer") or ""
         domain = origin.split("//")[-1].split("/")[0] if origin else None
-        log_usage_event(bot, "widget", domain=domain, session_id=body.session_id)
+        log_usage_event(bot, "widget", body.question.strip(), confidence,
+                        domain=domain, session_id=body.session_id)
         return {
             "answer":          answer,
             "sources":         sources,
@@ -464,14 +574,15 @@ async def internal_query(body: InternalQueryRequest,
         # workspace's documents by naming its UUID.
         auth.assert_workspace(body.bot_config.workspace_id)
 
-        answer, sources = run_rag_query(
+        answer, sources, confidence = run_rag_query(
             body.question,
             body.bot_config,
             history=body.conversation_history,
             strict_folders=False,  # internal users can see workspace docs anyway
             user_id=body.user_id, feature="chatbot_internal",
         )
-        log_usage_event(body.bot_config, "internal", user_id=body.user_id)
+        log_usage_event(body.bot_config, "internal", body.question.strip(), confidence,
+                        user_id=body.user_id)
         return {
             "answer":          answer,
             "sources":         sources,

@@ -363,11 +363,19 @@ def distill_meeting_transcript(transcript: str, meeting_title: str,
 
 def create_note_and_embed(workspace_id: str, connection_id: Optional[str], provider: str,
                           note: dict, source_type: str = "slack", source_tier: int = 3,
-                          source_ref: str = None, occurred_at: str = None) -> str:
+                          source_ref: str = None, occurred_at: str = None,
+                          extra_metadata: Optional[dict] = None) -> str:
     """
     Inserts a knowledge_note and embeds its body into document_chunks
     (document_id = note id, so its chunks are searchable via hybrid search
     and deletable together). Returns the note id.
+
+    extra_metadata is merged into every chunk's metadata dict. First use:
+    bot_learning.py stamps {"learned_for_bot_id": bot_id} on a note created
+    from an admin's answer to an escalated question — a note has no natural
+    knowledge_folders placement, so chatbot.py's folder-scope filter checks
+    this instead to keep a bot-specific learned answer retrievable regardless
+    of that bot's folder scope.
     """
     note_row = {
         "workspace_id":  workspace_id,
@@ -406,6 +414,7 @@ def create_note_and_embed(workspace_id: str, connection_id: Optional[str], provi
             "workspace_id": workspace_id,
             "source_type":  source_type,
             "note_id":      note_id,
+            **(extra_metadata or {}),
         },
     } for i in range(len(chunks))]
     supabase.table("document_chunks").insert(rows).execute()

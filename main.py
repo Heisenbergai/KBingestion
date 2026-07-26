@@ -19,6 +19,7 @@ from connector_google import router as google_router
 from connector_zoom import router as zoom_router
 from integrations import router as integrations_router
 from chatbot import router as chatbot_router
+from bot_learning import router as bot_learning_router
 from admin import router as admin_router
 
 app = FastAPI(title="Knowledge OS API", version="1.0.0")
@@ -50,6 +51,7 @@ app.include_router(google_router)
 app.include_router(zoom_router)
 app.include_router(integrations_router)
 app.include_router(chatbot_router)
+app.include_router(bot_learning_router)
 app.include_router(admin_router)
 
 @app.get("/health")
