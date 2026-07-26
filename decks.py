@@ -134,6 +134,14 @@ class EditCardRequest(BaseModel):
     available_layouts: Optional[list[str]] = None
 
 
+class EditOutlineCardRequest(BaseModel):
+    deck_title:  Optional[str] = ""
+    title:       str
+    brief:       Optional[str] = ""
+    instruction: str
+    chunks:      Optional[list[str]] = []
+
+
 class ExportDeckRequest(BaseModel):
     title:    str
     subtitle: Optional[str] = ""
@@ -199,6 +207,35 @@ def _coerce_layout(value, allowed: Optional[list[str]], blocks: list[dict]) -> s
     return layout
 
 
+# ── Block styling ───────────────────────────────────────────────────────────────
+# Per-block presentation controls set by the user in the editor (font size,
+# column width, alignment). They must survive normalize_card, which otherwise
+# rebuilds blocks from known keys only and would silently drop them on every
+# AI edit — the styling would vanish the moment someone used "make this shorter".
+
+STYLE_SIZES  = ("sm", "base", "lg", "xl")
+STYLE_WIDTHS = ("full", "two_thirds", "half")
+STYLE_ALIGNS = ("left", "center", "right")
+
+# size -> pptx point size, so the export matches what the editor shows
+STYLE_PT = {"sm": 11, "base": 14, "lg": 18, "xl": 23}
+# width -> fraction of the available content column
+STYLE_FRACTION = {"full": 1.0, "two_thirds": 0.66, "half": 0.5}
+
+
+def _clean_style(raw) -> Optional[dict]:
+    if not isinstance(raw, dict):
+        return None
+    out = {}
+    if raw.get("size") in STYLE_SIZES:
+        out["size"] = raw["size"]
+    if raw.get("width") in STYLE_WIDTHS:
+        out["width"] = raw["width"]
+    if raw.get("align") in STYLE_ALIGNS:
+        out["align"] = raw["align"]
+    return out or None
+
+
 # ── Normalization ───────────────────────────────────────────────────────────────
 
 def normalize_card(card: dict, enable_images: bool = True,
@@ -209,11 +246,19 @@ def normalize_card(card: dict, enable_images: bool = True,
     for raw in (card.get("blocks") or [])[:6]:
         btype = raw.get("type")
         if btype == "text" and str(raw.get("text", "")).strip():
-            blocks.append({"type": "text", "text": str(raw["text"])})
+            b = {"type": "text", "text": str(raw["text"])}
+            style = _clean_style(raw.get("style"))
+            if style:
+                b["style"] = style
+            blocks.append(b)
         elif btype == "bullets":
             items = [str(i) for i in (raw.get("items") or []) if str(i).strip()][:6]
             if items:
-                blocks.append({"type": "bullets", "items": items})
+                b = {"type": "bullets", "items": items}
+                style = _clean_style(raw.get("style"))
+                if style:
+                    b["style"] = style
+                blocks.append(b)
         elif btype == "stats":
             items = [
                 {"value": str(s.get("value", "")), "label": str(s.get("label", "")),
@@ -429,6 +474,50 @@ Respond only with the JSON object."""
         raise HTTPException(status_code=500, detail=f"Card generation failed: {e}")
 
 
+@router.post("/edit-outline-card")
+def edit_outline_card(request: EditOutlineCardRequest):
+    """AI edit of ONE entry on the content map, before any slide exists.
+
+    The content map is the cheap place to change a deck's direction — rewriting
+    a one-line brief here costs one small call, whereas the same correction
+    after generation means regenerating a full card. Deliberately narrow: it
+    returns a title and a brief, never blocks."""
+    try:
+        context = ""
+        if request.chunks:
+            context = "\n\nSource content:\n" + "\n---\n".join(str(c) for c in request.chunks[:6])
+
+        system_prompt = """You revise ONE entry in a presentation outline.
+An entry is a slide title plus a one-sentence brief describing what that slide
+will cover. Apply the user's instruction. Keep the brief to a single sentence.
+Stay grounded in the source content when it is provided.
+
+Respond ONLY with JSON, no markdown fences: {"title": "...", "brief": "..."}"""
+
+        user_prompt = f"""Deck: "{request.deck_title}"
+
+Current entry:
+title: {request.title}
+brief: {request.brief}
+
+Instruction: {request.instruction}{context}
+
+Return the updated entry as JSON only."""
+
+        data = ai.chat_json(
+            messages=[{"role": "user", "content": user_prompt}],
+            system=system_prompt, max_tokens=500, temperature=0.4,
+        )
+        return {
+            "title": str(data.get("title") or request.title).strip(),
+            "brief": str(data.get("brief") or request.brief).strip(),
+        }
+    except Exception as e:
+        import traceback
+        print(f"EDIT-OUTLINE-CARD ERROR: {e}"); print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Outline edit failed: {e}")
+
+
 @router.post("/edit-card")
 def edit_card(request: EditCardRequest):
     """AI edit of one card, preserving the block schema."""
@@ -482,6 +571,12 @@ Return the updated card JSON only."""
 
 CALLOUT_FILL = {"info": "DBEAFE", "success": "D1FAE5", "warning": "FEF3C7"}
 CALLOUT_TEXT = {"info": "1E40AF", "success": "065F46", "warning": "92400E"}
+
+
+def _pp_align(align: Optional[str]):
+    """Maps the editor's alignment onto python-pptx's enum."""
+    from pptx.enum.text import PP_ALIGN
+    return {"center": PP_ALIGN.CENTER, "right": PP_ALIGN.RIGHT}.get(align, PP_ALIGN.LEFT)
 
 
 def _download_image(url: str) -> Optional[bytes]:
@@ -783,19 +878,32 @@ def _stack_blocks(slide, card: dict, colors: dict, fonts: dict,
         btype = block["type"]
 
         if btype == "text":
-            lines = max(1, len(block["text"]) // 95 + 1)
-            h = 0.32 * lines + 0.1
+            st = block.get("style") or {}
+            pt = STYLE_PT.get(st.get("size"), 14)
+            frac = STYLE_FRACTION.get(st.get("width"), 1.0)
+            box_w = (content_width_in - 0.85) * frac
+            # chars-per-line scales with both point size and column width
+            per_line = max(20, int(95 * (14 / pt) * frac))
+            lines = max(1, len(block["text"]) // per_line + 1)
+            h = (pt / 14) * 0.32 * lines + 0.1
             add_text_box(slide, block["text"], Inches(0.85), Inches(y),
-                         Inches(content_width_in - 0.85), Inches(h),
-                         font_name=body_font, font_size=14, color=colors["text"])
+                         Inches(box_w), Inches(h),
+                         font_name=body_font, font_size=pt, color=colors["text"],
+                         align=_pp_align(st.get("align")))
             y += h + 0.15
 
         elif btype == "bullets":
+            st = block.get("style") or {}
+            pt = STYLE_PT.get(st.get("size"), 14)
+            frac = STYLE_FRACTION.get(st.get("width"), 1.0)
+            box_w = (content_width_in - 1.0) * frac
+            row_h = (pt / 14) * 0.52
             for item in block["items"]:
                 add_text_box(slide, f"•  {item}", Inches(0.95), Inches(y),
-                             Inches(content_width_in - 1.0), Inches(0.5),
-                             font_name=body_font, font_size=14, color=colors["text"])
-                y += 0.52
+                             Inches(box_w), Inches(max(0.5, row_h)),
+                             font_name=body_font, font_size=pt, color=colors["text"],
+                             align=_pp_align(st.get("align")))
+                y += row_h
             y += 0.1
 
         elif btype == "stats":
