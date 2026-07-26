@@ -68,6 +68,79 @@ def decrypt_secret(value: str) -> str:
     return _fernet().decrypt(value.encode()).decode()
 
 
+# ── Per-workspace provider app credentials ──────────────────────────────────────
+# Single-tenant model (decided 2026-07-26): each customer registers their OWN
+# Slack/Google/Microsoft/Zoom app in their own tenant and pastes its client_id/
+# client_secret here, rather than every customer sharing one Knova-owned app —
+# that would need Google OAuth verification + an annual CASA assessment,
+# Microsoft publisher verification, and Teams Protected-APIs approval, none of
+# which are survivable pre-revenue. See 09_company_brain_roadmap.md.
+
+def get_provider_credentials(workspace_id: str, provider: str) -> Optional[dict]:
+    """
+    Returns {"client_id", "client_secret", "webhook_secret"} for this
+    workspace+provider, or None if the workspace hasn't registered its own
+    app for that provider yet. webhook_secret is "" if not set (not every
+    provider has one — it's only needed by webhook-verified connectors).
+
+    Callers that need a fallback (e.g. keeping the one pre-existing Slack
+    connection working through this rollout) should fall back to the
+    provider's own env vars themselves when this returns None — that decision
+    is provider-specific, not made here.
+    """
+    row = supabase.table("provider_credentials") \
+        .select("client_id, client_secret_enc, webhook_secret_enc") \
+        .eq("workspace_id", workspace_id).eq("provider", provider).execute().data
+    if not row:
+        return None
+    return {
+        "client_id":      row[0]["client_id"],
+        "client_secret":  decrypt_secret(row[0]["client_secret_enc"]),
+        "webhook_secret": decrypt_secret(row[0]["webhook_secret_enc"]) if row[0].get("webhook_secret_enc") else "",
+    }
+
+
+def save_provider_credentials(workspace_id: str, provider: str, client_id: str,
+                              client_secret: str, webhook_secret: str = "",
+                              created_by: str = "") -> None:
+    """Upserts one (workspace, provider) app credential set, encrypted at rest."""
+    row = {
+        "workspace_id":      workspace_id,
+        "provider":          provider,
+        "client_id":         client_id,
+        "client_secret_enc": encrypt_secret(client_secret),
+        "created_by":        created_by,
+        "updated_at":        datetime.now(timezone.utc).isoformat(),
+    }
+    if webhook_secret:
+        row["webhook_secret_enc"] = encrypt_secret(webhook_secret)
+    supabase.table("provider_credentials").upsert(
+        row, on_conflict="workspace_id,provider"
+    ).execute()
+
+
+def has_provider_credentials(workspace_id: str, provider: str) -> bool:
+    row = supabase.table("provider_credentials").select("id") \
+        .eq("workspace_id", workspace_id).eq("provider", provider).execute().data
+    return bool(row)
+
+
+def get_provider_credentials_by_external_team(provider: str, external_team_id: str) -> Optional[dict]:
+    """
+    Resolves a workspace's provider credentials starting from the external
+    team/tenant id instead of workspace_id — what an inbound webhook has to
+    work with (Slack's event payload carries team_id, not our workspace_id).
+    Used to verify a webhook against the RIGHT customer's signing secret
+    before trusting anything else in the payload.
+    """
+    conn = supabase.table("connections").select("workspace_id") \
+        .eq("provider", provider).eq("external_team_id", external_team_id) \
+        .eq("status", "active").execute().data
+    if not conn:
+        return None
+    return get_provider_credentials(conn[0]["workspace_id"], provider)
+
+
 # ── In-memory sync job status (same pattern as ingest) ──────────────────────────
 SYNC_JOBS: dict[str, dict] = {}
 

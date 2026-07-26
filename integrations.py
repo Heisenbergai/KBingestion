@@ -43,6 +43,21 @@ PROVIDERS: dict[str, dict] = {
         "captures": "Messages from channels you choose",
         "install_path": "/slack/install", "needs_channel_selection": True,
         "setup_hint": "Invite the Knova bot to a channel in Slack, then pick channels here.",
+        # Single-tenant model: this workspace's OWN Slack app, not Knova's.
+        # redirect_path/webhook_path are FIXED (Railway's URL), shown in the
+        # setup step so the admin knows what to paste into their Slack app
+        # config. needs_webhook_secret because /slack/events verifies one
+        # shared URL against whichever customer's secret matches the event's
+        # team_id — see connector_slack.slack_events().
+        "needs_own_app": True,
+        "redirect_path": "/slack/oauth/callback",
+        "webhook_path": "/slack/events",
+        "needs_webhook_secret": True,
+        "setup_fields": [
+            {"key": "client_id", "label": "Client ID"},
+            {"key": "client_secret", "label": "Client Secret", "secret": True},
+            {"key": "webhook_secret", "label": "Signing Secret", "secret": True},
+        ],
     },
     "google_drive": {
         "name": "Google Drive", "category": "Documents", "auth_method": "oauth",
@@ -98,6 +113,11 @@ PROVIDERS: dict[str, dict] = {
 CATEGORY_ORDER = ["Communication", "Meetings", "Documents", "Productivity"]
 
 
+RAILWAY_BASE = os.getenv("RAILWAY_PUBLIC_DOMAIN", "https://kbingestion-production.up.railway.app")
+if not RAILWAY_BASE.startswith("http"):
+    RAILWAY_BASE = f"https://{RAILWAY_BASE}"
+
+
 def _provider_public(pid: str, p: dict) -> dict:
     """Registry fields safe to expose to the frontend."""
     return {
@@ -118,6 +138,13 @@ def _provider_public(pid: str, p: dict) -> dict:
         "oauth_url_path": "/integrations/oauth-url" if p["auth_method"] == "oauth" else None,
         "api_key_label": p.get("api_key_label"),
         "setup_hint": p.get("setup_hint"),
+        # Single-tenant "bring your own app" fields. redirect_uri/webhook_url
+        # are absolute so the setup step can show them to copy-paste straight
+        # into the provider's app config, no assembly required client-side.
+        "needs_own_app":  p.get("needs_own_app", False),
+        "setup_fields":   p.get("setup_fields", []),
+        "redirect_uri":   f"{RAILWAY_BASE}{p['redirect_path']}" if p.get("redirect_path") else None,
+        "webhook_url":    f"{RAILWAY_BASE}{p['webhook_path']}" if p.get("webhook_path") else None,
     }
 
 
@@ -138,9 +165,14 @@ async def list_integrations(workspace_id: str,
     ).eq("workspace_id", workspace_id).neq("status", "revoked").execute().data or []
     by_provider = {c["provider"]: c for c in conns}
 
+    creds_rows = bc.supabase.table("provider_credentials").select("provider") \
+        .eq("workspace_id", workspace_id).execute().data or []
+    configured_providers = {r["provider"] for r in creds_rows}
+
     items = []
     for pid, p in PROVIDERS.items():
         entry = _provider_public(pid, p)
+        entry["credentials_configured"] = pid in configured_providers
         conn = by_provider.get(pid)
         if conn and p["status"] == "available":
             channels = (conn.get("config") or {}).get("channels", [])
@@ -158,7 +190,7 @@ async def list_integrations(workspace_id: str,
 
     return {
         "categories": CATEGORY_ORDER,
-        "railway_base": os.getenv("RAILWAY_PUBLIC_DOMAIN", "https://kbingestion-production.up.railway.app"),
+        "railway_base": RAILWAY_BASE,
         "integrations": items,
     }
 
@@ -202,6 +234,71 @@ async def connect_api_key(body: ApiKeyConnectRequest,
     }
     bc.supabase.table("connections").insert(row).execute()
     return {"success": True, "provider": body.provider}
+
+
+def _require_admin(auth: AuthContext, workspace_id: str) -> None:
+    """
+    App credentials (a Slack/Google/etc client secret) are more sensitive than
+    an ordinary invite — restricted to owner/admin, unlike the membership-only
+    bar the rest of this file uses. Mirrors create_workspace_invitation's role
+    check in the app DB, but this table lives in the vector DB so it can't
+    reuse that SQL function directly.
+    """
+    if auth.is_super_admin:
+        return
+    if auth.role_in(workspace_id) not in ("owner", "admin"):
+        raise HTTPException(status_code=403, detail="Only workspace owners/admins can manage integration credentials.")
+
+
+class SaveCredentialsRequest(BaseModel):
+    workspace_id:   str
+    provider:       str
+    client_id:      str
+    client_secret:  str
+    webhook_secret: Optional[str] = None
+
+
+@router.post("/integrations/credentials")
+async def save_credentials(body: SaveCredentialsRequest,
+                           auth: AuthContext = Depends(current_user)):
+    """
+    Saves this workspace's OWN app credentials for a provider (single-tenant
+    model — see connector_slack.py's module docstring for why). Never returns
+    the secret back; GET below confirms only whether one is set.
+    """
+    auth.assert_workspace(body.workspace_id)
+    _require_admin(auth, body.workspace_id)
+
+    p = PROVIDERS.get(body.provider)
+    if not p:
+        raise HTTPException(status_code=404, detail=f"Unknown provider '{body.provider}'.")
+    if not p.get("needs_own_app"):
+        raise HTTPException(status_code=400, detail=f"{p['name']} does not use per-workspace app credentials.")
+    if not body.client_id.strip() or not body.client_secret.strip():
+        raise HTTPException(status_code=400, detail="Client ID and Client Secret are required.")
+    if p.get("needs_webhook_secret") and not (body.webhook_secret or "").strip():
+        raise HTTPException(status_code=400, detail=f"{p['name']} also requires a Signing Secret.")
+
+    bc.save_provider_credentials(
+        body.workspace_id, body.provider,
+        client_id=body.client_id.strip(),
+        client_secret=body.client_secret.strip(),
+        webhook_secret=(body.webhook_secret or "").strip(),
+    )
+    return {"success": True, "provider": body.provider}
+
+
+@router.get("/integrations/credentials")
+async def get_credentials_status(workspace_id: str, provider: str,
+                                 auth: AuthContext = Depends(current_user)):
+    """Whether this workspace has its own app configured for a provider, and
+    the client_id (not secret) so the setup form can show what's saved."""
+    auth.assert_workspace(workspace_id)
+    creds = bc.get_provider_credentials(workspace_id, provider)
+    return {
+        "configured": creds is not None,
+        "client_id":  creds["client_id"] if creds else None,
+    }
 
 
 class OAuthUrlRequest(BaseModel):

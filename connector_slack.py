@@ -17,14 +17,22 @@ state minted in step 1; step 5 by Slack's own request signature.
 Everything Slack-specific lives here; the shared pipeline (capture, filtration,
 notes, embedding) is in brain_connectors.py.
 
-One-time setup (Tanmay, api.slack.com/apps):
-  - Create app, add Bot Token scopes: channels:read, channels:history, users:read, team:read
+CREDENTIAL MODEL (single-tenant, decided 2026-07-26 — see 09_company_brain_roadmap.md):
+Each CUSTOMER creates their own Slack app at api.slack.com/apps and pastes its
+client_id / client_secret / signing_secret into the Integrations panel
+(POST /integrations/credentials), not Tanmay. This avoids Slack's app-directory
+review, which single-workspace installs don't need. Per customer, in their app:
+  - Add Bot Token scopes: channels:read, channels:history, users:read, team:read
   - OAuth redirect URL: https://kbingestion-production.up.railway.app/slack/oauth/callback
-  - Enable Events API, request URL: https://kbingestion-production.up.railway.app/slack/events,
-    subscribe to bot event: message.channels
-  - Railway env: SLACK_CLIENT_ID, SLACK_CLIENT_SECRET, SLACK_SIGNING_SECRET,
-    APP_REDIRECT_URL (where to send the user after connecting, e.g. the Library page),
-    CONNECTOR_ENCRYPTION_KEY
+    (fixed — same for every customer, since it's Railway's URL, not theirs)
+  - Enable Events API, request URL: https://kbingestion-production.up.railway.app/slack/events
+    (also fixed/shared — see slack_events() for how one shared URL still verifies
+    each customer's own signing secret), subscribe to bot event: message.channels
+
+Env vars SLACK_CLIENT_ID / SLACK_CLIENT_SECRET / SLACK_SIGNING_SECRET are now only
+a FALLBACK, for the one connection created before this model existed (Default
+Workspace, connected 2026-07-22). CONNECTOR_ENCRYPTION_KEY (Fernet) and
+APP_REDIRECT_URL remain required Railway env vars regardless.
 """
 import os
 import json
@@ -48,8 +56,15 @@ load_dotenv()
 
 router = APIRouter()
 
-SLACK_CLIENT_ID     = os.getenv("SLACK_CLIENT_ID", "")
-SLACK_CLIENT_SECRET = os.getenv("SLACK_CLIENT_SECRET", "")
+# Env vars are now only a FALLBACK, for the one Slack connection created before
+# the per-workspace credential model existed (Default Workspace, connected
+# 2026-07-22). Every new connection resolves its own workspace's app via
+# provider_credentials (see _slack_credentials below) — single-tenant model,
+# each customer registers their own Slack app. SLACK_SIGNING_SECRET stays
+# global/env-only: it verifies the /slack/events webhook, which arrives
+# before any workspace is known, so it cannot be looked up per-workspace.
+_ENV_SLACK_CLIENT_ID     = os.getenv("SLACK_CLIENT_ID", "")
+_ENV_SLACK_CLIENT_SECRET = os.getenv("SLACK_CLIENT_SECRET", "")
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "")
 RAILWAY_BASE = os.getenv("RAILWAY_PUBLIC_DOMAIN", "https://kbingestion-production.up.railway.app")
 if not RAILWAY_BASE.startswith("http"):
@@ -107,6 +122,25 @@ def _user_name_map(token: str) -> dict:
 
 # ── Routes ──────────────────────────────────────────────────────────────────────
 
+def _slack_client_credentials(workspace_id: str) -> tuple[str, str]:
+    """
+    (client_id, client_secret) for this workspace's own Slack app, falling
+    back to the env vars only for connections that predate the per-workspace
+    credential model (Default Workspace, connected 2026-07-22, before
+    provider_credentials existed).
+    """
+    creds = bc.get_provider_credentials(workspace_id, "slack")
+    if creds:
+        return creds["client_id"], creds["client_secret"]
+    if _ENV_SLACK_CLIENT_ID and _ENV_SLACK_CLIENT_SECRET:
+        return _ENV_SLACK_CLIENT_ID, _ENV_SLACK_CLIENT_SECRET
+    raise HTTPException(
+        status_code=400,
+        detail="This workspace hasn't set up its Slack app credentials yet. "
+               "Go to Integrations → Slack → Set up to add them.",
+    )
+
+
 def build_install_url(workspace_id: str, user_id: str = "") -> str:
     """
     The Slack consent URL for one workspace, with the workspace baked into a
@@ -115,10 +149,9 @@ def build_install_url(workspace_id: str, user_id: str = "") -> str:
     browser actually uses — a popup navigation cannot carry an Authorization
     header, so the URL is minted by an authenticated call and only then opened.
     """
-    if not SLACK_CLIENT_ID:
-        raise HTTPException(status_code=500, detail="SLACK_CLIENT_ID not configured on the server.")
+    client_id, _ = _slack_client_credentials(workspace_id)
     state = _encode_state(workspace_id, user_id)
-    return (f"https://slack.com/oauth/v2/authorize?client_id={SLACK_CLIENT_ID}"
+    return (f"https://slack.com/oauth/v2/authorize?client_id={client_id}"
             f"&scope={SLACK_SCOPES}&redirect_uri={REDIRECT_URI}&state={state}")
 
 
@@ -145,9 +178,10 @@ async def slack_callback(code: str = "", state: str = "", error: str = ""):
         return oauth_complete_html("slack", "error")
     st = _decode_state(state)
     workspace_id, user_id = st["w"], st.get("u", "")
+    client_id, client_secret = _slack_client_credentials(workspace_id)
 
     res = httpx.post("https://slack.com/api/oauth.v2.access", data={
-        "client_id": SLACK_CLIENT_ID, "client_secret": SLACK_CLIENT_SECRET,
+        "client_id": client_id, "client_secret": client_secret,
         "code": code, "redirect_uri": REDIRECT_URI,
     }, timeout=30)
     data = res.json()
@@ -303,25 +337,36 @@ def _normalize_message(m: dict, channel_id: str, channel_name: str, names: dict)
 
 # ── Events API webhook (live messages) ──────────────────────────────────────────
 
-def _verify_slack_signature(request: Request, body: bytes) -> bool:
-    """Verifies the request genuinely came from Slack (signing secret)."""
-    if not SLACK_SIGNING_SECRET:
-        return True  # not configured — allow (dev); set the secret in prod
+def _verify_slack_signature(request: Request, body: bytes, signing_secret: str) -> bool:
+    """Verifies the request genuinely came from Slack, against ONE specific
+    app's signing secret (see slack_events() for how that secret is chosen)."""
+    if not signing_secret:
+        return True  # not configured — allow (dev); set one in prod
     ts = request.headers.get("X-Slack-Request-Timestamp", "")
     sig = request.headers.get("X-Slack-Signature", "")
     if not ts or abs(time.time() - int(ts)) > 60 * 5:
         return False
     base = f"v0:{ts}:{body.decode()}"
-    mine = "v0=" + hmac.new(SLACK_SIGNING_SECRET.encode(), base.encode(), hashlib.sha256).hexdigest()
+    mine = "v0=" + hmac.new(signing_secret.encode(), base.encode(), hashlib.sha256).hexdigest()
     return hmac.compare_digest(mine, sig)
 
 
 @router.post("/slack/events")
 async def slack_events(request: Request):
     """
-    Slack Events API endpoint. Handles the one-time url_verification handshake
-    and live message events (captured into ingest_items; filtration runs on the
-    next /connectors/sync or a scheduled job, not per-message).
+    Slack Events API endpoint. ONE shared URL for every customer's Slack app
+    (Railway has one deployment), but each customer's own app signs its
+    events with ITS OWN signing secret — verifying against a single global
+    secret would fail every real customer's events except possibly the first
+    one configured, silently breaking live ingestion for everyone else. So the
+    signing secret is resolved from the payload's team_id BEFORE verifying,
+    not read from env, except as a fallback for the one connection that
+    predates per-workspace credentials.
+
+    Handles the one-time url_verification handshake (no team_id, no signature
+    needed — Slack's own onboarding step) and live message events (captured
+    into ingest_items; filtration runs on the next /connectors/sync or the
+    scheduled worker, not per-message).
     """
     body = await request.body()
     payload = json.loads(body or "{}")
@@ -329,13 +374,16 @@ async def slack_events(request: Request):
     if payload.get("type") == "url_verification":
         return PlainTextResponse(payload.get("challenge", ""))
 
-    if not _verify_slack_signature(request, body):
+    team_id = payload.get("team_id")
+    creds = bc.get_provider_credentials_by_external_team("slack", team_id) if team_id else None
+    signing_secret = creds["webhook_secret"] if creds and creds.get("webhook_secret") else SLACK_SIGNING_SECRET
+
+    if not _verify_slack_signature(request, body, signing_secret):
         raise HTTPException(status_code=401, detail="Bad Slack signature.")
 
     if payload.get("type") == "event_callback":
         event = payload.get("event", {})
         if event.get("type") == "message" and not event.get("subtype") and not event.get("bot_id"):
-            team_id = payload.get("team_id")
             conn = bc.supabase.table("connections").select("*") \
                 .eq("provider", "slack").eq("external_team_id", team_id) \
                 .eq("status", "active").execute().data
