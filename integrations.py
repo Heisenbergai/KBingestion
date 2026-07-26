@@ -106,24 +106,6 @@ PROVIDERS: dict[str, dict] = {
         "setup_hint": "The admin who authorizes this should be a Zoom account owner/admin — "
                       "recording access is account-wide, not just their own meetings.",
     },
-    "webex": {
-        "name": "Webex", "category": "Meetings", "auth_method": "oauth",
-        "status": "available", "icon": "webex", "accent": "#00BCE3",
-        "description": "Distill Webex meeting recordings into decisions & action items.",
-        "captures": "Meeting transcripts",
-        "install_path": "/webex/install",
-        "needs_own_app": True,
-        "redirect_path": "/webex/oauth/callback",
-        "webhook_path": "/webex/events",
-        "needs_webhook_secret": True,
-        "setup_fields": [
-            {"key": "client_id", "label": "Client ID"},
-            {"key": "client_secret", "label": "Client Secret", "secret": True},
-            {"key": "webhook_secret", "label": "Webhook Secret", "secret": True},
-        ],
-        "setup_hint": "Requires an Integration (not a Bot) with meeting recording read access — "
-                      "bots cannot read meeting transcripts.",
-    },
     "microsoft_teams": {
         "name": "Microsoft Teams", "category": "Communication", "auth_method": "oauth",
         "status": "coming_soon", "icon": "teams", "accent": "#6264A7",
@@ -384,9 +366,6 @@ async def oauth_url(body: OAuthUrlRequest,
     elif body.provider == "zoom":
         import connector_zoom
         url = connector_zoom.build_install_url(body.workspace_id, body.user_id or "")
-    elif body.provider == "webex":
-        import connector_webex
-        url = connector_webex.build_install_url(body.workspace_id, body.user_id or "")
     else:
         # This is the one line each new OAuth connector must add here.
         raise HTTPException(status_code=400, detail=f"No OAuth builder for '{body.provider}'.")

@@ -1,6 +1,5 @@
 """
-Zoom connector — meeting transcripts (Phase 3, second meeting-transcript
-connector alongside connector_webex.py).
+Zoom connector — meeting transcripts (Phase 3).
 
 Shape: webhook-triggered like Slack, but each event is ONE COMPLETE meeting
 transcript, not a stream of small messages needing batching — so this calls
@@ -215,8 +214,8 @@ def _valid_access_token(conn: dict) -> Optional[str]:
 
 
 # ── VTT transcript parsing ───────────────────────────────────────────────────────
-# Shared by connector_webex.py — both Zoom and Webex serve WebVTT transcripts,
-# and this is generic WebVTT parsing, not Zoom-specific.
+# Generic WebVTT parsing, not Zoom-specific — reusable by any future
+# meeting-recording connector that serves standard WebVTT transcripts.
 
 _VTT_CUE_NUM = re.compile(r"^\d+$")
 _VTT_TIMESTAMP = re.compile(r"-->")

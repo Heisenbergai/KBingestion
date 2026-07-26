@@ -17,7 +17,6 @@ from brain_connectors import router as connectors_router
 from connector_slack import router as slack_router
 from connector_google import router as google_router
 from connector_zoom import router as zoom_router
-from connector_webex import router as webex_router
 from integrations import router as integrations_router
 from chatbot import router as chatbot_router
 from admin import router as admin_router
@@ -49,7 +48,6 @@ app.include_router(connectors_router)
 app.include_router(slack_router)
 app.include_router(google_router)
 app.include_router(zoom_router)
-app.include_router(webex_router)
 app.include_router(integrations_router)
 app.include_router(chatbot_router)
 app.include_router(admin_router)

@@ -287,7 +287,7 @@ def classify_batch(transcript: str, channel: str, workspace_id: Optional[str] = 
 
 
 MEETING_SYSTEM = """You are the filter that decides what enters a company's permanent knowledge base.
-You will see a FULL MEETING TRANSCRIPT (Zoom or Webex). Unlike a short chat snippet, a meeting that
+You will see a FULL MEETING TRANSCRIPT (Zoom). Unlike a short chat snippet, a meeting that
 actually took place almost always has SOME durable value — decisions made, action items assigned,
 or a discussion worth a written record — so default to keeping it. Only discard if the transcript
 is empty, corrupted, or pure small talk with zero substantive content (e.g. a call that never
@@ -313,9 +313,9 @@ If truly nothing of value: {"worth_keeping": false}"""
 def distill_meeting_transcript(transcript: str, meeting_title: str,
                                workspace_id: Optional[str] = None) -> Optional[dict]:
     """
-    The meeting-transcript equivalent of classify_batch() — shared by
-    connector_zoom.py and connector_webex.py (any future meeting-recording
-    connector reuses this too), since a full meeting transcript needs a
+    The meeting-transcript equivalent of classify_batch() — used by
+    connector_zoom.py (any future meeting-recording connector reuses this
+    too), since a full meeting transcript needs a
     differently-shaped prompt than a 12-message chat window: richer output
     (decisions / action items / summary, not one terse sentence) and a bias
     toward KEEPING rather than discarding, since a meeting that happened
