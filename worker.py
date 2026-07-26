@@ -52,6 +52,8 @@ from datetime import datetime, timezone, timedelta
 
 import brain_connectors as bc
 import connector_google
+import connector_zoom
+import connector_webex
 
 # How soon is "expiring soon" for the flag-only checks below.
 TOKEN_EXPIRY_WARNING_WINDOW = timedelta(hours=2)
@@ -139,6 +141,8 @@ def run_google_drive_polling() -> dict:
 # never expire so never appear here at all).
 _TOKEN_REFRESHERS = {
     "google_drive": connector_google.refresh_access_token,
+    "zoom": connector_zoom.refresh_access_token,
+    "webex": connector_webex.refresh_access_token,
 }
 
 

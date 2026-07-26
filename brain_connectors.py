@@ -286,6 +286,81 @@ def classify_batch(transcript: str, channel: str, workspace_id: Optional[str] = 
     }
 
 
+MEETING_SYSTEM = """You are the filter that decides what enters a company's permanent knowledge base.
+You will see a FULL MEETING TRANSCRIPT (Zoom or Webex). Unlike a short chat snippet, a meeting that
+actually took place almost always has SOME durable value — decisions made, action items assigned,
+or a discussion worth a written record — so default to keeping it. Only discard if the transcript
+is empty, corrupted, or pure small talk with zero substantive content (e.g. a call that never
+really started, or one that's entirely "can you hear me / one sec").
+
+If worth keeping, distill it into a structured note — NOT a transcript dump:
+  - decisions: concrete decisions made, if any
+  - action_items: who is doing what, if assigned
+  - summary: 2-4 sentences of what was discussed, in third person as settled fact
+
+Respond ONLY with valid JSON, no markdown fences:
+{
+  "worth_keeping": true,
+  "title": "concise, searchable title (the meeting's actual topic, not \"Meeting Notes\")",
+  "decisions": ["decision 1", "..."],
+  "action_items": ["who does what", "..."],
+  "summary": "2-4 sentences of discussion summary",
+  "participants": ["first names of key people involved"]
+}
+If truly nothing of value: {"worth_keeping": false}"""
+
+
+def distill_meeting_transcript(transcript: str, meeting_title: str,
+                               workspace_id: Optional[str] = None) -> Optional[dict]:
+    """
+    The meeting-transcript equivalent of classify_batch() — shared by
+    connector_zoom.py and connector_webex.py (any future meeting-recording
+    connector reuses this too), since a full meeting transcript needs a
+    differently-shaped prompt than a 12-message chat window: richer output
+    (decisions / action items / summary, not one terse sentence) and a bias
+    toward KEEPING rather than discarding, since a meeting that happened
+    almost always has some record value where idle chat usually doesn't.
+
+    Returns a note dict compatible with create_note_and_embed(), or None if
+    the transcript is empty/unparseable/genuinely worthless (fail safe by
+    discarding, same convention as classify_batch).
+    """
+    if not transcript.strip():
+        return None
+    try:
+        verdict = ai.chat_json(
+            messages=[{"role": "user",
+                       "content": f"Meeting: {meeting_title}\n\nTranscript:\n{transcript}"}],
+            system=MEETING_SYSTEM, max_tokens=800, temperature=0.2,
+            workspace_id=workspace_id, feature="filtration",
+        )
+    except Exception as e:
+        print(f"[filtration] meeting distillation failed (discarding): {e}")
+        return None
+    if not isinstance(verdict, dict) or not verdict.get("worth_keeping"):
+        return None
+    if not verdict.get("title"):
+        return None
+
+    parts = []
+    if verdict.get("summary"):
+        parts.append(verdict["summary"])
+    if verdict.get("decisions"):
+        parts.append("Decisions:\n" + "\n".join(f"- {d}" for d in verdict["decisions"]))
+    if verdict.get("action_items"):
+        parts.append("Action items:\n" + "\n".join(f"- {a}" for a in verdict["action_items"]))
+    body = "\n\n".join(parts).strip()
+    if not body:
+        return None
+
+    return {
+        "category":     "meeting",
+        "title":        str(verdict["title"])[:200],
+        "body":         body,
+        "participants": [str(p) for p in (verdict.get("participants") or [])][:10],
+    }
+
+
 def create_note_and_embed(workspace_id: str, connection_id: Optional[str], provider: str,
                           note: dict, source_type: str = "slack", source_tier: int = 3,
                           source_ref: str = None, occurred_at: str = None) -> str:
