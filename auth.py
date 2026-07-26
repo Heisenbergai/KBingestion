@@ -43,7 +43,7 @@ from typing import Optional
 import httpx
 import jwt
 from jwt import PyJWKClient
-from fastapi import Depends, Header, HTTPException
+from fastapi import Depends, Header, HTTPException, Request
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -67,6 +67,44 @@ _jwk_client: Optional[PyJWKClient] = None
 _jwk_client_at = 0.0
 
 
+# ── Caller fingerprinting (for the AUTH-SKIP logs only) ─────────────────────────
+def _caller(request: Optional[Request]) -> str:
+    """
+    A short "who made this call" tag for the rollout logs.
+
+    Without this an AUTH-SKIP line cannot be told apart from a curl probe, a
+    health checker, or a real browser session — which is exactly the question the
+    staged rollout has to answer before AUTH_ENFORCE can be turned on. Never logs
+    the token or any header value beyond a truncated User-Agent.
+    """
+    if request is None:
+        return "?"
+    ua = (request.headers.get("user-agent") or "none")[:40]
+    origin = request.headers.get("origin") or "-"
+    return f"{request.method} {request.url.path} ua={ua!r} origin={origin}"
+
+
+def _token_shape(token: str) -> str:
+    """
+    Describes a token that failed verification WITHOUT logging it.
+
+    The three shapes seen in practice and what each means:
+      alg=?              -> not a JWT at all (a probe, or an sb_publishable_ key)
+      alg=HS256 sub=no   -> a Supabase anon/publishable key sent as a bearer
+      alg=HS256 sub=yes  -> a real user token from BEFORE the project moved to
+                            asymmetric keys; it will verify once the session refreshes
+    """
+    try:
+        header = jwt.get_unverified_header(token)
+        alg = header.get("alg", "?")
+        kid = (header.get("kid") or "-")[:8]
+    except Exception:
+        return "alg=? (not a JWT)"
+    claims = _unverified_claims(token)
+    return (f"alg={alg} kid={kid} sub={'yes' if claims.get('sub') else 'no'} "
+            f"role={claims.get('role', '-')} iss={claims.get('iss', '-')}")
+
+
 # ── Auth context ────────────────────────────────────────────────────────────────
 class AuthContext:
     """
@@ -80,11 +118,12 @@ class AuthContext:
     """
 
     def __init__(self, user_id: str, workspaces: dict, is_super_admin: bool = False,
-                 enforced: bool = True):
+                 enforced: bool = True, caller: str = "?"):
         self.user_id        = user_id
         self.workspaces     = workspaces
         self.is_super_admin = is_super_admin
         self.enforced       = enforced
+        self.caller         = caller
 
     def assert_workspace(self, workspace_id: str) -> None:
         """
@@ -93,7 +132,7 @@ class AuthContext:
         """
         if not self.enforced:
             print(f"AUTH-SKIP: unauthenticated access to workspace {workspace_id} "
-                  f"allowed because AUTH_ENFORCE is off")
+                  f"allowed because AUTH_ENFORCE is off | {self.caller}")
             return
 
         if self.is_super_admin:
@@ -239,7 +278,8 @@ def _load_memberships(token: str, user_id: str) -> tuple[dict, bool]:
 
 
 # ── FastAPI dependency ──────────────────────────────────────────────────────────
-def current_user(authorization: Optional[str] = Header(None)) -> AuthContext:
+def current_user(request: Request = None,
+                 authorization: Optional[str] = Header(None)) -> AuthContext:
     """
     FastAPI dependency. Use as:
 
@@ -251,6 +291,8 @@ def current_user(authorization: Optional[str] = Header(None)) -> AuthContext:
     assert_workspace call is what actually closes the hole, so it must appear in
     every endpoint that accepts a workspace_id.
     """
+    who = _caller(request)
+
     token = ""
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:].strip()
@@ -258,8 +300,9 @@ def current_user(authorization: Optional[str] = Header(None)) -> AuthContext:
     if not token:
         if AUTH_ENFORCE:
             raise HTTPException(status_code=401, detail="Missing access token.")
-        print("AUTH-SKIP: request arrived with no bearer token (AUTH_ENFORCE off)")
-        return AuthContext(user_id="", workspaces={}, enforced=False)
+        print(f"AUTH-SKIP: request arrived with no bearer token "
+              f"(AUTH_ENFORCE off) | {who}")
+        return AuthContext(user_id="", workspaces={}, enforced=False, caller=who)
 
     now = time.time()
     with _cache_lock:
@@ -274,15 +317,15 @@ def current_user(authorization: Optional[str] = Header(None)) -> AuthContext:
             raise HTTPException(status_code=401, detail="Access token has no subject.")
 
         workspaces, is_super = _load_memberships(token, user_id)
-        ctx = AuthContext(user_id=user_id, workspaces=workspaces, is_super_admin=is_super)
+        ctx = AuthContext(user_id=user_id, workspaces=workspaces,
+                          is_super_admin=is_super, caller=who)
 
-    except HTTPException:
+    except HTTPException as e:
         if AUTH_ENFORCE:
             raise
-        claims = _unverified_claims(token)
-        print(f"AUTH-SKIP: token present but unusable "
-              f"(sub={claims.get('sub')}) — allowed because AUTH_ENFORCE is off")
-        return AuthContext(user_id="", workspaces={}, enforced=False)
+        print(f"AUTH-SKIP: token present but unusable — {_token_shape(token)} "
+              f"— reason={e.detail!r} — allowed because AUTH_ENFORCE is off | {who}")
+        return AuthContext(user_id="", workspaces={}, enforced=False, caller=who)
 
     with _cache_lock:
         _membership_cache[token] = (now, ctx)
