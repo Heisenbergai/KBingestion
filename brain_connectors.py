@@ -169,7 +169,7 @@ Respond ONLY with valid JSON, no markdown fences:
 If it is noise: {"worth_keeping": false}"""
 
 
-def classify_batch(transcript: str, channel: str) -> Optional[dict]:
+def classify_batch(transcript: str, channel: str, workspace_id: Optional[str] = None) -> Optional[dict]:
     """Runs one conversation through the LLM filter. Returns a note dict or
     None (noise / empty / unparseable — fail safe by discarding)."""
     if not transcript.strip():
@@ -179,6 +179,7 @@ def classify_batch(transcript: str, channel: str) -> Optional[dict]:
             messages=[{"role": "user",
                        "content": f"Channel: #{channel}\n\nConversation:\n{transcript}"}],
             system=CLASSIFY_SYSTEM, max_tokens=500, temperature=0.2,
+            workspace_id=workspace_id, feature="filtration",
         )
     except Exception as e:
         print(f"[filtration] classify failed (discarding): {e}")
@@ -222,7 +223,7 @@ def create_note_and_embed(workspace_id: str, connection_id: Optional[str], provi
     # Embed the note body into the searchable brain (tier 3 by default)
     full_text = f"{note['title']}\n\n{note['body']}"
     chunks = chunk_text(full_text) or [full_text]
-    embeddings = embed_chunks(chunks)
+    embeddings = embed_chunks(chunks, workspace_id=workspace_id, feature="filtration")
     rows = [{
         "document_id":  note_id,
         "asset_id":     note_id,
@@ -266,7 +267,7 @@ def run_filtration(workspace_id: str, connection_id: str, provider: str,
 
     for bi, batch in enumerate(batches):
         transcript, channel = _format_batch(batch)
-        note = classify_batch(transcript, channel)
+        note = classify_batch(transcript, channel, workspace_id=workspace_id)
         item_ids = [it["id"] for it in batch]
 
         if note:

@@ -113,6 +113,8 @@ def run_rag_query(
     bot: BotConfig,
     history: Optional[list[ChatMessage]] = None,
     strict_folders: bool = False,
+    user_id: Optional[str] = None,
+    feature: str = "chatbot_internal",
 ) -> tuple[str, list[str]]:
     """
     Searches ONLY document chunks belonging to the bot's workspace.
@@ -123,6 +125,11 @@ def run_rag_query(
     answer from documents outside its intended scope. Internal bots fall
     back to the whole workspace (with a loud log), since everyone in the
     workspace can already see those documents anyway.
+
+    user_id/feature are for the token-usage dashboards. `feature` matches the
+    same 'chatbot_internal'/'chatbot_external' vocabulary check_and_increment_usage
+    already uses, so a workspace's quota checks and its token spend can be
+    correlated by feature without translating between two naming schemes.
     """
     if not bot.workspace_id:
         raise HTTPException(
@@ -150,7 +157,9 @@ def run_rag_query(
 
     try:
         search_text = _retrieval_text(question.strip(), history_messages)
-        question_embedding = ai.embed_texts([search_text])[0]
+        question_embedding = ai.embed_texts(
+            [search_text], workspace_id=bot.workspace_id, user_id=user_id, feature=feature,
+        )[0]
 
         # Hybrid retrieval (vector + keyword + tier/freshness boosts), still
         # workspace-isolated. Falls back to the old vector-only RPC if the
@@ -260,6 +269,7 @@ Use the conversation history to stay consistent with what was already discussed.
         system=system_content,
         max_tokens=600,
         temperature=0.5,
+        workspace_id=bot.workspace_id, user_id=user_id, feature=feature,
     )
 
     sources = list(set([
@@ -421,6 +431,7 @@ async def widget_query(request: Request, body: WidgetQueryRequest):
             bot,
             history=body.conversation_history,
             strict_folders=True,   # public bots never fall back outside their scope
+            feature="chatbot_external",
         )
         origin = request.headers.get("origin") or request.headers.get("referer") or ""
         domain = origin.split("//")[-1].split("/")[0] if origin else None
@@ -458,6 +469,7 @@ async def internal_query(body: InternalQueryRequest,
             body.bot_config,
             history=body.conversation_history,
             strict_folders=False,  # internal users can see workspace docs anyway
+            user_id=body.user_id, feature="chatbot_internal",
         )
         log_usage_event(body.bot_config, "internal", user_id=body.user_id)
         return {

@@ -24,6 +24,7 @@ enabled once in the Bedrock console (see deploy notes).
 import os
 import json
 import re
+from typing import Optional
 import boto3
 from botocore.config import Config
 from dotenv import load_dotenv
@@ -50,13 +51,55 @@ bedrock = boto3.client(
 )
 
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
+def _log_usage(call_type: str, model: str, input_tokens: int, output_tokens: int,
+               workspace_id: Optional[str], user_id: Optional[str], feature: Optional[str]) -> None:
+    """
+    Records one Bedrock call for the token-usage dashboards. Best-effort: a
+    logging failure must never break the AI feature that triggered it, so
+    every exception is swallowed here, never raised to the caller.
+
+    workspace_id is the only field that matters for the rollups — a call made
+    without one (a caller that hasn't been threaded with workspace context
+    yet) still costs money, so it is logged anyway with a NULL workspace_id
+    rather than silently dropped; it just won't appear in any workspace total.
+    """
+    if not feature:
+        return
+    try:
+        from shared import supabase as vector_db
+        vector_db.table("ai_token_usage").insert({
+            "workspace_id":  workspace_id,
+            "user_id":       user_id,
+            "feature":       feature,
+            "call_type":     call_type,
+            "model":         model,
+            "input_tokens":  input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens":  input_tokens + output_tokens,
+        }).execute()
+    except Exception as e:
+        print(f"AI-USAGE-LOG-FAILED (non-fatal): {e}")
+
+
+def embed_texts(
+    texts: list[str],
+    workspace_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    feature: Optional[str] = None,
+) -> list[list[float]]:
     """
     Embeds a list of texts with Titan v2. Titan takes ONE text per API
     call (no batch endpoint), so this loops — callers should report
     progress per batch for large documents. Normalized vectors, 1024 dims.
+
+    workspace_id/user_id/feature are optional and purely for the token-usage
+    dashboards (see 13_tenancy_and_plans.md) — omitting them costs nothing
+    functionally, they just leave this call unattributed. One usage row is
+    logged per embed_texts() call (summed across the loop), not one per text,
+    so a 200-chunk document ingestion doesn't write 200 rows.
     """
     embeddings = []
+    total_input_tokens = 0
     for text in texts:
         body = json.dumps({
             "inputText":  text[:MAX_EMBED_CHARS],
@@ -66,6 +109,11 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
         response = bedrock.invoke_model(modelId=EMBED_MODEL, body=body)
         result = json.loads(response["body"].read())
         embeddings.append(result["embedding"])
+        total_input_tokens += result.get("inputTextTokenCount", 0)
+
+    if feature:
+        _log_usage("embed", EMBED_MODEL, total_input_tokens, 0, workspace_id, user_id, feature)
+
     return embeddings
 
 
@@ -75,6 +123,9 @@ def chat(
     max_tokens: int = 1000,
     temperature: float = 0.5,
     model: str = None,
+    workspace_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    feature: Optional[str] = None,
 ) -> str:
     """
     Chat completion via the Bedrock Converse API (works the same across
@@ -87,6 +138,9 @@ def chat(
     trusted to satisfy that (e.g. a bot greeting first, or two user
     messages after a failed send), so we normalize here: drop leading
     assistant turns and merge consecutive same-role turns.
+
+    workspace_id/user_id/feature are optional and purely for the token-usage
+    dashboards — see embed_texts() docstring for the same convention.
     """
     normalized = []
     for m in messages:
@@ -110,6 +164,13 @@ def chat(
         kwargs["system"] = [{"text": system}]
 
     response = bedrock.converse(**kwargs)
+
+    if feature:
+        usage = response.get("usage", {})
+        _log_usage("chat", model or CHAT_MODEL,
+                  usage.get("inputTokens", 0), usage.get("outputTokens", 0),
+                  workspace_id, user_id, feature)
+
     return response["output"]["message"]["content"][0]["text"]
 
 
@@ -143,13 +204,21 @@ def chat_json(
     max_tokens: int = 2000,
     temperature: float = 0.3,
     model: str = None,
+    workspace_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    feature: Optional[str] = None,
 ):
     """
     Chat completion that must return parsed JSON. Retries once with an
     explicit correction message if the first response isn't valid JSON.
+
+    workspace_id/user_id/feature: see chat()'s docstring. A retry logs a
+    second usage row — it is a second real Bedrock call and costs real
+    tokens, so it must be counted, not hidden inside the first row's total.
     """
     raw = chat(messages, system=system, max_tokens=max_tokens,
-               temperature=temperature, model=model)
+               temperature=temperature, model=model,
+               workspace_id=workspace_id, user_id=user_id, feature=feature)
     try:
         return _extract_json(raw)
     except json.JSONDecodeError:
@@ -161,5 +230,6 @@ def chat_json(
                 "before or after it."},
         ]
         raw = chat(retry_messages, system=system, max_tokens=max_tokens,
-                   temperature=0.1, model=model)
+                   temperature=0.1, model=model,
+                   workspace_id=workspace_id, user_id=user_id, feature=feature)
         return _extract_json(raw)

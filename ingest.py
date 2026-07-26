@@ -299,7 +299,9 @@ def chunk_text(text: str) -> list[str]:
     return [c.page_content for c in splitter.create_documents([text])]
 
 
-def embed_chunks(chunks: list[str], on_progress=None) -> list[list[float]]:
+def embed_chunks(chunks: list[str], on_progress=None,
+                 workspace_id: Optional[str] = None, feature: str = "document_ingestion",
+                 ) -> list[list[float]]:
     """
     Embeds via AWS Bedrock Titan v2 (see ai.py). Titan takes one text per
     API call, so we process in batches of 25 purely for progress
@@ -309,6 +311,12 @@ def embed_chunks(chunks: list[str], on_progress=None) -> list[list[float]]:
 
     on_progress(embedded_count) is called after each batch so the job
     status endpoint can report live progress to the frontend.
+
+    workspace_id/feature: token-usage attribution. `feature` defaults to
+    'document_ingestion' (the /ingest caller); brain_connectors.py's
+    filtration pipeline passes 'filtration' instead, since embedding a
+    distilled note is a different cost driver worth telling apart on the
+    dashboards.
     """
     all_embeddings = []
     batch_size = 25
@@ -316,7 +324,9 @@ def embed_chunks(chunks: list[str], on_progress=None) -> list[list[float]]:
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i:i + batch_size]
         try:
-            all_embeddings.extend(ai.embed_texts(batch))
+            all_embeddings.extend(
+                ai.embed_texts(batch, workspace_id=workspace_id, feature=feature)
+            )
         except Exception as e:
             print(f"[ingest] Embedding error on batch {i}-{i+batch_size}: {e}")
             raise RuntimeError(
@@ -368,7 +378,7 @@ def process_document(request: IngestRequest, job: Optional[dict] = None) -> dict
         if job is not None:
             job["chunks_embedded"] = done
 
-    embeddings = embed_chunks(chunks, on_progress=on_progress)
+    embeddings = embed_chunks(chunks, on_progress=on_progress, workspace_id=request.workspace_id)
 
     set_stage("storing")
 

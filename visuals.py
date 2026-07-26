@@ -179,3 +179,54 @@ async def workspace_stats(workspace_id: str,
     except Exception as e:
         print(f"WORKSPACE-STATS ERROR: {e}")
         raise HTTPException(status_code=500, detail=f"Stats failed: {e}")
+
+
+@router.get("/workspace-token-usage/{workspace_id}")
+async def workspace_token_usage(workspace_id: str, days: int = 30,
+                                auth: AuthContext = Depends(current_user)):
+    """
+    Bedrock token spend for this workspace, from ai_token_usage (see ai.py's
+    _log_usage). God-panel-facing number, not shown to customers today — the
+    god panel calls this once per workspace row (only 3 workspaces exist as
+    of 2026-07-26, so no pagination/batching is needed yet).
+
+    Aggregated in Python rather than a SQL RPC: row counts at pilot scale are
+    small (hundreds to low thousands per workspace per month), and this keeps
+    the aggregation logic next to the one place tokens are logged, instead of
+    duplicating the grouping rules in a second RPC that could drift from it.
+    """
+    auth.assert_workspace(workspace_id)
+    try:
+        from datetime import datetime, timezone, timedelta
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+        rows = supabase.table("ai_token_usage").select(
+            "feature, call_type, input_tokens, output_tokens, total_tokens"
+        ).eq("workspace_id", workspace_id).gte("created_at", since).execute().data or []
+
+        by_feature: dict = {}
+        total_input = total_output = total_calls = 0
+        for r in rows:
+            f = r["feature"]
+            agg = by_feature.setdefault(f, {"feature": f, "input_tokens": 0,
+                                            "output_tokens": 0, "total_tokens": 0, "calls": 0})
+            agg["input_tokens"]  += r["input_tokens"]
+            agg["output_tokens"] += r["output_tokens"]
+            agg["total_tokens"]  += r["total_tokens"]
+            agg["calls"]         += 1
+            total_input  += r["input_tokens"]
+            total_output += r["output_tokens"]
+            total_calls  += 1
+
+        return {
+            "workspace_id":       workspace_id,
+            "days":               days,
+            "total_input_tokens": total_input,
+            "total_output_tokens": total_output,
+            "total_tokens":       total_input + total_output,
+            "total_calls":        total_calls,
+            "by_feature":         sorted(by_feature.values(), key=lambda x: -x["total_tokens"]),
+        }
+    except Exception as e:
+        print(f"WORKSPACE-TOKEN-USAGE ERROR: {e}")
+        raise HTTPException(status_code=500, detail=f"Token usage lookup failed: {e}")

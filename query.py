@@ -36,7 +36,7 @@ def hybrid_search(question: str, workspace_id: str,
     if the hybrid RPC is unavailable (safety net during rollout).
     Always workspace-isolated.
     """
-    embedding = ai.embed_texts([question])[0]
+    embedding = ai.embed_texts([question], workspace_id=workspace_id, feature="ai_search")[0]
     try:
         result = supabase.rpc("match_chunks_hybrid", {
             "query_text":          question,
@@ -151,6 +151,7 @@ Formatting:
             system=system_prompt,
             max_tokens=1000,
             temperature=0.2,
+            workspace_id=request.workspace_id, user_id=auth.user_id, feature="ai_search",
         )
         answer, gaps = split_answer_and_gaps(raw)
 
