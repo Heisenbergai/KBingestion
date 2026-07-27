@@ -2,24 +2,29 @@
   'use strict';
 
   // ── Config from the embedding page ──────────────────────────────────────────
-  // Lovable generates this snippet PER BOT with all fields inlined at creation
+  // The app generates this snippet PER BOT with all fields inlined at creation
   // time — e.g.:
   //
-  //   window.HireflowBot = {
+  //   window.KnovaBot = {
   //     botId: "...", token: "...", workspaceId: "...",
   //     name: "HR Assistant", greetingMessage: "Hi! How can I help?",
   //     primaryColor: "#1E2761", avatarUrl: "https://...",
   //     systemPrompt: "...", linkedFolderIds: [], allowedDomains: []
   //   };
   //
-  // Railway is stateless and cannot look up bot config from Lovable's DB by
+  // Railway is stateless and cannot look up bot config from the app DB by
   // botId alone — so the widget never fetches config at runtime. Everything
-  // it needs is baked into the snippet Lovable generates.
-  const cfg = window.HireflowBot || {};
+  // it needs is baked into the snippet the app generates.
+  //
+  // window.HireflowBot is the pre-rename name (the product was called HireFlow
+  // before Knova). Still read as a fallback so any snippet already pasted onto
+  // a customer's site keeps working — renaming the global must not silently
+  // break widgets that are already deployed and out of our control.
+  const cfg = window.KnovaBot || window.HireflowBot || {};
   const API = 'https://kbingestion-production.up.railway.app';
 
   if (!cfg.botId || !cfg.token || !cfg.workspaceId) {
-    console.error('[HireflowBot] Missing botId, token, or workspaceId in window.HireflowBot config. Widget cannot start.');
+    console.error('[KnovaBot] Missing botId, token, or workspaceId in window.KnovaBot config. Widget cannot start.');
     return;
   }
 
@@ -171,7 +176,7 @@
           <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
         </button>
       </div>
-      <div id="hf-powered">Powered by Hireflow</div>
+      <div id="hf-powered">Powered by Knova</div>
     `;
     document.body.appendChild(win);
 
@@ -244,7 +249,7 @@
       typing.remove();
 
       if (!res.ok) {
-        console.error('[HireflowBot] widget-query error:', data);
+        console.error('[KnovaBot] widget-query error:', data);
         appendMessage('bot', data.detail || 'Sorry, something went wrong. Please try again.');
       } else {
         appendMessage('bot', data.answer, data.sources);
