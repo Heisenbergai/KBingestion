@@ -28,6 +28,12 @@ Flow:
      actually answer it (see _require_admin_or_assignee) — RBAC rollout Phase
      3 fixed a real gap where transferring a question to a regular employee
      gave them no endpoint that let them act on it.
+  5. GET /user-activity/{user_id} — RBAC rollout Phase 5's User Activity
+     Profile, vector-DB half: this specific user's bot query counts (from
+     bot_usage_events) and their unanswered-question assignment history (from
+     bot_question_assignments, joined against bot_unanswered_questions for
+     current status). Admin/owner-only. The app-DB half (training assignment/
+     progress, presentation shares) is queried directly by the frontend.
 
 All mutate workspace-scoped tables with no permissive RLS policies (see the
 bot_learning_question_logging_and_escalation migration and
@@ -179,6 +185,73 @@ async def resolve_via_document(question_id: str, body: ResolveRequest,
         "answered_at":    datetime.now(timezone.utc).isoformat(),
     }).eq("id", question_id).execute()
     return {"success": True}
+
+
+@router.get("/user-activity/{user_id}")
+async def user_activity(user_id: str, workspace_id: str,
+                        auth: AuthContext = Depends(current_user)):
+    """
+    The vector-DB half of the User Activity Profile (RBAC rollout Phase 5) --
+    mirrors visuals.py's /workspace-token-usage shape (simple dict, aggregated
+    in Python, no new RPC). The app-DB half (training assigned+progress,
+    presentations shared with them) is queried directly from the frontend
+    against RLS already extended for this in Phases 1-2; this endpoint only
+    covers what lives here: bot usage and unanswered-question assignment
+    history. Admin/owner-only -- this is one specific person's activity, a
+    tighter bar than the workspace-wide token usage this mirrors.
+    """
+    auth.assert_workspace(workspace_id)
+    _require_admin(auth, workspace_id)
+
+    try:
+        events = supabase.table("bot_usage_events") \
+            .select("bot_id").eq("workspace_id", workspace_id).eq("user_id", user_id) \
+            .execute().data or []
+        by_bot: dict[str, int] = {}
+        for e in events:
+            by_bot[e["bot_id"]] = by_bot.get(e["bot_id"], 0) + 1
+
+        assignments = supabase.table("bot_question_assignments") \
+            .select("*").eq("workspace_id", workspace_id).eq("assigned_to_user_id", user_id) \
+            .order("assigned_at", desc=True).limit(50).execute().data or []
+
+        question_ids = [a["question_id"] for a in assignments]
+        questions_by_id: dict = {}
+        if question_ids:
+            q_rows = supabase.table("bot_unanswered_questions") \
+                .select("id, bot_id, question, status, answered_at, answered_by") \
+                .in_("id", question_ids).execute().data or []
+            questions_by_id = {q["id"]: q for q in q_rows}
+
+        question_assignments = []
+        for a in assignments:
+            q = questions_by_id.get(a["question_id"], {})
+            question_assignments.append({
+                "question_id":  a["question_id"],
+                "bot_id":       q.get("bot_id"),
+                "question":     q.get("question"),
+                "status":       q.get("status"),
+                "assigned_at":  a["assigned_at"],
+                "assigned_by":  a["assigned_by"],
+                "answered_at":  q.get("answered_at"),
+                "answered_by":  q.get("answered_by"),
+            })
+
+        return {
+            "user_id":              user_id,
+            "workspace_id":         workspace_id,
+            "bot_usage": {
+                "total_queries": sum(by_bot.values()),
+                "by_bot": [{"bot_id": bid, "count": c} for bid, c in
+                           sorted(by_bot.items(), key=lambda kv: -kv[1])],
+            },
+            "question_assignments": question_assignments,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"USER-ACTIVITY ERROR: {e}")
+        raise HTTPException(status_code=500, detail=f"User activity lookup failed: {e}")
 
 
 class TransferRequest(BaseModel):
