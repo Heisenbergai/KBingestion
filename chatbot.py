@@ -3,7 +3,7 @@ import ai
 import httpx
 import auth as auth_mod
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, HTTPException, Request, Depends
+from fastapi import APIRouter, HTTPException, Request, Depends, Header
 from auth import AuthContext, current_user
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -362,9 +362,44 @@ def log_usage_event(bot: BotConfig, source: str, question: str, confidence: str,
             print(f"[chatbot] escalation logging failed (non-fatal): {e}")
 
 
+def _fetch_my_chatbot_ids(token: str, workspace_id: str, user_id: str) -> set[str]:
+    """
+    Railway has no service-role client for the APP DB (chatbots lives there,
+    not here) -- so this forwards the CALLER'S OWN bearer token to the app
+    DB's PostgREST API, same pattern auth.py's _load_memberships already uses
+    for workspace_members/super_admins. The created_by=eq.{user_id} filter
+    does the real work regardless of chatbots' own RLS shape: PostgREST
+    applies it as a hard filter on top of whatever RLS allows, so this can
+    only ever return bots this exact caller created, never anyone else's.
+    """
+    if not auth_mod.APP_SUPABASE_URL or not auth_mod.APP_SUPABASE_ANON_KEY:
+        return set()
+    try:
+        with httpx.Client(timeout=10) as client:
+            res = client.get(
+                f"{auth_mod.APP_SUPABASE_URL}/rest/v1/chatbots",
+                params={
+                    "select":       "id",
+                    "workspace_id": f"eq.{workspace_id}",
+                    "created_by":   f"eq.{user_id}",
+                },
+                headers={
+                    "apikey":        auth_mod.APP_SUPABASE_ANON_KEY,
+                    "Authorization": f"Bearer {token}",
+                    "Accept":        "application/json",
+                },
+            )
+            res.raise_for_status()
+            return {row["id"] for row in res.json()}
+    except Exception as e:
+        print(f"BOT-ANALYTICS: failed to resolve caller's own bots (failing closed): {e}")
+        return set()
+
+
 @router.get("/bot-analytics")
 async def bot_analytics(workspace_id: str, days: int = 30,
-                        auth: AuthContext = Depends(current_user)):
+                        auth: AuthContext = Depends(current_user),
+                        authorization: Optional[str] = Header(None)):
     """
     Usage analytics for all bots in a workspace, keyed by bot_id
     (Lovable joins display names from its own chatbots table):
@@ -382,6 +417,14 @@ async def bot_analytics(workspace_id: str, days: int = 30,
     volume, and keeps bot_usage_summary/daily untouched). answer_rate is
     1 - unanswered/total, over queries that have a confidence value recorded
     (older rows predating this column are excluded, not counted as failures).
+
+    RBAC rollout Phase 4: an `admin`-tier caller (not owner/super admin) only
+    ever sees analytics for bots THEY created, not the full tenant — owner and
+    admin used to see the identical full-workspace view, which contradicted
+    "Admin cannot see overall tenant plan credits" once tier boundaries became
+    a real thing this session. Enforced server-side via _fetch_my_chatbot_ids,
+    not just a frontend filter — an admin cannot see past this by editing the
+    request, since the id set comes from the app DB with their own token.
     """
     try:
         if not workspace_id:
@@ -444,6 +487,14 @@ async def bot_analytics(workspace_id: str, days: int = 30,
             b["top_questions"] = sorted(
                 question_groups.values(), key=lambda g: g["count"], reverse=True
             )[:5]
+
+        if not auth.is_super_admin and auth.role_in(workspace_id) == "admin":
+            token = ""
+            if authorization and authorization.lower().startswith("bearer "):
+                token = authorization[7:].strip()
+            my_bot_ids = _fetch_my_chatbot_ids(token, workspace_id, auth.user_id)
+            bots = {bid: b for bid, b in bots.items() if bid in my_bot_ids}
+            daily = [row for row in daily if row.get("bot_id") in my_bot_ids]
 
         return {"workspace_id": workspace_id, "bots": bots, "daily": daily}
 
