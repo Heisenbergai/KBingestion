@@ -19,14 +19,20 @@ Flow:
      linked folder so it's automatically in-scope once uploaded). No ingestion
      logic is duplicated here — this just records which document answered it.
   4. POST /bot-unanswered-questions/{id}/transfer — assigns the question to a
-     specific workspace member. No email/notification: there is no SMTP in
-     this project yet (see 12_go_live_plan.md). The assignee finds it via an
-     "assigned to me" filter against the same list endpoint.
+     specific workspace member, and appends a row to bot_question_assignments
+     (append-only history — transferred_to_user_id on the question itself is
+     only ever a fast "current assignee" cache, so reassigning never destroys
+     who had it before). No email/notification: there is no SMTP in this
+     project yet (see 12_go_live_plan.md). The assignee finds it via an
+     "assigned to me" filter against the same list endpoint, and can now
+     actually answer it (see _require_admin_or_assignee) — RBAC rollout Phase
+     3 fixed a real gap where transferring a question to a regular employee
+     gave them no endpoint that let them act on it.
 
-All four mutate a workspace-scoped table with no permissive RLS policies (see
-the bot_learning_question_logging_and_escalation migration) — only this
-service-role client can touch it, same posture as bot_usage_events/
-provider_credentials/connections.
+All mutate workspace-scoped tables with no permissive RLS policies (see the
+bot_learning_question_logging_and_escalation migration and
+add_bot_question_assignments_history) — only this service-role client can
+touch them, same posture as bot_usage_events/provider_credentials/connections.
 """
 import os
 from datetime import datetime, timezone
@@ -62,6 +68,28 @@ def _require_admin(auth: AuthContext, workspace_id: str) -> None:
             status_code=403,
             detail="Only workspace owners/admins can manage the unanswered-questions queue.",
         )
+
+
+def _require_admin_or_assignee(auth: AuthContext, workspace_id: str, question: dict) -> None:
+    """
+    Relaxed bar for /answer only (RBAC rollout Phase 3): an admin can still
+    answer anything, but a question actually TRANSFERRED to this caller is now
+    also answerable by them — the real gap the audit found. Before this, a
+    regular employee handed a question via /transfer had no endpoint that let
+    them act on it at all, despite the frontend offering a "transfer to
+    teammate" flow that implied they could. /resolve and /transfer stay
+    admin-only (_require_admin) — this relaxation is deliberately narrow.
+    """
+    if auth.is_super_admin:
+        return
+    if auth.role_in(workspace_id) in ("owner", "admin"):
+        return
+    if question.get("status") == "transferred" and question.get("transferred_to_user_id") == auth.user_id:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail="Only workspace owners/admins, or the person this question was transferred to, can answer it.",
+    )
 
 
 @router.get("/bot-unanswered-questions")
@@ -102,12 +130,12 @@ async def answer_question(question_id: str, body: AnswerRequest,
     so the asking bot can find it next time, then marks the question answered.
     """
     auth.assert_workspace(body.workspace_id)
-    _require_admin(auth, body.workspace_id)
 
     if not body.answer_text.strip():
         raise HTTPException(status_code=400, detail="answer_text is required.")
 
     question = _get_question(question_id, body.workspace_id)
+    _require_admin_or_assignee(auth, body.workspace_id, question)
 
     note_id = bc.create_note_and_embed(
         body.workspace_id, connection_id=None, provider="bot_learning",
@@ -162,14 +190,29 @@ class TransferRequest(BaseModel):
 async def transfer_question(question_id: str, body: TransferRequest,
                             auth: AuthContext = Depends(current_user)):
     """Hands the question to a specific workspace member. No email — see
-    module docstring; the assignee checks the same list filtered to themselves."""
+    module docstring; the assignee checks the same list filtered to themselves.
+
+    Also appends a row to bot_question_assignments — transferred_to_user_id
+    on the question itself is only ever a fast "current assignee" cache, and
+    a reassignment used to silently overwrite it with no record of who had it
+    before. The history table is append-only so that never happens again."""
     auth.assert_workspace(body.workspace_id)
     _require_admin(auth, body.workspace_id)
     _get_question(question_id, body.workspace_id)
 
+    now = datetime.now(timezone.utc).isoformat()
     supabase.table("bot_unanswered_questions").update({
         "status":                 "transferred",
         "transferred_to_user_id": body.transferred_to_user_id,
-        "transferred_at":         datetime.now(timezone.utc).isoformat(),
+        "transferred_at":         now,
     }).eq("id", question_id).execute()
+
+    supabase.table("bot_question_assignments").insert({
+        "question_id":          question_id,
+        "workspace_id":         body.workspace_id,
+        "assigned_to_user_id":  body.transferred_to_user_id,
+        "assigned_by":          auth.user_id,
+        "assigned_at":          now,
+    }).execute()
+
     return {"success": True}
