@@ -262,6 +262,129 @@ def extract_csv(file_bytes: bytes) -> str:
     return "\n".join(lines)
 
 
+def extract_xlsx_tables(file_bytes: bytes, max_rows_per_sheet: int = 5000) -> list[dict]:
+    """
+    The STRUCTURED counterpart to extract_xlsx — same workbook, types kept.
+
+    WHY THIS EXISTS. extract_xlsx flattens every row into prose
+    ("Quarter: Q3 | Revenue: 4200000") because that embeds and retrieves better,
+    which is correct for RAG. But it means a spreadsheet — the one input that
+    arrives already structured and already typed — has its structure thrown away
+    at the last step. A cell containing 4200000 IS the number: no LLM reads it,
+    so there is nothing to hallucinate. That is the highest-confidence data this
+    system can obtain, and it was being discarded.
+
+    DELIBERATELY A SEPARATE FUNCTION. extract_xlsx is on the live path for every
+    upload and every Google Drive sync; its signature, return type and exact
+    output text are unchanged and must stay that way. This one is additive and
+    its failure is never allowed to abort an ingest (see the caller).
+
+    Note on formulas: openpyxl's data_only=True returns the value Excel/Sheets
+    last CACHED, not a computed one. Files saved by real Excel or exported from
+    Google Sheets carry those cached values; a workbook generated
+    programmatically and never opened does not, and those cells read as None.
+    That is a property of the format, not a bug here.
+    """
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
+    tables: list[dict] = []
+
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            continue
+
+        # First non-empty row is the header — same rule extract_xlsx uses, so the
+        # two views of one sheet never disagree about where the data starts.
+        header = None
+        header_idx = 0
+        for i, row in enumerate(rows):
+            if row and any(c is not None and str(c).strip() != "" for c in row):
+                header = [str(c).strip() if c is not None else f"col_{j}"
+                          for j, c in enumerate(row)]
+                header_idx = i
+                break
+        if not header:
+            continue
+
+        records: list[dict] = []
+        for row in rows[header_idx + 1:]:
+            if not row or all(c is None or str(c).strip() == "" for c in row):
+                continue  # blank row, same skip rule as extract_xlsx
+            record = {}
+            for col_name, value in zip(header, row):
+                if value is None:
+                    continue
+                # Keep native types. Dates become ISO strings only because the
+                # destination is JSONB, which has no date type.
+                if hasattr(value, "isoformat"):
+                    record[col_name] = value.isoformat()
+                else:
+                    record[col_name] = value
+            if record:
+                records.append(record)
+            if len(records) >= max_rows_per_sheet:
+                break
+
+        if not records:
+            continue
+
+        # Which columns are usable as metrics — the whole point of keeping types.
+        numeric_columns = [
+            col for col in header
+            if any(isinstance(r.get(col), (int, float)) and not isinstance(r.get(col), bool)
+                   for r in records)
+        ]
+
+        tables.append({
+            "sheet":           sheet_name,
+            "headers":         header,
+            "rows":            records,
+            "row_count":       len(records),
+            "numeric_columns": numeric_columns,
+        })
+
+    return tables
+
+
+def is_spreadsheet(mime_type: str, file_name: str) -> bool:
+    """Mirrors extract_text's own xlsx branch so the two cannot drift apart."""
+    return (
+        mime_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        or (file_name or "").lower().endswith((".xlsx", ".xlsm"))
+    )
+
+
+def store_document_tables(tables: list[dict], document_id: str, workspace_id: str) -> int:
+    """
+    Persists the structured view. Re-ingesting a document REPLACES its tables
+    rather than accumulating copies — a re-processed spreadsheet should not end
+    up with two conflicting versions of the same sheet, which is exactly the
+    kind of ambiguity this whole feature exists to remove.
+
+    Returns how many sheets were stored. Raises on failure; the caller decides
+    whether that is fatal (it is not — see process_document_bytes).
+    """
+    if not tables:
+        return 0
+
+    supabase.table("document_tables").delete().eq("document_id", document_id).execute()
+
+    payload = [{
+        "document_id":     document_id,
+        "workspace_id":    workspace_id,
+        "sheet_name":      t["sheet"],
+        "headers":         t["headers"],
+        "rows":            t["rows"],
+        "row_count":       t["row_count"],
+        "numeric_columns": t["numeric_columns"],
+    } for t in tables]
+
+    supabase.table("document_tables").insert(payload).execute()
+    print(f"[ingest] stored {len(payload)} structured sheet(s) for document {document_id}")
+    return len(payload)
+
+
 def extract_text(file_bytes: bytes, mime_type: str, file_name: str) -> str:
     name_lower = file_name.lower()
 
@@ -546,6 +669,18 @@ def process_document_bytes(
 
     set_stage("extracting")
     raw_text = extract_text(file_bytes, mime_type, file_name)
+
+    # Phase H: a spreadsheet also keeps its STRUCTURE, not just its prose.
+    # Best-effort by design — a structured-parse failure must never cost the
+    # user their upload, since the text path above has already succeeded and is
+    # what powers search. Same fail-safe convention as ai._log_usage().
+    if is_spreadsheet(mime_type, file_name):
+        try:
+            store_document_tables(
+                extract_xlsx_tables(file_bytes), document_id, workspace_id,
+            )
+        except Exception as e:
+            print(f"[ingest] structured spreadsheet parse skipped for {file_name}: {e}")
 
     if not raw_text.strip():
         raise ValueError(
