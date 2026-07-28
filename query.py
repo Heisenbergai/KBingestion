@@ -27,6 +27,14 @@ class QueryRequest(BaseModel):
     workspace_id: str           # ← REQUIRED — only search this workspace's chunks
     asset_id:     Optional[str] = None
     match_count:  Optional[int] = 8
+    # Optional narrowing to specific documents (a dashboard card scoped to a
+    # folder resolves that folder to its document ids client-side, through the
+    # caller's own RLS, and sends them here). This is a RELEVANCE filter, not a
+    # security boundary — filter_sensitivities below remains the access control,
+    # and is always resolved server-side from the caller's real role. Sending a
+    # document id you cannot see gains you nothing: both filters are ANDed
+    # inside match_chunks_hybrid's SQL.
+    filter_document_ids: Optional[list[str]] = None
 
 
 def _resolve_allowed_sensitivities(role: Optional[str], is_super_admin: bool) -> list[str]:
@@ -68,7 +76,8 @@ def _fetch_my_restricted_grants(token: str, user_id: str) -> list[str]:
 def hybrid_search(question: str, workspace_id: str,
                   match_count: int = 8, asset_id: str = None,
                   filter_sensitivities: Optional[list[str]] = None,
-                  filter_restricted_grant_ids: Optional[list[str]] = None) -> list[dict]:
+                  filter_restricted_grant_ids: Optional[list[str]] = None,
+                  filter_document_ids: Optional[list[str]] = None) -> list[dict]:
     """
     Company-brain retrieval: vector + keyword fused with Reciprocal Rank
     Fusion, then boosted by source tier (official docs > curated notes >
@@ -88,6 +97,7 @@ def hybrid_search(question: str, workspace_id: str,
         "filter_asset_id":             asset_id,
         "filter_sensitivities":        filter_sensitivities,
         "filter_restricted_grant_ids": filter_restricted_grant_ids,
+        "filter_document_ids":         filter_document_ids or None,
     }
     try:
         result = supabase.rpc("match_chunks_hybrid", rpc_args).execute()
@@ -167,6 +177,7 @@ async def query_documents(request: QueryRequest,
             match_count=request.match_count or 8, asset_id=request.asset_id,
             filter_sensitivities=filter_sensitivities,
             filter_restricted_grant_ids=filter_restricted_grant_ids,
+            filter_document_ids=request.filter_document_ids or None,
         )
 
         if not chunks:
