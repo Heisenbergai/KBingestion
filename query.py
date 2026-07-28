@@ -1,7 +1,9 @@
 import os
 import re
 import ai
-from fastapi import APIRouter, HTTPException, Depends
+import httpx
+import auth as auth_mod
+from fastapi import APIRouter, HTTPException, Depends, Header
 from auth import AuthContext, current_user
 from pydantic import BaseModel
 from typing import Optional
@@ -27,33 +29,74 @@ class QueryRequest(BaseModel):
     match_count:  Optional[int] = 8
 
 
+def _resolve_allowed_sensitivities(role: Optional[str], is_super_admin: bool) -> list[str]:
+    """Same ladder as chatbot.py's identical helper — kept as a small local
+    duplicate rather than a cross-module import, matching this codebase's
+    existing convention of small per-file helpers over shared coupling."""
+    if is_super_admin or role == "owner":
+        return ["public", "internal", "confidential", "restricted"]
+    if role == "admin":
+        return ["public", "internal", "confidential"]
+    return ["public", "internal"]
+
+
+def _fetch_my_restricted_grants(token: str, user_id: str) -> list[str]:
+    """Same forwarded-token pattern as chatbot.py's _fetch_my_chatbot_ids."""
+    if not auth_mod.APP_SUPABASE_URL or not auth_mod.APP_SUPABASE_ANON_KEY:
+        return []
+    try:
+        with httpx.Client(timeout=10) as client:
+            res = client.get(
+                f"{auth_mod.APP_SUPABASE_URL}/rest/v1/knowledge_item_grants",
+                params={
+                    "select":             "knowledge_item_id",
+                    "granted_to_user_id": f"eq.{user_id}",
+                },
+                headers={
+                    "apikey":        auth_mod.APP_SUPABASE_ANON_KEY,
+                    "Authorization": f"Bearer {token}",
+                    "Accept":        "application/json",
+                },
+            )
+            res.raise_for_status()
+            return [row["knowledge_item_id"] for row in res.json()]
+    except Exception as e:
+        print(f"QUERY: failed to resolve caller's restricted grants (failing closed): {e}")
+        return []
+
+
 def hybrid_search(question: str, workspace_id: str,
-                  match_count: int = 8, asset_id: str = None) -> list[dict]:
+                  match_count: int = 8, asset_id: str = None,
+                  filter_sensitivities: Optional[list[str]] = None,
+                  filter_restricted_grant_ids: Optional[list[str]] = None) -> list[dict]:
     """
     Company-brain retrieval: vector + keyword fused with Reciprocal Rank
     Fusion, then boosted by source tier (official docs > curated notes >
     chat) and freshness. Falls back to pure-vector match_chunks_workspace
     if the hybrid RPC is unavailable (safety net during rollout).
-    Always workspace-isolated.
+    Always workspace-isolated. Phase E: also sensitivity-filtered — AI
+    Search previously let any workspace member search up a Confidential
+    document with no check at all; the caller's real ladder is resolved by
+    the route handler and passed in here, same as chatbot.py's bots.
     """
     embedding = ai.embed_texts([question], workspace_id=workspace_id, feature="ai_search")[0]
+    rpc_args = {
+        "query_text":                 question,
+        "query_embedding":             embedding,
+        "match_count":                 match_count,
+        "filter_workspace_id":         workspace_id,
+        "filter_asset_id":             asset_id,
+        "filter_sensitivities":        filter_sensitivities,
+        "filter_restricted_grant_ids": filter_restricted_grant_ids,
+    }
     try:
-        result = supabase.rpc("match_chunks_hybrid", {
-            "query_text":          question,
-            "query_embedding":     embedding,
-            "match_count":         match_count,
-            "filter_workspace_id": workspace_id,
-            "filter_asset_id":     asset_id,
-        }).execute()
+        result = supabase.rpc("match_chunks_hybrid", rpc_args).execute()
         return result.data or []
     except Exception as e:
         print(f"[query] hybrid search unavailable, falling back to vector-only: {e}")
-        result = supabase.rpc("match_chunks_workspace", {
-            "query_embedding":     embedding,
-            "match_count":         match_count,
-            "filter_asset_id":     asset_id,
-            "filter_workspace_id": workspace_id,
-        }).execute()
+        fallback_args = dict(rpc_args)
+        fallback_args.pop("query_text")
+        result = supabase.rpc("match_chunks_workspace", fallback_args).execute()
         return result.data or []
 
 
@@ -90,7 +133,8 @@ def split_answer_and_gaps(text: str) -> tuple[str, Optional[str]]:
 
 @router.post("/query")
 async def query_documents(request: QueryRequest,
-                          auth: AuthContext = Depends(current_user)):
+                          auth: AuthContext = Depends(current_user),
+                          authorization: Optional[str] = Header(None)):
     """
     Company-brain search over ONLY the caller's workspace. Returns a
     synthesized answer with inline [n] citations, a structured citations
@@ -105,9 +149,24 @@ async def query_documents(request: QueryRequest,
         # authorised before it is used — not merely present.
         auth.assert_workspace(request.workspace_id)
 
+        # Phase E: resolve this caller's real sensitivity access, same as
+        # chatbot.py's internal-query path — closes the gap where any
+        # workspace member could previously search up a Confidential
+        # document via AI Search with no check at all.
+        role = auth.role_in(request.workspace_id)
+        filter_sensitivities = _resolve_allowed_sensitivities(role, auth.is_super_admin)
+        filter_restricted_grant_ids = None
+        if not auth.is_super_admin and role == "admin":
+            token = ""
+            if authorization and authorization.lower().startswith("bearer "):
+                token = authorization[7:].strip()
+            filter_restricted_grant_ids = _fetch_my_restricted_grants(token, auth.user_id) or None
+
         chunks = hybrid_search(
             request.question, request.workspace_id,
             match_count=request.match_count or 8, asset_id=request.asset_id,
+            filter_sensitivities=filter_sensitivities,
+            filter_restricted_grant_ids=filter_restricted_grant_ids,
         )
 
         if not chunks:

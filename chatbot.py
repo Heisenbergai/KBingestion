@@ -113,19 +113,30 @@ def run_rag_query(
     question: str,
     bot: BotConfig,
     history: Optional[list[ChatMessage]] = None,
-    strict_folders: bool = False,
     user_id: Optional[str] = None,
     feature: str = "chatbot_internal",
+    filter_sensitivities: Optional[list[str]] = None,
+    filter_restricted_grant_ids: Optional[list[str]] = None,
 ) -> tuple[str, list[str], str]:
     """
     Searches ONLY document chunks belonging to the bot's workspace.
     workspace_id in bot_config is the single source of truth for isolation.
 
-    strict_folders controls what happens when linked_folder_ids matches no
-    chunks: external (widget) bots fail CLOSED — a public bot must never
-    answer from documents outside its intended scope. Internal bots fall
-    back to the whole workspace (with a loud log), since everyone in the
-    workspace can already see those documents anyway.
+    Phase E: folder scoping (bot.linked_folder_ids) and sensitivity filtering
+    both happen INSIDE match_chunks_hybrid's SQL now, not as a Python
+    post-filter on already-returned candidates — this is what lets a
+    dashboard-style bot scoped to 2 real chunks actually retrieve just those
+    2, instead of 40 candidates from everywhere with 38 discarded after the
+    fact. There is no more "fall back to the whole workspace" branch: a bot
+    scoped to folders that don't contain a caller-visible match now correctly
+    says "I don't know" rather than silently searching outside its configured
+    scope — the old fallback was exactly the kind of over-broadening this
+    phase exists to close.
+
+    filter_sensitivities/filter_restricted_grant_ids are resolved by the
+    CALLER (per-request, from the asking person's real role/grants) since
+    that can differ between two people asking the same bot the same
+    question — never resolved inside this shared function.
 
     user_id/feature are for the token-usage dashboards. `feature` matches the
     same 'chatbot_internal'/'chatbot_external' vocabulary check_and_increment_usage
@@ -169,71 +180,35 @@ def run_rag_query(
 
         # Hybrid retrieval (vector + keyword + tier/freshness boosts), still
         # workspace-isolated. Falls back to the old vector-only RPC if the
-        # hybrid function isn't deployed yet.
+        # hybrid function isn't deployed yet. Phase E: folder scoping and
+        # sensitivity filtering both happen HERE, inside the RPC's SQL WHERE
+        # clause — they shape what gets retrieved, not what survives after.
+        # bot.linked_folder_ids is trusted as a relevance hint only (it's
+        # client-supplied for internal bots, server-resolved for widget bots)
+        # — filter_sensitivities/filter_restricted_grant_ids are the actual
+        # security boundary and are always resolved server-side by the
+        # caller, never derived from anything the bot/client sent.
+        filter_document_ids = bot.linked_folder_ids or None
+        rpc_args = {
+            "query_text":                 search_text,
+            "query_embedding":             question_embedding,
+            "match_count":                 8,
+            "filter_workspace_id":         bot.workspace_id,  # ← workspace isolation
+            "filter_asset_id":             None,
+            "filter_document_ids":         filter_document_ids,
+            "filter_sensitivities":        filter_sensitivities,
+            "filter_restricted_grant_ids": filter_restricted_grant_ids,
+            "filter_bot_id":               bot.id,
+        }
         try:
-            search_result = supabase.rpc("match_chunks_hybrid", {
-                "query_text":          search_text,
-                "query_embedding":     question_embedding,
-                "match_count":         8,
-                "filter_workspace_id": bot.workspace_id,  # ← workspace isolation
-                "filter_asset_id":     None,
-            }).execute()
+            search_result = supabase.rpc("match_chunks_hybrid", rpc_args).execute()
         except Exception as e:
             print(f"[chatbot] hybrid search unavailable, vector-only fallback: {e}")
-            search_result = supabase.rpc("match_chunks_workspace", {
-                "query_embedding":     question_embedding,
-                "match_count":         8,
-                "filter_asset_id":     None,
-                "filter_workspace_id": bot.workspace_id,
-            }).execute()
+            fallback_args = dict(rpc_args)
+            fallback_args.pop("query_text")
+            search_result = supabase.rpc("match_chunks_workspace", fallback_args).execute()
 
-        all_chunks = search_result.data or []
-
-        # Additionally filter by linked documents if specified.
-        # See the comment on BotConfig.linked_folder_ids — this only works
-        # if Lovable resolved folder IDs to document/asset IDs first.
-        # A chunk from a note this SPECIFIC bot learned (bot_learning.py,
-        # via create_note_and_embed's extra_metadata) always stays in scope —
-        # it has no knowledge_folders placement to filter by, and it was
-        # taught to this bot directly in response to its own escalated
-        # question, so folder-scoping shouldn't hide it from that bot.
-        if bot.linked_folder_ids and all_chunks:
-            filtered = [
-                c for c in all_chunks
-                if c.get("document_id") in bot.linked_folder_ids
-                or c.get("asset_id") in bot.linked_folder_ids
-                or c.get("metadata", {}).get("learned_for_bot_id") == bot.id
-            ]
-            if filtered:
-                chunks = filtered
-            elif strict_folders:
-                # External/public bot: fail CLOSED. Better to say "I don't
-                # know" than to answer a public visitor from internal
-                # documents the bot was never scoped to.
-                print(
-                    f"[chatbot] WARNING: external bot '{bot.name}' (id={bot.id}) "
-                    f"linked_folder_ids={bot.linked_folder_ids} matched none of "
-                    f"the {len(all_chunks)} retrieved chunks. Failing closed "
-                    f"(no context). If this bot should have knowledge, check "
-                    f"that Lovable resolves folder IDs to document/asset IDs."
-                )
-                chunks = []
-            else:
-                # Internal bot: fall back to unfiltered workspace search —
-                # workspace members can see these documents anyway. Log
-                # loudly so the folder-scoping bug is easy to spot.
-                print(
-                    f"[chatbot] WARNING: bot '{bot.name}' (id={bot.id}) has "
-                    f"linked_folder_ids={bot.linked_folder_ids} but none of "
-                    f"the {len(all_chunks)} matched chunks belong to those IDs. "
-                    f"Falling back to unfiltered workspace search. "
-                    f"This usually means Lovable sent folder IDs instead of "
-                    f"resolved document/asset IDs — check the bot's folder "
-                    f"scoping logic in Lovable."
-                )
-                chunks = all_chunks
-        else:
-            chunks = all_chunks
+        chunks = search_result.data or []
 
         if chunks:
             context_parts = []
@@ -394,6 +369,50 @@ def _fetch_my_chatbot_ids(token: str, workspace_id: str, user_id: str) -> set[st
     except Exception as e:
         print(f"BOT-ANALYTICS: failed to resolve caller's own bots (failing closed): {e}")
         return set()
+
+
+def _resolve_allowed_sensitivities(role: Optional[str], is_super_admin: bool) -> list[str]:
+    """
+    Phase E — the read-side sensitivity ladder, mirroring knowledge_items'
+    own RLS exactly (Phase C): owner/super admin see every tier; admin
+    additionally sees Confidential but NOT Restricted (owner-only + explicit
+    grants, per the locked spec); everyone else sees Public/Internal only.
+    """
+    if is_super_admin or role == "owner":
+        return ["public", "internal", "confidential", "restricted"]
+    if role == "admin":
+        return ["public", "internal", "confidential"]
+    return ["public", "internal"]
+
+
+def _fetch_my_restricted_grants(token: str, user_id: str) -> list[str]:
+    """
+    Only meaningful for admin-tier callers — owner already sees every
+    Restricted doc unconditionally, and employees can never be individually
+    granted per the locked spec (only admins are grantable). Same
+    forwarded-token pattern as _fetch_my_chatbot_ids.
+    """
+    if not auth_mod.APP_SUPABASE_URL or not auth_mod.APP_SUPABASE_ANON_KEY:
+        return []
+    try:
+        with httpx.Client(timeout=10) as client:
+            res = client.get(
+                f"{auth_mod.APP_SUPABASE_URL}/rest/v1/knowledge_item_grants",
+                params={
+                    "select":             "knowledge_item_id",
+                    "granted_to_user_id": f"eq.{user_id}",
+                },
+                headers={
+                    "apikey":        auth_mod.APP_SUPABASE_ANON_KEY,
+                    "Authorization": f"Bearer {token}",
+                    "Accept":        "application/json",
+                },
+            )
+            res.raise_for_status()
+            return [row["knowledge_item_id"] for row in res.json()]
+    except Exception as e:
+        print(f"CHATBOT: failed to resolve caller's restricted grants (failing closed): {e}")
+        return []
 
 
 @router.get("/bot-analytics")
@@ -586,12 +605,17 @@ async def widget_query(request: Request, body: WidgetQueryRequest):
         )
 
         verify_domain(bot, request)
+        # No visitor identity exists on this path at all — there is nothing
+        # to derive a sensitivity ladder FROM, so it's hard-coded to Public
+        # only. get_public_bot's own SQL already resolves resolved_document_ids
+        # to Public-tier documents only (Phase E fix); this is defense in
+        # depth on top of that, not the only barrier.
         answer, sources, confidence = run_rag_query(
             body.question,
             bot,
             history=body.conversation_history,
-            strict_folders=True,   # public bots never fall back outside their scope
             feature="chatbot_external",
+            filter_sensitivities=["public"],
         )
         origin = request.headers.get("origin") or request.headers.get("referer") or ""
         domain = origin.split("//")[-1].split("/")[0] if origin else None
@@ -615,7 +639,8 @@ async def widget_query(request: Request, body: WidgetQueryRequest):
 
 @router.post("/internal-query")
 async def internal_query(body: InternalQueryRequest,
-                         auth: AuthContext = Depends(current_user)):
+                         auth: AuthContext = Depends(current_user),
+                         authorization: Optional[str] = Header(None)):
     try:
         if not body.question.strip():
             raise HTTPException(status_code=400, detail="Question cannot be empty")
@@ -625,12 +650,27 @@ async def internal_query(body: InternalQueryRequest,
         # workspace's documents by naming its UUID.
         auth.assert_workspace(body.bot_config.workspace_id)
 
+        # Phase E: resolve THIS caller's real sensitivity access, server-side —
+        # two different employees asking the same bot the same question can
+        # get different context, since a Confidential/Restricted document
+        # visible to one may not be to the other. Never derived from the bot
+        # or client-supplied fields.
+        role = auth.role_in(body.bot_config.workspace_id)
+        filter_sensitivities = _resolve_allowed_sensitivities(role, auth.is_super_admin)
+        filter_restricted_grant_ids = None
+        if not auth.is_super_admin and role == "admin":
+            token = ""
+            if authorization and authorization.lower().startswith("bearer "):
+                token = authorization[7:].strip()
+            filter_restricted_grant_ids = _fetch_my_restricted_grants(token, auth.user_id) or None
+
         answer, sources, confidence = run_rag_query(
             body.question,
             body.bot_config,
             history=body.conversation_history,
-            strict_folders=False,  # internal users can see workspace docs anyway
             user_id=body.user_id, feature="chatbot_internal",
+            filter_sensitivities=filter_sensitivities,
+            filter_restricted_grant_ids=filter_restricted_grant_ids,
         )
         log_usage_event(body.bot_config, "internal", body.question.strip(), confidence,
                         user_id=body.user_id)
