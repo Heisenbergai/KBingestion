@@ -567,7 +567,7 @@ async def widget_query(request: Request, body: WidgetQueryRequest):
 
         # Server-resolved identity wins over anything the page sent. Folder scoping
         # is now ALSO fully server-resolved: get_public_bot's RPC (app DB) resolves
-        # linked_departments (folder IDs) against knowledge_items itself and returns
+        # linked_folder_ids (folder IDs) against knowledge_items itself and returns
         # resolved_document_ids, since it lives in the same Postgres instance as
         # knowledge_folders/knowledge_items and Railway does not. The client-sent
         # bot_config.linked_folder_ids is no longer trusted at all for the widget
