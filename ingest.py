@@ -65,6 +65,13 @@ class IngestRequest(BaseModel):
     source_type:  Optional[str] = "document"
     source_tier:  Optional[int] = 1
     doc_date:     Optional[str] = None   # ISO date; falls back to created_at
+    # Document classification (Phase C) — mirrored onto every chunk so a later
+    # phase can filter retrieval by them. Defaults match knowledge_items' own
+    # column defaults, in case an older frontend build omits these fields.
+    sensitivity:      Optional[str] = "internal"
+    authority:        Optional[str] = "working"
+    doc_class:        Optional[str] = None
+    lifecycle_status: Optional[str] = "active"
     # wait=True runs synchronously and returns the full result in one response
     # (old behavior — fine for small files and curl testing). Default is
     # background mode: returns a job_id immediately so large documents can't
@@ -357,6 +364,10 @@ def process_document(request: IngestRequest, job: Optional[dict] = None) -> dict
         workspace_id=request.workspace_id, mime_type=request.mime_type,
         file_name=request.file_name, source_type=request.source_type or "document",
         source_tier=request.source_tier or 1, doc_date=request.doc_date, job=job,
+        sensitivity=request.sensitivity or "internal",
+        authority=request.authority or "working",
+        doc_class=request.doc_class,
+        lifecycle_status=request.lifecycle_status or "active",
     )
 
 
@@ -364,6 +375,8 @@ def process_document_bytes(
     file_bytes: bytes, document_id: str, asset_id: str, workspace_id: str,
     mime_type: str, file_name: str, source_type: str = "document",
     source_tier: int = 1, doc_date: Optional[str] = None, job: Optional[dict] = None,
+    sensitivity: str = "internal", authority: str = "working",
+    doc_class: Optional[str] = None, lifecycle_status: str = "active",
 ) -> dict:
     """
     The extract → clean → chunk → embed → store tail of process_document(),
@@ -427,6 +440,10 @@ def process_document_bytes(
             "source_type":  source_type,
             "source_tier":  source_tier,
             "doc_date":     doc_date,      # None → DB default (created_at)
+            "sensitivity":       sensitivity,
+            "authority":         authority,
+            "doc_class":         doc_class,
+            "lifecycle_status":  lifecycle_status,
             "metadata": {
                 "file_name":    file_name,
                 "chunk_index":  i,
@@ -573,3 +590,48 @@ async def ingest_status(job_id: str,
         )
     auth.assert_workspace(job["workspace_id"])
     return job
+
+
+class DocumentMetadataUpdate(BaseModel):
+    document_id:      str
+    workspace_id:     str
+    sensitivity:      Optional[str] = None
+    authority:        Optional[str] = None
+    doc_class:        Optional[str] = None
+    lifecycle_status: Optional[str] = None
+
+
+@router.post("/document-metadata")
+async def update_document_metadata(request: DocumentMetadataUpdate,
+                                   auth: AuthContext = Depends(current_user)):
+    """
+    Syncs a classification change onto an already-ingested document's chunks.
+    Without this, re-classifying a document via the Library's edit UI would
+    only update knowledge_items in the app DB — the chunks already sitting in
+    the vector DB from the original ingestion would keep stale values, which
+    defeats "mirrored to chunks" as an ongoing guarantee (Phase E's retrieval
+    filtering would then read the wrong tier for anything reclassified after
+    upload). Metadata only — no re-embedding, since content hasn't changed.
+    A document with no chunks yet (never ingested, or still processing) is a
+    no-op: the next real ingestion will carry the current values anyway.
+    """
+    auth.assert_workspace(request.workspace_id)
+
+    patch = {
+        k: v for k, v in {
+            "sensitivity":      request.sensitivity,
+            "authority":        request.authority,
+            "doc_class":        request.doc_class,
+            "lifecycle_status": request.lifecycle_status,
+        }.items() if v is not None
+    }
+    if not patch:
+        return {"success": True, "updated_chunks": 0}
+
+    result = supabase.table("document_chunks") \
+        .update(patch) \
+        .eq("document_id", request.document_id) \
+        .eq("workspace_id", request.workspace_id) \
+        .execute()
+
+    return {"success": True, "updated_chunks": len(result.data or [])}
