@@ -72,6 +72,11 @@ class IngestRequest(BaseModel):
     authority:        Optional[str] = "working"
     doc_class:        Optional[str] = None
     lifecycle_status: Optional[str] = "active"
+    # Phase D — frontend-resolved name of the department that owns the
+    # uploading folder, if any (Railway cannot query knowledge_folders/
+    # departments itself, same reason linked_folder_ids has to be resolved
+    # frontend-side). Used only as a rules-engine hint for doc_class.
+    folder_department_name: Optional[str] = None
     # wait=True runs synchronously and returns the full result in one response
     # (old behavior — fine for small files and curl testing). Default is
     # background mode: returns a job_id immediately so large documents can't
@@ -344,6 +349,153 @@ def embed_chunks(chunks: list[str], on_progress=None,
     return all_embeddings
 
 
+# ── Document classification (Phase D) ────────────────────────────────────────────
+# Rules engine runs first (free, deterministic); the LLM (ai.chat_json, same
+# convention as brain_connectors.py's classify_batch) fills in whatever rules
+# didn't confidently resolve, and always runs for sensitivity specifically —
+# that's the security-relevant axis and deserves a real read of the content,
+# not just a filename/folder guess. Fail-safe throughout: any failure here
+# falls back to this project's own defaults rather than aborting ingestion,
+# matching how every other "LLM judgment call" in this codebase behaves.
+
+VALID_SENSITIVITY = {"public", "internal", "confidential", "restricted"}
+VALID_AUTHORITY   = {"canonical", "official", "working", "reference", "informal"}
+VALID_CLASS       = {"financial", "strategy", "policy_sop", "legal", "product",
+                      "people", "sales_marketing", "research_reference", "meeting"}
+VALID_LIFECYCLE   = {"draft", "active", "under_review", "superseded", "archived"}
+
+CLASS_FILENAME_HINTS: list[tuple[tuple[str, ...], str]] = [
+    (("invoice", "budget", "revenue", "expense", "financial"), "financial"),
+    (("policy", "sop", "procedure"), "policy_sop"),
+    (("contract", "nda", "agreement", "legal"), "legal"),
+    (("roadmap", "strategy", "okr", "vision"), "strategy"),
+    (("resume", "cv", "offer letter", "job description"), "people"),
+    (("pitch", "proposal", "campaign", "brochure"), "sales_marketing"),
+    (("meeting", "notes", "minutes", "standup"), "meeting"),
+]
+
+# Best-effort — the project's 8 default department names, not exhaustive.
+DEPARTMENT_TO_CLASS = {
+    "finance": "financial", "sales": "sales_marketing", "marketing": "sales_marketing",
+    "legal": "legal", "people": "people", "engineering": "product", "product": "product",
+    "leadership": "strategy",
+}
+
+BEDROCK_CLASSIFY_MODEL = os.getenv("BEDROCK_CLASSIFY_MODEL") or None  # falls back to ai.CHAT_MODEL
+
+CLASSIFY_SYSTEM = """You are a document classification assistant for a company's internal knowledge base.
+Given a document's title and content, classify it along four independent axes.
+
+Sensitivity - who should be able to see it:
+  public        - fine for anyone, including outside the company
+  internal      - fine for all employees (default if unsure)
+  confidential  - sensitive; only managers/admins should see it (financial detail, internal strategy, PII)
+  restricted    - highly sensitive (legal disputes, executive compensation, security incidents, M&A); owner-only
+
+Authority - how much to trust it as current truth:
+  canonical  - the definitive, official source of truth
+  official   - approved and published, but not THE canonical reference
+  working    - a draft or working document, not yet finalized
+  reference  - background/reference material, not a source of truth
+  informal   - casual notes, not vetted
+
+Class - what kind of document it is: financial, strategy, policy_sop, legal, product, people,
+  sales_marketing, research_reference, meeting
+
+Lifecycle - is it still current: draft, active, under_review, superseded, archived
+
+Respond ONLY with valid JSON, no markdown fences:
+{"sensitivity": "...", "authority": "...", "doc_class": "..." or null, "lifecycle_status": "...", "confidence": "high"|"medium"|"low"}"""
+
+
+def _rules_engine_classify(
+    title: str, source_type: str, department_hint: Optional[str],
+) -> tuple[dict, list[str]]:
+    """Free, deterministic first pass. Only ever resolves doc_class today —
+    the axis with genuinely deterministic signals (source_type, filename
+    keywords, folder department). Returns (partial_result, signals)."""
+    result: dict = {}
+    signals: list[str] = []
+
+    if source_type in ("meeting", "slack", "note"):
+        result["doc_class"] = "meeting"
+        signals.append(f"source_type:{source_type}")
+
+    if "doc_class" not in result:
+        lower_title = title.lower()
+        for keywords, doc_class in CLASS_FILENAME_HINTS:
+            if any(k in lower_title for k in keywords):
+                result["doc_class"] = doc_class
+                signals.append(f"filename_match:{keywords[0]}")
+                break
+
+    if "doc_class" not in result and department_hint:
+        mapped = DEPARTMENT_TO_CLASS.get(department_hint.strip().lower())
+        if mapped:
+            result["doc_class"] = mapped
+            signals.append(f"department_hint:{department_hint}")
+
+    return result, signals
+
+
+def classify_document(
+    title: str, raw_text: str, source_type: str,
+    department_hint: Optional[str] = None, workspace_id: Optional[str] = None,
+) -> dict:
+    """
+    Returns {"sensitivity", "authority", "doc_class", "lifecycle_status",
+    "confidence", "signals"}. Never raises — a classification failure falls
+    back to this project's own defaults (internal/working/None/active, low
+    confidence) rather than aborting ingestion, same as every other
+    "LLM judgment call" site in this codebase (classify_batch, etc).
+    """
+    rules_result, signals = _rules_engine_classify(title, source_type, department_hint)
+    defaults = {
+        "sensitivity": "internal", "authority": "working",
+        "doc_class": None, "lifecycle_status": "active", "confidence": "low",
+    }
+
+    if not raw_text.strip():
+        # Nothing to read (e.g. an image) - trust rules alone, nothing else to go on.
+        return {**defaults, **rules_result, "confidence": "high" if rules_result else "low", "signals": signals}
+
+    try:
+        verdict = ai.chat_json(
+            messages=[{"role": "user", "content":
+                       f"Title: {title}\n\nContent (may be truncated):\n{raw_text[:4000]}"}],
+            system=CLASSIFY_SYSTEM, max_tokens=300, temperature=0.2,
+            model=BEDROCK_CLASSIFY_MODEL, workspace_id=workspace_id, feature="classification",
+        )
+    except Exception as e:
+        print(f"[classify] LLM classification failed (falling back to rules/defaults): {e}")
+        signals.append("llm_failed")
+        return {**defaults, **rules_result, "signals": signals}
+
+    if not isinstance(verdict, dict):
+        signals.append("llm_invalid_response")
+        return {**defaults, **rules_result, "signals": signals}
+
+    result = dict(defaults)
+    if verdict.get("sensitivity") in VALID_SENSITIVITY:
+        result["sensitivity"] = verdict["sensitivity"]
+    if verdict.get("authority") in VALID_AUTHORITY:
+        result["authority"] = verdict["authority"]
+    if verdict.get("lifecycle_status") in VALID_LIFECYCLE:
+        result["lifecycle_status"] = verdict["lifecycle_status"]
+    if verdict.get("confidence") in ("high", "medium", "low"):
+        result["confidence"] = verdict["confidence"]
+    # Rules-engine doc_class wins over the LLM's guess - a deterministic
+    # keyword/source_type match is more trustworthy than an LLM read for
+    # this one axis specifically.
+    if "doc_class" in rules_result:
+        result["doc_class"] = rules_result["doc_class"]
+    elif verdict.get("doc_class") in VALID_CLASS:
+        result["doc_class"] = verdict["doc_class"]
+
+    result["signals"] = signals if signals else ["llm_classified"]
+    return result
+
+
 # ── Core pipeline (shared by sync and background modes) ─────────────────────────
 
 def process_document(request: IngestRequest, job: Optional[dict] = None) -> dict:
@@ -368,6 +520,7 @@ def process_document(request: IngestRequest, job: Optional[dict] = None) -> dict
         authority=request.authority or "working",
         doc_class=request.doc_class,
         lifecycle_status=request.lifecycle_status or "active",
+        folder_department_name=request.folder_department_name,
     )
 
 
@@ -377,6 +530,7 @@ def process_document_bytes(
     source_tier: int = 1, doc_date: Optional[str] = None, job: Optional[dict] = None,
     sensitivity: str = "internal", authority: str = "working",
     doc_class: Optional[str] = None, lifecycle_status: str = "active",
+    folder_department_name: Optional[str] = None,
 ) -> dict:
     """
     The extract → clean → chunk → embed → store tail of process_document(),
@@ -398,6 +552,22 @@ def process_document_bytes(
             "No text could be extracted. The file may be empty, image-only "
             "(scanned PDF with no OCR layer), or a spreadsheet with no data rows."
         )
+
+    set_stage("classifying")
+    classification = classify_document(
+        title=file_name, raw_text=raw_text, source_type=source_type,
+        department_hint=folder_department_name, workspace_id=workspace_id,
+    )
+    classification_fields = {
+        "proposed_sensitivity":      classification["sensitivity"],
+        "proposed_authority":        classification["authority"],
+        "proposed_doc_class":        classification["doc_class"],
+        "proposed_lifecycle_status": classification["lifecycle_status"],
+        "classification_confidence": classification["confidence"],
+        "classification_signals":    classification["signals"],
+    }
+    if job is not None:
+        job.update(classification_fields)
 
     cleaned = clean_text(raw_text)
     chunks  = chunk_text(cleaned)
@@ -466,7 +636,8 @@ def process_document_bytes(
         "document_id":    document_id,
         "workspace_id":   workspace_id,
         "chunks_created": len(chunks),
-        "message":        f"Processed '{file_name}' into {len(chunks)} chunks."
+        "message":        f"Processed '{file_name}' into {len(chunks)} chunks.",
+        **classification_fields,
     }
 
 
