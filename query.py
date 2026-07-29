@@ -141,6 +141,83 @@ def split_answer_and_gaps(text: str) -> tuple[str, Optional[str]]:
     return text.strip(), None
 
 
+@router.get("/document-tables")
+async def list_document_tables(workspace_id: str,
+                               auth: AuthContext = Depends(current_user),
+                               authorization: Optional[str] = Header(None)):
+    """
+    Phase I: the structured sheets (Phase H) a caller is allowed to read, so a
+    dashboard can build a metric from a real spreadsheet cell.
+
+    ACCESS: the sensitivity ladder is resolved SERVER-SIDE from the caller's real
+    role and applied in the query — identical to /query. The client never says
+    which documents it may see; that would be the client-trusted access control
+    this project already had to fix once on the public widget path.
+
+    Row payloads are deliberately NOT returned here — only the shape (sheet
+    names, headers, which columns are numeric, row counts). A dashboard card
+    picks a column from this, then fetches just that column's values. Shipping
+    every cell of every sheet to build a picker would be both slow and a wider
+    exposure than the feature needs.
+    """
+    if not workspace_id:
+        raise HTTPException(status_code=400, detail="workspace_id is required.")
+    auth.assert_workspace(workspace_id)
+
+    role = auth.role_in(workspace_id)
+    allowed = _resolve_allowed_sensitivities(role, auth.is_super_admin)
+
+    try:
+        res = (supabase.table("document_tables")
+               .select("id, document_id, sheet_name, headers, numeric_columns, row_count, sensitivity")
+               .eq("workspace_id", workspace_id)
+               .in_("sensitivity", allowed)
+               .execute())
+        return {"tables": res.data or [], "workspace_id": workspace_id}
+    except Exception as e:
+        print(f"DOCUMENT-TABLES ERROR: {e}")
+        raise HTTPException(status_code=500, detail="Could not load spreadsheet tables.")
+
+
+@router.get("/document-table-rows/{table_id}")
+async def get_document_table_rows(table_id: str, workspace_id: str,
+                                  auth: AuthContext = Depends(current_user)):
+    """
+    The actual cell values for ONE sheet the caller has already been shown.
+
+    The sensitivity check is repeated here rather than assumed from the listing
+    call — an endpoint that trusts "you must have listed it first" is trusting
+    the client's word about a previous request.
+    """
+    if not workspace_id:
+        raise HTTPException(status_code=400, detail="workspace_id is required.")
+    auth.assert_workspace(workspace_id)
+
+    role = auth.role_in(workspace_id)
+    allowed = _resolve_allowed_sensitivities(role, auth.is_super_admin)
+
+    try:
+        res = (supabase.table("document_tables")
+               .select("id, document_id, sheet_name, headers, rows, numeric_columns, row_count")
+               .eq("id", table_id)
+               .eq("workspace_id", workspace_id)   # never trust the id alone
+               .in_("sensitivity", allowed)
+               .limit(1)
+               .execute())
+        rows = res.data or []
+        if not rows:
+            # Deliberately indistinguishable from "does not exist": telling a
+            # caller that a sheet exists but is above their tier leaks its
+            # existence.
+            raise HTTPException(status_code=404, detail="Table not found.")
+        return rows[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"DOCUMENT-TABLE-ROWS ERROR: {e}")
+        raise HTTPException(status_code=500, detail="Could not load sheet rows.")
+
+
 @router.post("/query")
 async def query_documents(request: QueryRequest,
                           auth: AuthContext = Depends(current_user),

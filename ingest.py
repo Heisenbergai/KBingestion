@@ -355,7 +355,8 @@ def is_spreadsheet(mime_type: str, file_name: str) -> bool:
     )
 
 
-def store_document_tables(tables: list[dict], document_id: str, workspace_id: str) -> int:
+def store_document_tables(tables: list[dict], document_id: str, workspace_id: str,
+                          sensitivity: str = "internal") -> int:
     """
     Persists the structured view. Re-ingesting a document REPLACES its tables
     rather than accumulating copies — a re-processed spreadsheet should not end
@@ -378,6 +379,10 @@ def store_document_tables(tables: list[dict], document_id: str, workspace_id: st
         "rows":            t["rows"],
         "row_count":       t["row_count"],
         "numeric_columns": t["numeric_columns"],
+        # Mirrored from the document so the metrics endpoint can filter by the
+        # caller's sensitivity ladder server-side — the vector DB cannot see
+        # knowledge_items' RLS. Same mirroring Phase C did for document_chunks.
+        "sensitivity":     sensitivity or "internal",
     } for t in tables]
 
     supabase.table("document_tables").insert(payload).execute()
@@ -678,6 +683,7 @@ def process_document_bytes(
         try:
             store_document_tables(
                 extract_xlsx_tables(file_bytes), document_id, workspace_id,
+                sensitivity=sensitivity,
             )
         except Exception as e:
             print(f"[ingest] structured spreadsheet parse skipped for {file_name}: {e}")
