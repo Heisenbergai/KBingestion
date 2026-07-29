@@ -2,6 +2,7 @@ import os
 import ai
 import httpx
 import auth as auth_mod
+import escalation_triage
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Request, Depends, Header
 from auth import AuthContext, current_user
@@ -294,7 +295,8 @@ Use the conversation history to stay consistent with what was already discussed.
 
 
 def log_usage_event(bot: BotConfig, source: str, question: str, confidence: str,
-                    domain: str = None, user_id: str = None, session_id: str = None):
+                    domain: str = None, user_id: str = None, session_id: str = None,
+                    asker_role: str = None):
     """
     Records one analytics row per bot query (powers GET /bot-analytics: chats
     per bot, internal vs external, which domains the widget runs on, top
@@ -324,14 +326,43 @@ def log_usage_event(bot: BotConfig, source: str, question: str, confidence: str,
 
     if confidence in ("none", "low"):
         try:
+            text = question[:MAX_MESSAGE_CHARS]
+
+            # Triage BEFORE writing, so the queue is quiet by default rather than
+            # filtered at read time. Nothing is dropped: a rejected question is
+            # still stored, with its reason, so the filter stays auditable.
+            triage, reason = escalation_triage.triage_question(
+                text, workspace_id=bot.workspace_id,
+            )
+
+            # How often this exact question has come up already — the strongest
+            # priority signal there is, and it needs nobody to tag anything.
+            times_asked = 1
+            try:
+                prior = (supabase.table("bot_unanswered_questions")
+                         .select("id", count="exact")
+                         .eq("workspace_id", bot.workspace_id)
+                         .eq("question", text)
+                         .execute())
+                times_asked = (prior.count or 0) + 1
+            except Exception:
+                pass  # a missing count must not cost us the escalation itself
+
+            priority = escalation_triage.score_priority(
+                text, confidence, asker_role, times_asked,
+            )
+
             supabase.table("bot_unanswered_questions").insert({
-                "workspace_id": bot.workspace_id,
-                "bot_id":       bot.id,
-                "question":     question[:MAX_MESSAGE_CHARS],
-                "source":       source,
-                "session_id":   session_id,
-                "user_id":      user_id,
-                "confidence":   confidence,
+                "workspace_id":  bot.workspace_id,
+                "bot_id":        bot.id,
+                "question":      text,
+                "source":        source,
+                "session_id":    session_id,
+                "user_id":       user_id,
+                "confidence":    confidence,
+                "triage":        triage,
+                "triage_reason": reason or None,
+                "priority":      priority,
             }).execute()
         except Exception as e:
             print(f"[chatbot] escalation logging failed (non-fatal): {e}")
@@ -672,8 +703,11 @@ async def internal_query(body: InternalQueryRequest,
             filter_sensitivities=filter_sensitivities,
             filter_restricted_grant_ids=filter_restricted_grant_ids,
         )
+        # asker_role feeds priority scoring — a question the owner or an admin
+        # couldn't get answered is escalated to P1. `role` is already resolved
+        # above for the sensitivity ladder, so this costs no extra lookup.
         log_usage_event(body.bot_config, "internal", body.question.strip(), confidence,
-                        user_id=body.user_id)
+                        user_id=body.user_id, asker_role=role)
         return {
             "answer":          answer,
             "sources":         sources,
