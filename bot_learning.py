@@ -123,9 +123,18 @@ def _get_question(question_id: str, workspace_id: str) -> dict:
     return rows[0]
 
 
+_SENSITIVITY_TIERS = ("public", "internal", "confidential", "restricted")
+
+
 class AnswerRequest(BaseModel):
     workspace_id: str
     answer_text:  str
+    # Who may see this answer once it becomes searchable knowledge. Defaults to
+    # 'internal', NEVER 'public': an admin answering "what was Q4 revenue" must
+    # have to *choose* to expose it, and the quiet tier is the safe one to land
+    # on when nobody chooses. Matches the locked Phase C rule that anything
+    # unclassified is Internal.
+    sensitivity:  Optional[str] = "internal"
 
 
 @router.post("/bot-unanswered-questions/{question_id}/answer")
@@ -143,12 +152,33 @@ async def answer_question(question_id: str, body: AnswerRequest,
     question = _get_question(question_id, body.workspace_id)
     _require_admin_or_assignee(auth, body.workspace_id, question)
 
+    # Validate rather than trust: an unrecognised tier falls back to 'internal',
+    # never to 'public'. A typo must not be the thing that publishes an answer.
+    sensitivity = (body.sensitivity or "internal").strip().lower()
+    if sensitivity not in _SENSITIVITY_TIERS:
+        sensitivity = "internal"
+
     note_id = bc.create_note_and_embed(
         body.workspace_id, connection_id=None, provider="bot_learning",
         note={"title": question["question"][:200], "body": body.answer_text.strip()},
         source_type="note", source_tier=2, source_ref=question_id,
         extra_metadata={"learned_for_bot_id": question["bot_id"]},
     )
+
+    # Stamp the tier on the note AND on the chunks it produced. The chunks are
+    # what retrieval actually filters on, so tagging only the note would leave
+    # the answer just as exposed as before — the fix to match_chunks_hybrid
+    # enforces `sensitivity`, and chunks default to 'internal' otherwise.
+    try:
+        supabase.table("knowledge_notes").update({"sensitivity": sensitivity}) \
+            .eq("id", note_id).execute()
+        supabase.table("document_chunks").update({"sensitivity": sensitivity}) \
+            .eq("document_id", note_id).execute()
+    except Exception as e:
+        # Best-effort, but log loudly: the answer is already saved at this point,
+        # and silently leaving it at the default is exactly the kind of quiet
+        # over-exposure this whole change exists to remove.
+        print(f"[bot_learning] FAILED to stamp sensitivity '{sensitivity}' on note {note_id}: {e}")
 
     supabase.table("bot_unanswered_questions").update({
         "status":         "answered",
