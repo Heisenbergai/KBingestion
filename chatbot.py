@@ -5,6 +5,7 @@ import auth as auth_mod
 import escalation_triage
 import query_reasoning
 import grounding
+import signals
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Request, Depends, Header
 from auth import AuthContext, current_user
@@ -339,6 +340,18 @@ Use the conversation history to stay consistent with what was already discussed.
     # the final context — not the pre-retry candidates, and not filtered to
     # "cited" since nothing here is cited. Zero extra AI cost, same as query.py.
     corroboration = grounding.corroboration_level(chunks)
+
+    # R-D: dark signal collection — nothing reads this back yet. 'scope_used'
+    # from the bot's own configured scope (not the fallback-resolved widget
+    # scope, which is server-derived rather than a real user choice); sources
+    # are logged as 'source_used_in_context', never 'source_cited' — bots have
+    # no citation mechanism, so this is honestly a weaker signal (see
+    # signals.py's module docstring on why the two must never be conflated).
+    signals.log_scope_used(bot.workspace_id, user_id, feature, question, bot.linked_folder_ids or [])
+    signals.log_sources_used_in_context(
+        bot.workspace_id, user_id, feature, question,
+        [c.get("document_id") for c in chunks], confidence,
+    )
 
     return answer, sources, confidence, corroboration
 

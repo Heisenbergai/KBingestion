@@ -5,6 +5,7 @@ import httpx
 import auth as auth_mod
 import query_reasoning
 import grounding
+import signals
 from fastapi import APIRouter, HTTPException, Depends, Header
 from auth import AuthContext, current_user
 from pydantic import BaseModel
@@ -363,6 +364,19 @@ Formatting:
         # Confidence can only move MORE cautious here, never more confident —
         # retrieval similarity remains the ceiling.
         confidence = grounding.downgrade_for_weak_grounding(confidence, coverage["coverage_ratio"])
+
+        # R-D: dark signal collection — nothing reads this back yet. Reuses
+        # cited_chunks already computed for R-C rather than recomputing.
+        # 'source_cited' specifically, not 'source_used_in_context' — the
+        # model chose to attribute a claim to these, a real citation.
+        signals.log_scope_used(
+            request.workspace_id, auth.user_id, "ai_search",
+            request.question, request.filter_document_ids or [],
+        )
+        signals.log_sources_cited(
+            request.workspace_id, auth.user_id, "ai_search", request.question,
+            [c.get("document_id") for c in (cited_chunks or chunks)], confidence,
+        )
 
         return {
             "answer":       answer,
