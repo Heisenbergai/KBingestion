@@ -8,6 +8,7 @@ import docx
 import pptx
 import openpyxl
 import threading
+import time
 import ai
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Depends
@@ -72,6 +73,11 @@ class IngestRequest(BaseModel):
     authority:        Optional[str] = "working"
     doc_class:        Optional[str] = None
     lifecycle_status: Optional[str] = "active"
+    # H-0: optional, default None — an older frontend build that omits them
+    # behaves exactly as before (these were null on every chunk until now).
+    effective_from:   Optional[str] = None
+    valid_until:      Optional[str] = None
+    superseded_by:    Optional[str] = None
     # Phase D — frontend-resolved name of the department that owns the
     # uploading folder, if any (Railway cannot query knowledge_folders/
     # departments itself, same reason linked_folder_ids has to be resolved
@@ -649,6 +655,9 @@ def process_document(request: IngestRequest, job: Optional[dict] = None) -> dict
         doc_class=request.doc_class,
         lifecycle_status=request.lifecycle_status or "active",
         folder_department_name=request.folder_department_name,
+        effective_from=request.effective_from,
+        valid_until=request.valid_until,
+        superseded_by=request.superseded_by,
     )
 
 
@@ -659,6 +668,14 @@ def process_document_bytes(
     sensitivity: str = "internal", authority: str = "working",
     doc_class: Optional[str] = None, lifecycle_status: str = "active",
     folder_department_name: Optional[str] = None,
+    # H-0: carried so a RE-INGEST doesn't silently wipe an expiry date the user
+    # had set. The other four classification fields were already carried for
+    # exactly this reason; these three were left behind when they were added,
+    # so "Re-run AI Processing" on a document with a valid_until would have
+    # dropped it from the chunks while knowledge_items kept it — a silent
+    # divergence between the two, which is what the mirroring exists to prevent.
+    effective_from: Optional[str] = None, valid_until: Optional[str] = None,
+    superseded_by: Optional[str] = None,
 ) -> dict:
     """
     The extract → clean → chunk → embed → store tail of process_document(),
@@ -755,6 +772,9 @@ def process_document_bytes(
             "authority":         authority,
             "doc_class":         doc_class,
             "lifecycle_status":  lifecycle_status,
+            "effective_from":    effective_from,
+            "valid_until":       valid_until,
+            "superseded_by":     superseded_by,
             "metadata": {
                 "file_name":    file_name,
                 "chunk_index":  i,
@@ -782,10 +802,37 @@ def process_document_bytes(
     }
 
 
+def log_processing_outcome(document_id: str, workspace_id: str, status: str,
+                           chunks_created: int = 0, error: Optional[str] = None,
+                           duration_ms: Optional[int] = None,
+                           file_name: Optional[str] = None) -> None:
+    """
+    H-0: appends one row per ingestion attempt, success or failure.
+
+    Best-effort and fail-safe, same convention as ai._log_usage() and
+    signals.log_signal(): a logging failure must NEVER turn a SUCCESSFUL
+    ingest into a failed one, and must never mask the REAL error on the
+    failure path. Every exception is swallowed here.
+    """
+    try:
+        supabase.table("document_processing_log").insert({
+            "document_id":    document_id,
+            "workspace_id":   workspace_id,
+            "status":         status,
+            "chunks_created": chunks_created,
+            "error":          (error or None) and error[:2000],
+            "duration_ms":    duration_ms,
+            "file_name":      file_name,
+        }).execute()
+    except Exception as e:
+        print(f"[ingest] processing-log write failed, non-fatal ({status}): {e}")
+
+
 def _run_ingest_job(job_id: str, request: IngestRequest):
     job = INGEST_JOBS.get(job_id)
     if job is None:
         return
+    started = time.monotonic()
     try:
         result = process_document(request, job=job)
         job.update({
@@ -795,6 +842,12 @@ def _run_ingest_job(job_id: str, request: IngestRequest):
             "finished_at":    datetime.now(timezone.utc).isoformat(),
         })
         print(f"[ingest:job {job_id}] Completed — {result['chunks_created']} chunks")
+        log_processing_outcome(
+            request.document_id, request.workspace_id, "completed",
+            chunks_created=result["chunks_created"],
+            duration_ms=int((time.monotonic() - started) * 1000),
+            file_name=request.file_name,
+        )
     except Exception as e:
         import traceback
         print(f"[ingest:job {job_id}] FAILED: {e}")
@@ -804,6 +857,15 @@ def _run_ingest_job(job_id: str, request: IngestRequest):
             "error":       str(e),
             "finished_at": datetime.now(timezone.utc).isoformat(),
         })
+        # Logged AFTER job.update, so a logging problem can never prevent the
+        # real error reaching /ingest-status — which is what the user actually
+        # sees. The log is a health signal, never the primary error channel.
+        log_processing_outcome(
+            request.document_id, request.workspace_id, "failed",
+            error=str(e),
+            duration_ms=int((time.monotonic() - started) * 1000),
+            file_name=request.file_name,
+        )
 
 
 # ── Routes ──────────────────────────────────────────────────────────────────────
@@ -911,6 +973,14 @@ class DocumentMetadataUpdate(BaseModel):
     authority:        Optional[str] = None
     doc_class:        Optional[str] = None
     lifecycle_status: Optional[str] = None
+    # H-0: the three lifecycle DATE fields, mirrored the same way the four
+    # above already are. The Library's classification editor already sends
+    # these to knowledge_items; without them here, a document's expiry would
+    # sit in the app DB where Railway (and therefore the health checker and
+    # retrieval ranking) cannot see it.
+    effective_from:   Optional[str] = None
+    valid_until:      Optional[str] = None
+    superseded_by:    Optional[str] = None
 
 
 @router.post("/document-metadata")
@@ -935,6 +1005,9 @@ async def update_document_metadata(request: DocumentMetadataUpdate,
             "authority":        request.authority,
             "doc_class":        request.doc_class,
             "lifecycle_status": request.lifecycle_status,
+            "effective_from":   request.effective_from,
+            "valid_until":      request.valid_until,
+            "superseded_by":    request.superseded_by,
         }.items() if v is not None
     }
     if not patch:
