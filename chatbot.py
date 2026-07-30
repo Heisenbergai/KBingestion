@@ -3,6 +3,7 @@ import ai
 import httpx
 import auth as auth_mod
 import escalation_triage
+import query_reasoning
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Request, Depends, Header
 from auth import AuthContext, current_user
@@ -169,6 +170,26 @@ def run_rag_query(
 
     history_messages = _clean_history(history)
 
+    # Defined BEFORE the try block, deliberately: if embedding or the RPC call
+    # itself throws, `chunks` stays [] and these still need to be callable below
+    # to compute confidence — a NameError here would turn a normal "no results"
+    # response into a hard 500.
+    #
+    # similarity is normally a float, but PostgREST serialises NaN/Infinity as
+    # the STRING "NaN"/"Infinity" (JSON has no such literals) — confirmed while
+    # testing this locally with a degenerate query embedding. Coerced safely so
+    # a NaN similarity degrades to "no confidence" rather than crashing this
+    # function.
+    def _safe_similarity(c: dict) -> float:
+        try:
+            v = float(c.get("similarity") or 0)
+            return v if v == v else 0.0  # NaN != NaN
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _top_sim(cs: list[dict]) -> float:
+        return max((_safe_similarity(c) for c in cs), default=0.0)
+
     # Search ONLY this workspace's chunks
     chunks = []
     context_block = ""
@@ -211,6 +232,35 @@ def run_rag_query(
 
         chunks = search_result.data or []
 
+        # R-B: the first attempt came back weak (top_sim < 0.30 is exactly the
+        # 'none'/'low' confidence boundary computed below — checked early so a
+        # retry can run before the answer is generated, not after). Only the
+        # search text/embedding change on a retry — filter_document_ids/
+        # filter_sensitivities/filter_bot_id in rpc_args stay IDENTICAL, so
+        # reformulation can only find MORE of what this caller was already
+        # allowed to see, never widen access. One round, hard-capped at
+        # query_reasoning.REFORMULATION_CAP alternate queries — see that
+        # module's docstring for the full cost/safety case.
+        if _top_sim(chunks) < 0.30:
+            alt_queries = query_reasoning.reformulate_query(
+                question.strip(), workspace_id=bot.workspace_id,
+            )
+            retry_batches = []
+            for alt_q in alt_queries:
+                try:
+                    alt_embedding = ai.embed_texts(
+                        [alt_q], workspace_id=bot.workspace_id, user_id=user_id, feature=feature,
+                    )[0]
+                    alt_args = dict(rpc_args)
+                    alt_args["query_text"] = alt_q
+                    alt_args["query_embedding"] = alt_embedding
+                    alt_result = supabase.rpc("match_chunks_hybrid", alt_args).execute()
+                    retry_batches.append(alt_result.data or [])
+                except Exception as e:
+                    print(f"[chatbot] reformulated retrieval failed for one alt query (non-fatal): {e}")
+            if retry_batches:
+                chunks = query_reasoning.merge_chunk_results(chunks, retry_batches, match_count=8)
+
         if chunks:
             context_parts = []
             for chunk in chunks:
@@ -228,22 +278,10 @@ def run_rag_query(
 
     # Confidence mirrors query.py's exact thresholds (query.py:158-160) — reused
     # rather than reinvented, so "answered well" means the same thing across AI
-    # Search and chatbots. No chunks at all is "none"; otherwise it's driven by
-    # the best-matching chunk's semantic similarity.
-    #
-    # similarity is normally a float, but PostgREST serialises NaN/Infinity as
-    # the STRING "NaN"/"Infinity" (JSON has no such literals) — confirmed while
-    # testing this locally with a degenerate query embedding. Coerced safely
-    # here so a NaN similarity degrades to "no confidence" instead of crashing
-    # run_rag_query with an unhandled TypeError and breaking the chat response.
-    def _safe_similarity(c: dict) -> float:
-        try:
-            v = float(c.get("similarity") or 0)
-            return v if v == v else 0.0  # NaN != NaN
-        except (TypeError, ValueError):
-            return 0.0
-
-    top_sim = max((_safe_similarity(c) for c in chunks), default=0.0)
+    # Search and chatbots. Computed from whatever `chunks` ended up as (original
+    # or reformulation-merged) — `_top_sim`/`_safe_similarity` are defined above
+    # the try block specifically so they are always callable here.
+    top_sim = _top_sim(chunks)
     confidence = (
         "none" if not chunks else
         "high" if top_sim >= 0.45 else

@@ -3,6 +3,7 @@ import re
 import ai
 import httpx
 import auth as auth_mod
+import query_reasoning
 from fastapi import APIRouter, HTTPException, Depends, Header
 from auth import AuthContext, current_user
 from pydantic import BaseModel
@@ -256,6 +257,36 @@ async def query_documents(request: QueryRequest,
             filter_restricted_grant_ids=filter_restricted_grant_ids,
             filter_document_ids=request.filter_document_ids or None,
         )
+
+        # R-B: retry with a reformulated query when the first attempt came back
+        # weak (top_sim < 0.30 is the 'low' floor / 'none' when chunks is
+        # empty). Every retry reuses the SAME filter_sensitivities/
+        # filter_restricted_grant_ids/filter_document_ids as the primary call —
+        # hybrid_search takes those as fixed params, so a retry cannot widen
+        # access, only find more of what this caller could already see. One
+        # round, capped at query_reasoning.REFORMULATION_CAP — see that
+        # module's docstring for the full cost/safety case.
+        first_top_sim = max((c.get("similarity") or 0) for c in chunks) if chunks else 0.0
+        if first_top_sim < 0.30:
+            alt_queries = query_reasoning.reformulate_query(
+                request.question, workspace_id=request.workspace_id,
+            )
+            retry_batches = []
+            for alt_q in alt_queries:
+                try:
+                    retry_batches.append(hybrid_search(
+                        alt_q, request.workspace_id,
+                        match_count=request.match_count or 8, asset_id=request.asset_id,
+                        filter_sensitivities=filter_sensitivities,
+                        filter_restricted_grant_ids=filter_restricted_grant_ids,
+                        filter_document_ids=request.filter_document_ids or None,
+                    ))
+                except Exception as e:
+                    print(f"QUERY: reformulated retrieval failed for one alt query (non-fatal): {e}")
+            if retry_batches:
+                chunks = query_reasoning.merge_chunk_results(
+                    chunks, retry_batches, match_count=request.match_count or 8,
+                )
 
         if not chunks:
             return {
