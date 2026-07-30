@@ -4,6 +4,7 @@ import httpx
 import auth as auth_mod
 import escalation_triage
 import query_reasoning
+import grounding
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Request, Depends, Header
 from auth import AuthContext, current_user
@@ -145,10 +146,12 @@ def run_rag_query(
     already uses, so a workspace's quota checks and its token spend can be
     correlated by feature without translating between two naming schemes.
 
-    Returns (answer, sources, confidence). confidence reuses query.py's exact
-    scheme (high/medium/low/none, from top chunk similarity) rather than
-    inventing a second one, so the caller can escalate a low/none answer into
-    the admin's unanswered-questions queue.
+    Returns (answer, sources, confidence, corroboration). confidence reuses
+    query.py's exact scheme (high/medium/low/none, from top chunk similarity)
+    rather than inventing a second one, so the caller can escalate a low/none
+    answer into the admin's unanswered-questions queue. corroboration
+    ('none'/'single_source'/'multi_source', see grounding.py) is R-C's
+    zero-extra-cost signal for how many independent documents fed the answer.
     """
     if not bot.workspace_id:
         raise HTTPException(
@@ -329,7 +332,15 @@ Use the conversation history to stay consistent with what was already discussed.
         if c.get("metadata", {}).get("file_name")
     ]))
 
-    return answer, sources, confidence
+    # R-C: bots have no citation convention (their sources already render
+    # separately via the SourcesDisclosure component shipped this project —
+    # inline [n] brackets in chat prose would duplicate that, not improve it),
+    # so only corroboration applies here, computed from every chunk that fed
+    # the final context — not the pre-retry candidates, and not filtered to
+    # "cited" since nothing here is cited. Zero extra AI cost, same as query.py.
+    corroboration = grounding.corroboration_level(chunks)
+
+    return answer, sources, confidence, corroboration
 
 
 def log_usage_event(bot: BotConfig, source: str, question: str, confidence: str,
@@ -679,7 +690,7 @@ async def widget_query(request: Request, body: WidgetQueryRequest):
         # only. get_public_bot's own SQL already resolves resolved_document_ids
         # to Public-tier documents only (Phase E fix); this is defense in
         # depth on top of that, not the only barrier.
-        answer, sources, confidence = run_rag_query(
+        answer, sources, confidence, corroboration = run_rag_query(
             body.question,
             bot,
             history=body.conversation_history,
@@ -696,6 +707,7 @@ async def widget_query(request: Request, body: WidgetQueryRequest):
             "bot_name":        bot.name,
             "conversation_id": body.conversation_id,
             "session_id":      body.session_id,
+            "corroboration":   corroboration,
         }
     except HTTPException:
         raise
@@ -733,7 +745,7 @@ async def internal_query(body: InternalQueryRequest,
                 token = authorization[7:].strip()
             filter_restricted_grant_ids = _fetch_my_restricted_grants(token, auth.user_id) or None
 
-        answer, sources, confidence = run_rag_query(
+        answer, sources, confidence, corroboration = run_rag_query(
             body.question,
             body.bot_config,
             history=body.conversation_history,
@@ -752,6 +764,7 @@ async def internal_query(body: InternalQueryRequest,
             "bot_name":        body.bot_config.name,
             "conversation_id": body.conversation_id,
             "user_id":         body.user_id,
+            "corroboration":   corroboration,
         }
     except HTTPException:
         raise

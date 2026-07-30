@@ -4,6 +4,7 @@ import ai
 import httpx
 import auth as auth_mod
 import query_reasoning
+import grounding
 from fastapi import APIRouter, HTTPException, Depends, Header
 from auth import AuthContext, current_user
 from pydantic import BaseModel
@@ -341,6 +342,28 @@ Formatting:
         used = {int(n) for n in re.findall(r"\[(\d+)\]", answer)}
         cited = [c for c in citations if c["index"] in used] or citations
 
+        # R-C: grounded self-critique, at ZERO extra AI cost — both functions
+        # are pure/programmatic, working off the answer's own citation markers
+        # and which documents the CITED chunks (not the whole candidate pool)
+        # came from. citations[i-1] and chunks[i-1] are built from the same
+        # enumerate() in build_context_and_citations, so indices line up.
+        cited_chunks = [chunks[i - 1] for i in used if 1 <= i <= len(chunks)]
+        coverage = grounding.citation_coverage(answer)
+        corroboration = grounding.corroboration_level(cited_chunks or chunks)
+
+        # Cut, don't embellish: an uncited claim is not deleted from the
+        # answer (fragile text surgery risks mangling valid prose) — it is
+        # surfaced through the SAME gaps mechanism the model already uses to
+        # admit what it doesn't know, so the reader sees it either way.
+        if coverage["uncited"]:
+            preview = "; ".join(coverage["uncited"][:2])
+            note = f"Not tied to a specific source: {preview}"
+            gaps = f"{gaps} {note}" if gaps else note
+
+        # Confidence can only move MORE cautious here, never more confident —
+        # retrieval similarity remains the ceiling.
+        confidence = grounding.downgrade_for_weak_grounding(confidence, coverage["coverage_ratio"])
+
         return {
             "answer":       answer,
             "citations":    cited,
@@ -348,6 +371,7 @@ Formatting:
             "chunks":       [c["content"] for c in chunks],  # backward compat: decks/visuals flows
             "gaps":         gaps,
             "confidence":   confidence,
+            "grounding":    {"coverage_ratio": coverage["coverage_ratio"], "corroboration": corroboration},
             "workspace_id": request.workspace_id,
         }
 
