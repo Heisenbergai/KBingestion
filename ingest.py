@@ -1019,4 +1019,38 @@ async def update_document_metadata(request: DocumentMetadataUpdate,
         .eq("workspace_id", request.workspace_id) \
         .execute()
 
-    return {"success": True, "updated_chunks": len(result.data or [])}
+    # document_tables mirrors sensitivity for the SAME reason document_chunks
+    # does, and must be synced here too. Missing this was a real, confirmed
+    # exposure: automated classification (Phase D) raises a spreadsheet to
+    # `confidential` AFTER ingest has already written its tables at the
+    # then-current tier, so the tables kept `internal` while the document and
+    # its chunks became `confidential`. /document-tables and
+    # /document-table-rows filter on document_tables.sensitivity, so an
+    # employee-tier ladder (`public`,`internal`) could read every cell of a
+    # confidential spreadsheet through the metric card while knowledge_items
+    # RLS correctly hid the document itself. Found live 2026-08-01 on a real
+    # R&D budget sheet, on the first real spreadsheet ever uploaded.
+    #
+    # Only `sensitivity` exists on document_tables -- the other classification
+    # axes are not mirrored there -- so the patch is narrowed rather than
+    # reused wholesale, which would 400 on unknown columns.
+    updated_tables = 0
+    if "sensitivity" in patch:
+        try:
+            t_result = supabase.table("document_tables") \
+                .update({"sensitivity": patch["sensitivity"]}) \
+                .eq("document_id", request.document_id) \
+                .eq("workspace_id", request.workspace_id) \
+                .execute()
+            updated_tables = len(t_result.data or [])
+        except Exception as e:
+            # Never let a tables-sync failure fail the chunk sync that already
+            # succeeded -- but do surface it, because a silent failure here is
+            # exactly how the stale value got there in the first place.
+            print(f"DOCUMENT-METADATA document_tables sync FAILED: {e}")
+
+    return {
+        "success": True,
+        "updated_chunks": len(result.data or []),
+        "updated_tables": updated_tables,
+    }
