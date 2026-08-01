@@ -4,6 +4,7 @@ import ai
 import httpx
 import auth as auth_mod
 import query_reasoning
+import query_routing
 import grounding
 import signals
 from fastapi import APIRouter, HTTPException, Depends, Header
@@ -80,7 +81,9 @@ def hybrid_search(question: str, workspace_id: str,
                   match_count: int = 8, asset_id: str = None,
                   filter_sensitivities: Optional[list[str]] = None,
                   filter_restricted_grant_ids: Optional[list[str]] = None,
-                  filter_document_ids: Optional[list[str]] = None) -> list[dict]:
+                  filter_document_ids: Optional[list[str]] = None,
+                  boost_document_ids: Optional[list[str]] = None,
+                  boost_doc_classes: Optional[list[str]] = None) -> list[dict]:
     """
     Company-brain retrieval: vector + keyword fused with Reciprocal Rank
     Fusion, then boosted by source tier (official docs > curated notes >
@@ -101,6 +104,11 @@ def hybrid_search(question: str, workspace_id: str,
         "filter_sensitivities":        filter_sensitivities,
         "filter_restricted_grant_ids": filter_restricted_grant_ids,
         "filter_document_ids":         filter_document_ids or None,
+        # Soft routing (query_routing.py). RELEVANCE ONLY — these multiply a
+        # score, they never gate a row. Both None = scoring identical to
+        # before routing existed.
+        "boost_document_ids":          boost_document_ids or None,
+        "boost_doc_classes":           boost_doc_classes or None,
     }
     try:
         result = supabase.rpc("match_chunks_hybrid", rpc_args).execute()
@@ -109,6 +117,14 @@ def hybrid_search(question: str, workspace_id: str,
         print(f"[query] hybrid search unavailable, falling back to vector-only: {e}")
         fallback_args = dict(rpc_args)
         fallback_args.pop("query_text")
+        # match_chunks_workspace (vector-only safety net) does NOT implement
+        # the boost params — dropping them here rather than adding an unused
+        # signature to a second function. Consequence, stated rather than
+        # hidden: if the hybrid RPC is ever unavailable, retrieval still works
+        # and stays correctly access-filtered, but is unrouted. Ranking-only
+        # divergence, never an access divergence.
+        fallback_args.pop("boost_document_ids", None)
+        fallback_args.pop("boost_doc_classes", None)
         result = supabase.rpc("match_chunks_workspace", fallback_args).execute()
         return result.data or []
 
@@ -252,12 +268,25 @@ async def query_documents(request: QueryRequest,
                 token = authorization[7:].strip()
             filter_restricted_grant_ids = _fetch_my_restricted_grants(token, auth.user_id) or None
 
+        # Soft routing: infer which department/class the question belongs to
+        # and BOOST that branch. Never filters — see query_routing.py for why
+        # hard routing was rejected. Fails open to no boost, so a routing
+        # outage leaves retrieval exactly as it was.
+        _caller_token = ""
+        if authorization and authorization.lower().startswith("bearer "):
+            _caller_token = authorization[7:].strip()
+        routing = query_routing.compute_boosts(
+            request.question, _caller_token, request.workspace_id,
+        )
+
         chunks = hybrid_search(
             request.question, request.workspace_id,
             match_count=request.match_count or 8, asset_id=request.asset_id,
             filter_sensitivities=filter_sensitivities,
             filter_restricted_grant_ids=filter_restricted_grant_ids,
             filter_document_ids=request.filter_document_ids or None,
+            boost_document_ids=routing["boost_document_ids"],
+            boost_doc_classes=routing["boost_doc_classes"],
         )
 
         # R-B: retry with a reformulated query when the first attempt came back
@@ -282,6 +311,10 @@ async def query_documents(request: QueryRequest,
                         filter_sensitivities=filter_sensitivities,
                         filter_restricted_grant_ids=filter_restricted_grant_ids,
                         filter_document_ids=request.filter_document_ids or None,
+                        # Same routing on retries: the department a question
+                        # belongs to doesn't change just because the wording did.
+                        boost_document_ids=routing["boost_document_ids"],
+                        boost_doc_classes=routing["boost_doc_classes"],
                     ))
                 except Exception as e:
                     print(f"QUERY: reformulated retrieval failed for one alt query (non-fatal): {e}")
