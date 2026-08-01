@@ -445,6 +445,97 @@ def chunk_text(text: str) -> list[str]:
     return [c.page_content for c in splitter.create_documents([text])]
 
 
+# Structural markers the extractors themselves emit. These are the most
+# reliable section signals available, because we wrote them: extract_pptx
+# emits "[Slide 3]", extract_xlsx "[Sheet: Research Budget]", and
+# extract_pdf pages similarly. Matched before any heuristic.
+_SECTION_MARKER = re.compile(r'^\s*\[(Slide \d+|Sheet: [^\]]+|Page \d+)\]\s*$', re.M)
+
+# A heading-looking line: short, not sentence-punctuated, not a bullet, and
+# either Title Case, ALL CAPS, or numbered ("3. Executive Summary").
+_HEADING_LINE = re.compile(
+    r'^\s*(?:\d+[.)]\s+)?([A-Z][^\n]{2,79})\s*$'
+)
+
+
+# Words that are legitimately lowercase inside a Title Case heading, so they
+# must not drag its score down ("Statement of Work", "Return to Office").
+_MINOR_WORDS = {"a", "an", "and", "as", "at", "by", "for", "from", "in", "of",
+                "on", "or", "the", "to", "vs", "with"}
+
+
+def _looks_like_heading(line: str) -> bool:
+    s = line.strip()
+    if not s or len(s) > 80:
+        return False
+    if s[-1] in ".,;:?!":          # a sentence, not a heading
+        return False
+    if s[0] in "-*•–":             # a bullet
+        return False
+    if not _HEADING_LINE.match(s):
+        return False
+
+    letters = [c for c in s if c.isalpha()]
+    if not letters:
+        return False
+
+    # ALL CAPS banner ("REVENUE SUMMARY").
+    if sum(1 for c in letters if c.isupper()) / len(letters) >= 0.60:
+        return True
+
+    # Title Case ("Executive Summary", "3. Platform Architecture"). Judged on
+    # WORD-INITIAL capitals, not the letter ratio: "Executive Summary" is only
+    # 12% uppercase by letter and would be wrongly rejected by a letter-ratio
+    # rule -- which is exactly what the tests caught here.
+    body = re.sub(r'^\s*\d+[.)]\s+', '', s)          # drop a "3." prefix
+    words = [w for w in re.split(r'\s+', body) if any(c.isalpha() for c in w)]
+    significant = [w for w in words if w.lower().strip(".,&|") not in _MINOR_WORDS]
+    if not significant:
+        return False
+    capitalised = sum(1 for w in significant if w[0].isupper())
+    return capitalised / len(significant) >= 0.60
+
+
+def extract_section_label(chunk: str, previous: Optional[str] = None) -> Optional[str]:
+    """
+    Best-effort section/heading label for ONE chunk.
+
+    WHY THIS IS DERIVED PER-CHUNK RATHER THAN BY RE-CHUNKING ON HEADINGS.
+    Changing chunk boundaries would change every embedding in the corpus and
+    force a full re-ingest of every document — an enormous, irreversible
+    regression risk for a metadata improvement. This reads the chunk the
+    splitter already produced and labels it, so embeddings, chunk_index and
+    retrieval behaviour are all bit-for-bit unchanged. Purely additive.
+
+    `previous` carries the last known section forward, so a chunk that begins
+    mid-section (very common with 100-char overlap) inherits its heading
+    instead of reporting None.
+
+    Returns None when nothing convincing is found — an honest null is better
+    than a confidently wrong heading, which would mislead both the UI and any
+    future "related topics" hop.
+    """
+    if not chunk:
+        return previous
+
+    marker = _SECTION_MARKER.search(chunk)
+    if marker:
+        label = marker.group(1).strip()
+        # For a slide/page, the line right after the marker is usually its
+        # real title, which is far more useful than "Slide 7".
+        tail = chunk[marker.end():].lstrip("\n")
+        first_line = tail.split("\n", 1)[0].strip() if tail else ""
+        if first_line and _looks_like_heading(first_line):
+            return f"{label} — {first_line}"[:200]
+        return label[:200]
+
+    for line in chunk.split("\n")[:6]:   # headings sit at the top of a chunk
+        if _looks_like_heading(line):
+            return line.strip()[:200]
+
+    return previous
+
+
 def embed_chunks(chunks: list[str], on_progress=None,
                  workspace_id: Optional[str] = None, feature: str = "document_ingestion",
                  ) -> list[list[float]]:
@@ -757,6 +848,22 @@ def process_document_bytes(
         .eq("document_id", document_id) \
         .execute()
 
+    # Section labels, computed in order so each chunk can inherit the last
+    # known heading when it starts mid-section. Derived from the chunks the
+    # splitter ALREADY produced — no boundary, embedding or index changes.
+    section_labels: list[Optional[str]] = []
+    _running_section: Optional[str] = None
+    for _c in chunks:
+        try:
+            _running_section = extract_section_label(_c, _running_section)
+        except Exception as e:
+            # A labelling failure must never cost a user their upload; the
+            # chunk simply goes in unlabelled. Same convention as the
+            # structured-spreadsheet parse and ai._log_usage.
+            print(f"[ingest] section labelling failed for one chunk (non-fatal): {e}")
+            _running_section = None
+        section_labels.append(_running_section)
+
     rows = [
         {
             "document_id":  document_id,
@@ -781,6 +888,12 @@ def process_document_bytes(
                 "total_chunks": len(chunks),
                 "workspace_id": workspace_id,
                 "source_type":  source_type,
+                # Step 2 of the knowledge-structuring work: the heading this
+                # chunk sits under. Enables "related headings/topics",
+                # heading-aware citations, and a future topic-level hop.
+                # Null when nothing convincing was found — an honest null
+                # beats a confidently wrong heading.
+                "section":      section_labels[i],
             }
         }
         for i in range(len(chunks))
