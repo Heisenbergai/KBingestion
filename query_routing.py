@@ -61,21 +61,40 @@ Rules:
 Question: {question}"""
 
 
-def route_question(question: str, department_names: list[str]) -> dict:
+def route_question(
+    question: str,
+    department_names: list[str],
+    workspace_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+) -> dict:
     """
     Returns {"department": str|None, "doc_class": str|None}.
     Never raises — an unroutable question is normal, not an error.
+
+    ai.chat_json takes messages as list[dict], NOT a bare prompt string.
+    Passing a string made ai.chat() iterate it CHARACTER BY CHARACTER and
+    raise TypeError on m["role"], every single call — swallowed by the
+    fail-open handler below, so routing silently never applied a boost from
+    the day it shipped. Same failure class as P0-13: the safety net that
+    makes a feature non-critical is exactly what hides that it never runs.
     """
     empty = {"department": None, "doc_class": None}
     if not question or not department_names:
         return empty
 
     try:
-        raw = ai.chat_json(_PROMPT.format(
-            departments=", ".join(department_names),
-            doc_classes=", ".join(_DOC_CLASSES),
-            question=question[:500],
-        ))
+        raw = ai.chat_json(
+            [{"role": "user", "content": _PROMPT.format(
+                departments=", ".join(department_names),
+                doc_classes=", ".join(_DOC_CLASSES),
+                question=question[:500],
+            )}],
+            max_tokens=100,
+            temperature=0,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            feature="query_routing",
+        )
     except Exception as e:
         print(f"[routing] classification failed, continuing unrouted: {e}")
         return empty
@@ -202,7 +221,7 @@ def compute_boosts(question: str, token: Optional[str], workspace_id: Optional[s
         if not names:
             return none_result
 
-        routed = route_question(question, names)
+        routed = route_question(question, names, workspace_id=workspace_id)
         dept, klass = routed["department"], routed["doc_class"]
         if not dept and not klass:
             return none_result
