@@ -1,4 +1,5 @@
 import os
+import time
 import ai
 import httpx
 import auth as auth_mod
@@ -198,11 +199,23 @@ def run_rag_query(
     chunks = []
     context_block = ""
 
+    # Lightweight step-by-step timing, logged (not stored) at the end of this
+    # function -- "bot response-speed profiling" from the feature-request
+    # list. No prior instrumentation existed anywhere in this file, so there
+    # was no way to tell whether a slow reply came from embedding, retrieval,
+    # a reformulation retry, or the LLM call itself. Purely additive: times
+    # print to the Railway log, nothing is written to the DB, no behavior
+    # changes.
+    t_start = time.perf_counter()
+    t_embed_ms = t_retrieval_ms = t_reformulation_ms = 0.0
+
     try:
         search_text = _retrieval_text(question.strip(), history_messages)
+        t_step = time.perf_counter()
         question_embedding = ai.embed_texts(
             [search_text], workspace_id=bot.workspace_id, user_id=user_id, feature=feature,
         )[0]
+        t_embed_ms = (time.perf_counter() - t_step) * 1000
 
         # Hybrid retrieval (vector + keyword + tier/freshness boosts), still
         # workspace-isolated. Falls back to the old vector-only RPC if the
@@ -226,6 +239,7 @@ def run_rag_query(
             "filter_restricted_grant_ids": filter_restricted_grant_ids,
             "filter_bot_id":               bot.id,
         }
+        t_step = time.perf_counter()
         try:
             search_result = supabase.rpc("match_chunks_hybrid", rpc_args).execute()
         except Exception as e:
@@ -233,6 +247,7 @@ def run_rag_query(
             fallback_args = dict(rpc_args)
             fallback_args.pop("query_text")
             search_result = supabase.rpc("match_chunks_workspace", fallback_args).execute()
+        t_retrieval_ms = (time.perf_counter() - t_step) * 1000
 
         chunks = search_result.data or []
 
@@ -246,6 +261,7 @@ def run_rag_query(
         # query_reasoning.REFORMULATION_CAP alternate queries — see that
         # module's docstring for the full cost/safety case.
         if _top_sim(chunks) < 0.30:
+            t_step = time.perf_counter()
             alt_queries = query_reasoning.reformulate_query(
                 question.strip(), workspace_id=bot.workspace_id,
             )
@@ -264,6 +280,7 @@ def run_rag_query(
                     print(f"[chatbot] reformulated retrieval failed for one alt query (non-fatal): {e}")
             if retry_batches:
                 chunks = query_reasoning.merge_chunk_results(chunks, retry_batches, match_count=8)
+            t_reformulation_ms = (time.perf_counter() - t_step) * 1000
 
         if chunks:
             context_parts = []
@@ -319,12 +336,21 @@ Use the conversation history to stay consistent with what was already discussed.
 
     # Bedrock takes the system prompt separately — never inside messages.
     # ai.chat also normalizes ordering (must start with user, must alternate).
+    t_step = time.perf_counter()
     answer = ai.chat(
         messages=history_messages + [{"role": "user", "content": question}],
         system=system_content,
         max_tokens=600,
         temperature=0.5,
         workspace_id=bot.workspace_id, user_id=user_id, feature=feature,
+    )
+    t_llm_ms = (time.perf_counter() - t_step) * 1000
+    t_total_ms = (time.perf_counter() - t_start) * 1000
+    print(
+        f"[chatbot][timing] bot={bot.name!r} total={t_total_ms:.0f}ms "
+        f"embed={t_embed_ms:.0f}ms retrieval={t_retrieval_ms:.0f}ms "
+        f"reformulation={t_reformulation_ms:.0f}ms llm={t_llm_ms:.0f}ms "
+        f"chunks={len(chunks)} confidence={confidence}"
     )
 
     sources = list(set([
