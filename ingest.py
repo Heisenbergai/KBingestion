@@ -198,6 +198,59 @@ def extract_pptx(file_bytes: bytes) -> str:
     return "\n\n".join(slides_text)
 
 
+_BANNER_SCAN_LIMIT = 3
+
+
+def _find_header_row(rows: list) -> Optional[int]:
+    """
+    Index of the row that holds the real column names, or None.
+
+    Default is the first non-empty row — the rule both xlsx extractors have
+    always used, and the one they must keep agreeing on so the prose view and
+    the structured view never disagree about where data starts.
+
+    BANNER ROWS (P1-14). Real business spreadsheets routinely open with a
+    merged title cell — "MASTER BUDGET SUMMARY" — above the actual header.
+    Taking that as the header produced ["MASTER BUDGET SUMMARY","col_1",
+    "col_2",...] and pushed the true column names down into the first DATA
+    row. Confirmed on 100% of a real 5-workbook corpus, every sheet. It broke
+    the metric card (a picker offering col_2/col_3 is unusable) and weakened
+    spreadsheet retrieval, since every numeric row embedded with meaningless
+    labels attached.
+
+    So: skip leading rows that have exactly ONE non-empty cell, but ONLY if a
+    row with 2+ non-empty cells appears within the next few rows. A genuinely
+    single-column sheet never finds one and keeps its original header — the
+    fix cannot eat a real header. Bounded scan so a long single-column
+    preamble can't run away.
+    """
+    first_non_empty = None
+    for i, row in enumerate(rows):
+        if row and any(c is not None and str(c).strip() != "" for c in row):
+            first_non_empty = i
+            break
+    if first_non_empty is None:
+        return None
+
+    def width(row) -> int:
+        return sum(1 for c in row if c is not None and str(c).strip() != "")
+
+    idx = first_non_empty
+    scanned = 0
+    while scanned < _BANNER_SCAN_LIMIT and width(rows[idx]) == 1:
+        nxt = None
+        for j in range(idx + 1, len(rows)):
+            if rows[j] and any(c is not None and str(c).strip() != "" for c in rows[j]):
+                nxt = j
+                break
+        if nxt is None or width(rows[nxt]) < 2:
+            break  # no wider row follows -> this really is the header
+        idx = nxt
+        scanned += 1
+
+    return idx
+
+
 def extract_xlsx(file_bytes: bytes) -> str:
     """
     Reads every sheet in the workbook and converts each row to a readable
@@ -215,18 +268,15 @@ def extract_xlsx(file_bytes: bytes) -> str:
         if not rows:
             continue
 
-        # First non-empty row is treated as the header
-        header = None
-        data_rows = []
-        for row in rows:
-            if all(cell is None for cell in row):
-                continue
-            if header is None:
-                header = [str(c).strip() if c is not None else f"col{i}" for i, c in enumerate(row)]
-                continue
-            data_rows.append(row)
+        header_idx = _find_header_row(rows)
+        if header_idx is None:
+            continue
+        header = [str(c).strip() if c is not None else f"col{i}"
+                  for i, c in enumerate(rows[header_idx])]
+        data_rows = [r for r in rows[header_idx + 1:]
+                     if not all(cell is None for cell in r)]
 
-        if header is None or not data_rows:
+        if not data_rows:
             continue
 
         lines = [f"[Sheet: {sheet_name}]"]
@@ -300,18 +350,15 @@ def extract_xlsx_tables(file_bytes: bytes, max_rows_per_sheet: int = 5000) -> li
         if not rows:
             continue
 
-        # First non-empty row is the header — same rule extract_xlsx uses, so the
-        # two views of one sheet never disagree about where the data starts.
-        header = None
-        header_idx = 0
-        for i, row in enumerate(rows):
-            if row and any(c is not None and str(c).strip() != "" for c in row):
-                header = [str(c).strip() if c is not None else f"col_{j}"
-                          for j, c in enumerate(row)]
-                header_idx = i
-                break
-        if not header:
+        # Shared header rule (_find_header_row) — the SAME function extract_xlsx
+        # calls, so the two views of one sheet cannot disagree about where the
+        # data starts. It also skips a leading merged title banner; see P1-14 in
+        # that helper's docstring.
+        header_idx = _find_header_row(rows)
+        if header_idx is None:
             continue
+        header = [str(c).strip() if c is not None else f"col_{j}"
+                  for j, c in enumerate(rows[header_idx])]
 
         records: list[dict] = []
         for row in rows[header_idx + 1:]:
