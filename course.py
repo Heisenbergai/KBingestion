@@ -55,6 +55,28 @@ TEMPLATES = {
 }
 
 
+# ── Endpoint: resolve one image query to a real photo ────────────────────────────
+@router.get("/image-search")
+async def image_search(query: str):
+    """
+    Resolve a short text query (e.g. an AI-generated "image_query"/"query" on
+    a deck or course slide block) to one real Unsplash photo. Deck/course
+    generation only ever produces the search PHRASE — the photo itself was
+    previously resolved only at PPTX export time (presentation.py) or course
+    render time, so the in-browser editor showed a dashed placeholder with
+    just the query text and no way to see or swap the actual image while
+    editing. Reuses fetch_unsplash_image_url so attribution/download-event
+    registration (Unsplash API guideline compliance) stays in one place.
+    """
+    q = (query or "").strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="query is required")
+    result = fetch_unsplash_image_url(q)
+    if not result:
+        raise HTTPException(status_code=404, detail=f"No image found for '{q}'")
+    return result
+
+
 # ── Endpoint: list available templates ───────────────────────────────────────────
 @router.get("/templates")
 async def list_templates():
