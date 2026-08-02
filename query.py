@@ -39,6 +39,14 @@ class QueryRequest(BaseModel):
     # document id you cannot see gains you nothing: both filters are ANDed
     # inside match_chunks_hybrid's SQL.
     filter_document_ids: Optional[list[str]] = None
+    # Recent turns from this same conversation, oldest first -- {"question":
+    # str, "answer": str}. Optional and stateless-safe: omitting it (or an
+    # empty list) reproduces the exact single-shot behavior this endpoint
+    # always had. Capped hard server-side below, never trusting the caller's
+    # own length.
+    history: Optional[list[dict]] = None
+
+_MAX_HISTORY_TURNS = 6  # hard cap regardless of what the caller sends
 
 
 def _resolve_allowed_sensitivities(role: Optional[str], is_super_admin: bool) -> list[str]:
@@ -268,6 +276,20 @@ async def query_documents(request: QueryRequest,
                 token = authorization[7:].strip()
             filter_restricted_grant_ids = _fetch_my_restricted_grants(token, auth.user_id) or None
 
+        # Conversational memory, retrieval side. A follow-up like "what are
+        # the challenges in achieving THESE targets" means nothing to a
+        # search index on its own — it has no idea what "these targets" is.
+        # Rewriting it into a standalone question BEFORE retrieval (and
+        # before routing, which infers department/class from the same
+        # wording) is what actually fixes this, not just handing the raw
+        # follow-up to the answer-generation step. Capped hard here, not
+        # left to the caller's own length.
+        history_turns = (request.history or [])[-_MAX_HISTORY_TURNS:]
+        search_question = query_reasoning.condense_followup(
+            request.question, history_turns,
+            workspace_id=request.workspace_id, user_id=auth.user_id,
+        )
+
         # Soft routing: infer which department/class the question belongs to
         # and BOOST that branch. Never filters — see query_routing.py for why
         # hard routing was rejected. Fails open to no boost, so a routing
@@ -276,11 +298,11 @@ async def query_documents(request: QueryRequest,
         if authorization and authorization.lower().startswith("bearer "):
             _caller_token = authorization[7:].strip()
         routing = query_routing.compute_boosts(
-            request.question, _caller_token, request.workspace_id,
+            search_question, _caller_token, request.workspace_id,
         )
 
         chunks = hybrid_search(
-            request.question, request.workspace_id,
+            search_question, request.workspace_id,
             match_count=request.match_count or 8, asset_id=request.asset_id,
             filter_sensitivities=filter_sensitivities,
             filter_restricted_grant_ids=filter_restricted_grant_ids,
@@ -300,7 +322,7 @@ async def query_documents(request: QueryRequest,
         first_top_sim = max((c.get("similarity") or 0) for c in chunks) if chunks else 0.0
         if first_top_sim < 0.30:
             alt_queries = query_reasoning.reformulate_query(
-                request.question, workspace_id=request.workspace_id,
+                search_question, workspace_id=request.workspace_id,
             )
             retry_batches = []
             for alt_q in alt_queries:
@@ -344,6 +366,10 @@ Citation rules:
 - After each fact or claim, cite the source number(s) it came from, e.g. [1] or [2][3].
 - Use ONLY information present in the sources. Never use outside knowledge or guess.
 - Prefer official company documents over informal chat when sources disagree, and say so.
+- Earlier turns of this conversation may be included below for CONTEXT ONLY (so
+  you understand what "these", "that", or "compared to before" refers to). They
+  are not a source — every factual claim in your answer must still be cited to
+  the numbered sources, never to something only your own earlier answer said.
 
 Honesty about gaps (important):
 - If the sources only PARTIALLY answer the question, answer what you can with citations,
@@ -356,10 +382,26 @@ Formatting:
 - Match structure to content (numbered steps, bullets for options, tables for comparisons).
 - **Bold** key terms and numbers. Keep paragraphs short."""
 
+        # Conversational memory, generation side. Retrieval above searched for
+        # what the follow-up actually MEANS (search_question); the model
+        # answering it needs the actual prior turns, in the person's own
+        # words, so it can naturally continue the conversation ("similarly to
+        # Engineering...") rather than answering as if this were the first
+        # question ever asked. Original wording here, not the condensed
+        # rewrite -- condensation is a search aid, not what the person asked.
+        history_block = "\n\n".join(
+            f"Q: {h['question']}\nA: {h['answer']}"
+            for h in history_turns if h.get("question") and h.get("answer")
+        )
+        user_content = (
+            (f"Earlier in this conversation:\n{history_block}\n\n" if history_block else "")
+            + f"Sources:\n{context}\n\nQuestion: {request.question}\n\nAnswer with citations:"
+        )
+
         raw = ai.chat(
             messages=[{
                 "role": "user",
-                "content": f"Sources:\n{context}\n\nQuestion: {request.question}\n\nAnswer with citations:"
+                "content": user_content,
             }],
             system=system_prompt,
             max_tokens=1000,

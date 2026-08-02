@@ -84,6 +84,68 @@ def reformulate_query(question: str, workspace_id: Optional[str] = None) -> list
         return []
 
 
+_CONDENSE_PROMPT = """You rewrite a follow-up question from an ongoing conversation into a
+single, fully self-contained question that makes sense with NO access to the
+earlier turns -- no "it", "these", "that", "compared to before", etc.
+
+Rules:
+- Use ONLY what the conversation already established (names, metrics, time
+  periods, departments, etc.) to fill in what the follow-up is really asking.
+- Do not answer the question. Only rewrite it.
+- If the follow-up is already self-contained, return it unchanged.
+
+Reply ONLY with JSON: {"standalone_question": "<rewritten question>"}"""
+
+
+def condense_followup(question: str, history: list[dict],
+                      workspace_id: Optional[str] = None,
+                      user_id: Optional[str] = None) -> str:
+    """
+    Rewrites a follow-up question into a standalone one using recent
+    conversation turns, so RETRIEVAL searches for what the person actually
+    means instead of the bare pronoun-laden follow-up text. This is the fix
+    for the specific failure mode Tanmay hit live: "what are the challenges
+    in achieving these targets" was searched as-is, with no idea "these
+    targets" meant Engineering/Sales headcount growth from two turns earlier,
+    so it retrieved an unrelated "Challenges" section from a different
+    document entirely. Generation-time conversational continuity is handled
+    separately in query.py by passing the raw history into the answer
+    prompt -- this function's ONLY job is producing a better search query.
+
+    FAILS OPEN to the original question, same bias as reformulate_query:
+    an unavailable/broken rewrite must never block a query that would have
+    worked fine standalone. No history (first question in a thread) is a
+    no-op, not an error -- there's nothing to condense yet.
+    """
+    q = (question or "").strip()
+    if not q or not history:
+        return q
+    transcript = "\n".join(
+        f"Q: {h['question']}\nA: {h['answer']}"
+        for h in history if h.get("question") and h.get("answer")
+    )
+    if not transcript:
+        return q
+    try:
+        result = ai.chat_json(
+            messages=[{
+                "role": "user",
+                "content": f"Conversation so far:\n{transcript}\n\nFollow-up question: {q}",
+            }],
+            system=_CONDENSE_PROMPT,
+            max_tokens=150,
+            temperature=0,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            feature="ai_search_condense",
+        )
+        rewritten = (result or {}).get("standalone_question")
+        return rewritten.strip() if isinstance(rewritten, str) and rewritten.strip() else q
+    except Exception as e:
+        print(f"[query_reasoning] follow-up condensation failed, using original question (non-fatal): {e}")
+        return q
+
+
 def merge_chunk_results(primary: list[dict], retry_batches: list[list[dict]],
                         match_count: int) -> list[dict]:
     """
