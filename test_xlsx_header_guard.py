@@ -77,6 +77,52 @@ ONE_COL = _wb({
     ],
 })
 
+# --- Fixture D: TWO-ROW banner (title, then a blank/subtitle spacer) before
+# the real header — added 2026-08-13 while de-risking Phase 0 of the
+# dashboard-upgrade thread ahead of Tanmay reprocessing the real corpus.
+# Several live "Executive Dashboard" sheets look like this shape (a merged
+# title row, then a narrower subtitle/date row, then the real header).
+TWO_ROW_BANNER = _wb({
+    "Exec Dashboard": [
+        ("FY2024-25 ENTERPRISE ANNUAL BUDGET DASHBOARD", None, None, None, None),
+        ("As of Q2", None, None, None, None),
+        ("Metric", "Target", "Actual", "Variance", "Status"),
+        ("Revenue", 5000000, 5200000, 200000, "On track"),
+        ("Headcount", 120, 118, -2, "Under"),
+    ],
+})
+
+# --- Fixture E: banner deeper than the scan bound — must be left alone. ---
+# Four single-cell rows before the real header, one more than
+# _BANNER_SCAN_LIMIT (3) can reach. The fix must not partially resolve this;
+# it should fall back to treating row 0 as the header, same as an unbounded
+# single-column sheet, rather than guessing past its proven-safe limit.
+DEEP_BANNER = _wb({
+    "Too Deep": [
+        ("TITLE", None, None),
+        ("Subtitle", None, None),
+        ("Prepared by Finance", None, None),
+        ("Confidential — internal use only", None, None),
+        ("Metric", "Value", "Notes"),
+        ("Revenue", 1000000, "Q2"),
+    ],
+})
+
+# --- Fixture F: a numeric-looking rank/ID column right under the real
+# header — confirms header detection looks only at row WIDTH, never at
+# whether the row's values happen to look numeric (a live "Sales
+# Leaderboard" sheet has exactly this shape: Rank 1, 2, 3... under a real
+# header, which the pre-fix code had folded into a fake "numeric" banner
+# column).
+RANKED = _wb({
+    "Leaderboard": [
+        ("Q2 INDIVIDUAL PERFORMANCE LEADERBOARD", None, None, None),
+        ("Rank", "Rep", "Deals Closed", "Revenue"),
+        (1, "A. Rao", 14, 980000),
+        (2, "S. Iyer", 11, 845000),
+    ],
+})
+
 
 def _digest(obj) -> str:
     return hashlib.sha256(repr(obj).encode()).hexdigest()
@@ -103,6 +149,17 @@ def report():
     tables_onecol = ingest.extract_xlsx_tables(ONE_COL)
     out["onecol_headers"] = [t["headers"] for t in tables_onecol]
     out["onecol_row_count"] = [t["row_count"] for t in tables_onecol]
+
+    tables_tworow = ingest.extract_xlsx_tables(TWO_ROW_BANNER)
+    out["tworow_headers"] = [t["headers"] for t in tables_tworow]
+    out["tworow_numeric_cols"] = [t["numeric_columns"] for t in tables_tworow]
+
+    tables_deep = ingest.extract_xlsx_tables(DEEP_BANNER)
+    out["deep_headers"] = [t["headers"] for t in tables_deep]
+
+    tables_ranked = ingest.extract_xlsx_tables(RANKED)
+    out["ranked_headers"] = [t["headers"] for t in tables_ranked]
+    out["ranked_numeric_cols"] = [t["numeric_columns"] for t in tables_ranked]
 
     return out
 
@@ -139,6 +196,30 @@ def verify() -> list[str]:
     # 3. THE SAFETY BOUND: a real one-column sheet keeps its own header.
     if r["onecol_headers"][0] != ["Note"] or r["onecol_row_count"][0] != 2:
         fails.append(f"one-column sheet was damaged: {r['onecol_headers']} {r['onecol_row_count']}")
+
+    # 4. A two-row banner (title + subtitle) before the real header resolves
+    #    correctly — matches the shape of live "Executive Dashboard" sheets.
+    twh = r["tworow_headers"][0]
+    if twh != ["Metric", "Target", "Actual", "Variance", "Status"]:
+        fails.append(f"two-row banner not resolved: {twh}")
+    if r["tworow_numeric_cols"][0] != ["Target", "Actual", "Variance"]:
+        fails.append(f"two-row banner numeric_columns not meaningful: {r['tworow_numeric_cols'][0]}")
+
+    # 5. A banner deeper than _BANNER_SCAN_LIMIT is left alone, not
+    #    partially/incorrectly resolved — proves the bound is real, not
+    #    just untested.
+    dh = r["deep_headers"][0]
+    if dh[0] != "TITLE":
+        fails.append(f"deep banner should have been left alone, got: {dh}")
+
+    # 6. A numeric-looking rank/ID column right under a real header is never
+    #    mistaken for evidence the row above it is data, not header — header
+    #    detection must key off ROW WIDTH only, never cell content.
+    rh = r["ranked_headers"][0]
+    if rh != ["Rank", "Rep", "Deals Closed", "Revenue"]:
+        fails.append(f"ranked-column sheet not resolved: {rh}")
+    if r["ranked_numeric_cols"][0] != ["Rank", "Deals Closed", "Revenue"]:
+        fails.append(f"ranked-column numeric_columns wrong: {r['ranked_numeric_cols'][0]}")
 
     return fails
 

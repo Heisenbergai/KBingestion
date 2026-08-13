@@ -223,6 +223,19 @@ def _find_header_row(rows: list) -> Optional[int]:
     single-column sheet never finds one and keeps its original header — the
     fix cannot eat a real header. Bounded scan so a long single-column
     preamble can't run away.
+
+    BUG FOUND AND FIXED 2026-08-13, before this ever ran against real data.
+    The original loop treated "the very next non-empty row is also narrow"
+    as proof nothing wider follows AT ALL, and gave up immediately — so a
+    two-row banner (a merged title, then a narrower subtitle/date line, THEN
+    the real header) was left unresolved even though _BANNER_SCAN_LIMIT was
+    clearly meant to allow skipping more than one such row. Caught by a
+    stress test built from the real corpus's "Executive Dashboard" sheet
+    shape (title + "As of Q2" line + header), not assumed safe from the
+    original single-banner-row fixture alone. Fixed by collecting up to
+    _BANNER_SCAN_LIMIT consecutive narrow rows as banner candidates and only
+    giving up once that budget is exhausted or the sheet genuinely ends,
+    rather than bailing on the first narrow row encountered mid-scan.
     """
     first_non_empty = None
     for i, row in enumerate(rows):
@@ -236,19 +249,27 @@ def _find_header_row(rows: list) -> Optional[int]:
         return sum(1 for c in row if c is not None and str(c).strip() != "")
 
     idx = first_non_empty
-    scanned = 0
-    while scanned < _BANNER_SCAN_LIMIT and width(rows[idx]) == 1:
+    banner_rows_seen = 0
+    while width(rows[idx]) == 1 and banner_rows_seen < _BANNER_SCAN_LIMIT:
+        banner_rows_seen += 1
         nxt = None
         for j in range(idx + 1, len(rows)):
             if rows[j] and any(c is not None and str(c).strip() != "" for c in rows[j]):
                 nxt = j
                 break
-        if nxt is None or width(rows[nxt]) < 2:
-            break  # no wider row follows -> this really is the header
+        if nxt is None:
+            # Nothing else in the sheet at all -> keep the original header,
+            # never eat the only row that exists.
+            return first_non_empty
         idx = nxt
-        scanned += 1
 
-    return idx
+    if width(rows[idx]) >= 2:
+        return idx
+    # Exhausted the scan budget (or hit another narrow row right at the
+    # boundary) without ever reaching a wide row -> this sheet's "header"
+    # really is just narrow, or the banner runs deeper than we're willing to
+    # guess through. Keep the original first row, same fail-safe as before.
+    return first_non_empty
 
 
 def extract_xlsx(file_bytes: bytes) -> str:
