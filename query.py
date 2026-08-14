@@ -199,6 +199,7 @@ async def list_document_tables(workspace_id: str,
                .select("id, document_id, sheet_name, headers, numeric_columns, row_count, sensitivity")
                .eq("workspace_id", workspace_id)
                .in_("sensitivity", allowed)
+               .is_("deleted_at", "null")
                .execute())
         return {"tables": res.data or [], "workspace_id": workspace_id}
     except Exception as e:
@@ -229,6 +230,7 @@ async def get_document_table_rows(table_id: str, workspace_id: str,
                .eq("id", table_id)
                .eq("workspace_id", workspace_id)   # never trust the id alone
                .in_("sensitivity", allowed)
+               .is_("deleted_at", "null")
                .limit(1)
                .execute())
         rows = res.data or []

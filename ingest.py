@@ -1235,3 +1235,61 @@ async def update_document_metadata(request: DocumentMetadataUpdate,
         "updated_chunks": len(result.data or []),
         "updated_tables": updated_tables,
     }
+
+
+class DocumentDeletedRequest(BaseModel):
+    document_ids: list[str]
+    workspace_id: str
+
+
+@router.post("/document-deleted")
+async def sync_document_deleted(request: DocumentDeletedRequest,
+                                auth: AuthContext = Depends(current_user)):
+    """
+    P0 fix, 2026-08-13. Soft-deleting a document (knowledge_items.deleted_at,
+    app DB) was leaving its document_chunks and document_tables rows fully
+    intact in the vector DB -- confirmed live: a distinctive chunk from the
+    first document ever actually soft-deleted on this system was still fully
+    retrievable by match_chunks_hybrid/match_chunks_workspace after "deletion"
+    (a bot or AI Search could still surface and cite it), and its spreadsheet
+    stayed fully pickable via /document-tables. This is the same mirroring
+    gap /document-metadata already exists to close for reclassification --
+    the vector DB cannot see knowledge_items' own deleted_at, so this must be
+    synced explicitly, the same way sensitivity/authority/etc. already are.
+
+    Called by the frontend right after a successful soft-delete (item or
+    folder). Best-effort by design, same convention as /document-metadata's
+    document_tables sync: never raises past a logged warning, since the
+    knowledge_items row is already correctly marked deleted regardless of
+    whether this sync succeeds -- a failure here is a (logged, fixable)
+    retrieval-staleness gap, not a reason to make the user's delete action
+    itself fail.
+    """
+    auth.assert_workspace(request.workspace_id)
+    if not request.document_ids:
+        return {"success": True, "updated_chunks": 0, "updated_tables": 0}
+
+    now = datetime.now(timezone.utc).isoformat()
+    updated_chunks = 0
+    updated_tables = 0
+    try:
+        c_result = supabase.table("document_chunks") \
+            .update({"deleted_at": now}) \
+            .in_("document_id", request.document_ids) \
+            .eq("workspace_id", request.workspace_id) \
+            .execute()
+        updated_chunks = len(c_result.data or [])
+    except Exception as e:
+        print(f"DOCUMENT-DELETED chunks sync FAILED: {e}")
+
+    try:
+        t_result = supabase.table("document_tables") \
+            .update({"deleted_at": now}) \
+            .in_("document_id", request.document_ids) \
+            .eq("workspace_id", request.workspace_id) \
+            .execute()
+        updated_tables = len(t_result.data or [])
+    except Exception as e:
+        print(f"DOCUMENT-DELETED tables sync FAILED: {e}")
+
+    return {"success": True, "updated_chunks": updated_chunks, "updated_tables": updated_tables}
