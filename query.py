@@ -245,6 +245,157 @@ async def get_document_table_rows(table_id: str, workspace_id: str,
         raise HTTPException(status_code=500, detail="Could not load sheet rows.")
 
 
+class WidgetSuggestRequest(BaseModel):
+    workspace_id: str
+    description: str
+
+
+_WIDGET_SUGGEST_EMPTY = {
+    "tableId": None, "valueColumn": None, "groupColumn": None,
+    "aggregation": None, "chartKind": None,
+}
+
+_WIDGET_SUGGEST_PROMPT = """You help someone build a chart for their company dashboard by picking the
+best-matching data source and settings from a list of REAL spreadsheet
+sheets already in their workspace. You are NOT computing or inventing any
+number -- you only select and configure from what is listed below.
+
+Available sheets:
+{catalog}
+
+Return JSON only:
+{{"tableId": "<id of the best-matching sheet above, or null>",
+  "valueColumn": "<a numeric column from THAT sheet's own numeric_columns, or null>",
+  "groupColumn": "<a header from THAT sheet to group by, or null>",
+  "aggregation": "<one of sum, average, latest, count, or null>",
+  "chartKind": "<one of stat, bar, line, area, pie, table, or null>"}}
+
+Rules:
+- tableId MUST be one of the ids listed above, or null if nothing matches well.
+- valueColumn MUST come from that sheet's own numeric_columns, or null.
+- groupColumn MUST come from that sheet's own headers and differ from valueColumn, or null.
+- Use null for anything you are not reasonably confident about -- a missing
+  suggestion costs nothing, a wrong one wastes the person's time undoing it.
+- Prefer "line" or "area" for a trend over time, "bar" for comparing
+  categories, "pie" for a share/breakdown, "table" only if they explicitly
+  want raw rows, "stat" for a single headline number.
+
+What they asked for: {description}"""
+
+
+def _widget_catalog_for_prompt(tables: list[dict]) -> str:
+    # Bounded so a workspace with many sheets can't blow out the prompt --
+    # 30 sheets is already far more than one workspace has today (14's own
+    # audit found ~13 real spreadsheets total across the whole corpus).
+    lines = []
+    for t in tables[:30]:
+        lines.append(
+            f'- id="{t["id"]}" sheet="{t["sheet_name"]}" headers={t["headers"]} '
+            f'numeric_columns={t["numeric_columns"]}'
+        )
+    return "\n".join(lines)
+
+
+@router.post("/widget-suggest")
+async def widget_suggest(request: WidgetSuggestRequest,
+                         auth: AuthContext = Depends(current_user)):
+    """
+    G7 of the dashboard-upgrade thread (2026-08-13) -- the optional "describe
+    what you want" input in the Create Widget wizard (G6).
+
+    WHAT THE MODEL SEES, AND DOESN'T. It is handed sheet/column LABELS only
+    -- id, sheet_name, headers, numeric_columns -- resolved from
+    document_tables with the caller's own sensitivity ladder applied
+    server-side, exactly like /document-tables. It never sees a single cell
+    VALUE, so there is nothing here for it to hallucinate about an actual
+    figure -- it can only pick a wrong SHEET or COLUMN, which the wizard's
+    existing live preview (G6) already makes obvious and correctable before
+    anything is added to a dashboard. Same "AI configures, never computes
+    the number" boundary spreadsheet_metric was built around from the start.
+
+    FAILS OPEN on every path, same convention as query_routing.py: no
+    description, no catalog, no Bedrock, bad JSON, a hallucinated
+    id/column -- all return an all-null suggestion, never a 4xx/5xx the
+    frontend has to special-case. The manual picker (G6) is always still
+    right there.
+    """
+    if not request.workspace_id:
+        raise HTTPException(status_code=400, detail="workspace_id is required.")
+    auth.assert_workspace(request.workspace_id)
+
+    description = (request.description or "").strip()
+    if not description:
+        return _WIDGET_SUGGEST_EMPTY
+
+    role = auth.role_in(request.workspace_id)
+    allowed = _resolve_allowed_sensitivities(role, auth.is_super_admin)
+
+    try:
+        res = (supabase.table("document_tables")
+               .select("id, sheet_name, headers, numeric_columns")
+               .eq("workspace_id", request.workspace_id)
+               .in_("sensitivity", allowed)
+               .execute())
+        tables = [t for t in (res.data or []) if t.get("numeric_columns")]
+    except Exception as e:
+        print(f"[widget-suggest] catalog fetch failed, no suggestion: {e}")
+        return _WIDGET_SUGGEST_EMPTY
+
+    if not tables:
+        return _WIDGET_SUGGEST_EMPTY
+
+    try:
+        raw = ai.chat_json(
+            [{"role": "user", "content": _WIDGET_SUGGEST_PROMPT.format(
+                catalog=_widget_catalog_for_prompt(tables),
+                description=description[:300],
+            )}],
+            max_tokens=200,
+            temperature=0,
+            workspace_id=request.workspace_id,
+            user_id=auth.user_id,
+            feature="widget_suggest",
+        )
+    except Exception as e:
+        print(f"[widget-suggest] suggestion failed, falling back to manual picker: {e}")
+        return _WIDGET_SUGGEST_EMPTY
+
+    if not isinstance(raw, dict):
+        return _WIDGET_SUGGEST_EMPTY
+
+    # Validate against the REAL catalog rather than trusting the model, same
+    # discipline query_routing.py already established for department names:
+    # a hallucinated id/column would otherwise silently reach the frontend.
+    by_id = {t["id"]: t for t in tables}
+    table = by_id.get(raw.get("tableId")) if isinstance(raw.get("tableId"), str) else None
+    if not table:
+        return _WIDGET_SUGGEST_EMPTY
+
+    value_col = raw.get("valueColumn")
+    if value_col not in (table.get("numeric_columns") or []):
+        value_col = None
+
+    group_col = raw.get("groupColumn")
+    if group_col not in (table.get("headers") or []) or group_col == value_col:
+        group_col = None
+
+    aggregation = raw.get("aggregation")
+    if aggregation not in ("sum", "average", "latest", "count"):
+        aggregation = None
+
+    chart_kind = raw.get("chartKind")
+    if chart_kind not in ("stat", "bar", "line", "area", "pie", "table"):
+        chart_kind = None
+
+    return {
+        "tableId": table["id"],
+        "valueColumn": value_col,
+        "groupColumn": group_col,
+        "aggregation": aggregation,
+        "chartKind": chart_kind,
+    }
+
+
 @router.post("/query")
 async def query_documents(request: QueryRequest,
                           auth: AuthContext = Depends(current_user),
