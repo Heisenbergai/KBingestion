@@ -557,10 +557,18 @@ Citation rules:
   the numbered sources, never to something only your own earlier answer said.
 
 Honesty about gaps (important):
-- If the sources only PARTIALLY answer the question, answer what you can with citations,
-  then on a new final line write "{GAP_MARKER}" followed by a short description of what is missing.
-- If the sources do NOT answer the question at all, write a one-line note under "{GAP_MARKER}"
-  explaining what's missing, and nothing else.
+- Only write a gap note if part of what the person actually ASKED is missing from the
+  sources -- never because the general topic could have more detail, a related-but-
+  unasked fact isn't mentioned, or the answer could simply be more comprehensive. If
+  you have fully answered the question as asked, do NOT write a gap note, even if the
+  sources could say more about the broader subject.
+- If the sources answer the question but a SPECIFIC part of what was actually asked is
+  missing, answer what you can with citations, then on a new final line write
+  "{GAP_MARKER}" followed by ONE plain sentence naming exactly what part of the
+  question is unanswered -- no markdown headers, no bold labels, no restating the answer.
+- If the sources do NOT answer the question at all, write ONLY a one-line plain-sentence
+  note under "{GAP_MARKER}" explaining what's missing, and nothing else -- no partial
+  answer, no markdown formatting.
 
 Formatting:
 - Markdown. Start longer answers with a one-sentence summary.
@@ -598,6 +606,16 @@ Formatting:
         # Confidence from the best chunk's semantic similarity
         top_sim = max((c.get("similarity") or 0) for c in chunks)
         confidence = "high" if top_sim >= 0.45 else "medium" if top_sim >= 0.3 else "low"
+        # A gap-only completion (answer is empty, the whole response was under
+        # GAP_MARKER) means the model found NOTHING it could answer with --
+        # top_sim-based confidence describes how close the RETRIEVED chunks
+        # were, not whether an answer exists, so showing "High confidence"
+        # next to no answer is actively misleading (found live 2026-08-15:
+        # a genuine gap query still returned "high"). Reuses the SAME "none"
+        # value the zero-chunks branch above already returns for an
+        # unanswerable question -- not a new confidence state.
+        if not answer.strip():
+            confidence = "none"
 
         # Only surface citations the model actually referenced (keeps the UI clean)
         used = {int(n) for n in re.findall(r"\[(\d+)\]", answer)}
@@ -612,14 +630,19 @@ Formatting:
         coverage = grounding.citation_coverage(answer)
         corroboration = grounding.corroboration_level(cited_chunks or chunks)
 
-        # Cut, don't embellish: an uncited claim is not deleted from the
-        # answer (fragile text surgery risks mangling valid prose) — it is
-        # surfaced through the SAME gaps mechanism the model already uses to
-        # admit what it doesn't know, so the reader sees it either way.
-        if coverage["uncited"]:
-            preview = "; ".join(coverage["uncited"][:2])
-            note = f"Not tied to a specific source: {preview}"
-            gaps = f"{gaps} {note}" if gaps else note
+        # coverage_ratio still feeds confidence downgrade below and the
+        # `grounding` response field (both unchanged) -- but the raw
+        # uncited-claim TEXT is deliberately never appended to the
+        # user-facing `gaps` field anymore. It used to be (see git history),
+        # and that was the exact source of two real live bugs (2026-08-15
+        # gap-semantics pass): (1) a synthesizing "**Summary:** ..." lead-in
+        # sentence -- which restates points that ARE individually cited
+        # right below it -- got flagged as its own "uncited claim" and its
+        # raw markdown text leaked straight into the gap callout; (2) this
+        # fired on fully-answered questions, producing a gap callout on an
+        # answer that had none. The model's OWN gap note (from GAP_MARKER,
+        # tightened in the system prompt above to only fire on a
+        # question-relevant missing part) is the sole source of `gaps` now.
 
         # Confidence can only move MORE cautious here, never more confident —
         # retrieval similarity remains the ceiling.
