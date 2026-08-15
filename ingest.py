@@ -890,6 +890,7 @@ def process_document_bytes(
     # divergence between the two, which is what the mirroring exists to prevent.
     effective_from: Optional[str] = None, valid_until: Optional[str] = None,
     superseded_by: Optional[str] = None,
+    auto_classify: bool = False,
 ) -> dict:
     """
     The extract → clean → chunk → embed → store tail of process_document(),
@@ -898,6 +899,18 @@ def process_document_bytes(
     fetches/exports a Drive file's bytes directly from Google's API — routing
     that through a signed Supabase Storage URL just to satisfy the download
     step would be a pointless extra upload/download round trip.
+
+    auto_classify: when True, classify_document()'s verdict is actually
+    APPLIED to the chunks this call writes (not just reported as
+    proposed_* for a human to act on later, which is all that happens when
+    False — the manual-upload caller always passes False since a human
+    already chose real values). Only sensitivity is safety-gated: it may
+    only RAISE above whatever the caller passed in as `sensitivity` (that
+    value is the caller's already-known current/baseline value — Drive sync
+    passes the document's current effective sensitivity so a re-classify
+    pass can never regress it). authority/doc_class/lifecycle_status apply
+    directly from the classifier, with its own built-in fail-safe defaults.
+    This is the same raise-only rule Phase 2A applies to Slack notes.
     """
     def set_stage(stage: str):
         if job is not None:
@@ -912,6 +925,51 @@ def process_document_bytes(
     # touches already-ingested rows. See extract_doc_date's docstring.
     if doc_date is None:
         doc_date = extract_doc_date(file_bytes, mime_type, file_name)
+
+    # Classification runs BEFORE the spreadsheet-tables write below (moved
+    # up from its original position after that write) so that when
+    # auto_classify raises `sensitivity`, document_tables gets the SAME
+    # final value as document_chunks/knowledge_items instead of the
+    # pre-classification one -- otherwise this reintroduces exactly the
+    # document_tables-vs-chunks divergence /document-metadata's own sync
+    # exists to close for human reclassification (found live 2026-08-01 on
+    # a real R&D budget sheet). classify_document() tolerates raw_text
+    # being empty fine (falls back to rules/defaults), so moving it ahead
+    # of the empty-text abort check below is safe.
+    set_stage("classifying")
+    classification = classify_document(
+        title=file_name, raw_text=raw_text, source_type=source_type,
+        department_hint=folder_department_name, workspace_id=workspace_id,
+    )
+    classification_fields = {
+        "proposed_sensitivity":      classification["sensitivity"],
+        "proposed_authority":        classification["authority"],
+        "proposed_doc_class":        classification["doc_class"],
+        "proposed_lifecycle_status": classification["lifecycle_status"],
+        "classification_confidence": classification["confidence"],
+        "classification_signals":    classification["signals"],
+    }
+    if job is not None:
+        job.update(classification_fields)
+
+    if auto_classify:
+        # Raise-only: `sensitivity` at this point is the caller's baseline
+        # (its current known-effective value) -- the classifier may only
+        # move it up the ladder, never down. authority/doc_class/
+        # lifecycle_status apply directly; classify_document() already
+        # fails safe to this function's own defaults on any LLM error.
+        _SENSITIVITY_RANK = {"public": 0, "internal": 1, "confidential": 2, "restricted": 3}
+        if _SENSITIVITY_RANK.get(classification["sensitivity"], 1) > _SENSITIVITY_RANK.get(sensitivity, 1):
+            sensitivity = classification["sensitivity"]
+        authority = classification["authority"]
+        doc_class = classification["doc_class"]
+        lifecycle_status = classification["lifecycle_status"]
+        classification_fields.update({
+            "effective_sensitivity":      sensitivity,
+            "effective_authority":        authority,
+            "effective_doc_class":        doc_class,
+            "effective_lifecycle_status": lifecycle_status,
+        })
 
     # Phase H: a spreadsheet also keeps its STRUCTURE, not just its prose.
     # Best-effort by design — a structured-parse failure must never cost the
@@ -931,22 +989,6 @@ def process_document_bytes(
             "No text could be extracted. The file may be empty, image-only "
             "(scanned PDF with no OCR layer), or a spreadsheet with no data rows."
         )
-
-    set_stage("classifying")
-    classification = classify_document(
-        title=file_name, raw_text=raw_text, source_type=source_type,
-        department_hint=folder_department_name, workspace_id=workspace_id,
-    )
-    classification_fields = {
-        "proposed_sensitivity":      classification["sensitivity"],
-        "proposed_authority":        classification["authority"],
-        "proposed_doc_class":        classification["doc_class"],
-        "proposed_lifecycle_status": classification["lifecycle_status"],
-        "classification_confidence": classification["confidence"],
-        "classification_signals":    classification["signals"],
-    }
-    if job is not None:
-        job.update(classification_fields)
 
     cleaned = clean_text(raw_text)
     chunks  = chunk_text(cleaned)

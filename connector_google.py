@@ -58,6 +58,7 @@ from dotenv import load_dotenv
 
 from auth import AuthContext, current_user
 import brain_connectors as bc
+import drive_app_db
 import ingest
 
 load_dotenv()
@@ -106,6 +107,20 @@ _SUPPORTED_DIRECT_MIME = {
     "text/csv",
     "text/plain",
 }
+
+
+def _knowledge_file_type(mime_type: str) -> str:
+    """Maps a mime type onto knowledge_items.file_type's enum (knowledge_file_type),
+    same categories the manual-upload dialog's own detectFileType() uses."""
+    if mime_type == "application/pdf":
+        return "pdf"
+    if "wordprocessingml" in mime_type:
+        return "word"
+    if "spreadsheetml" in mime_type or mime_type == "application/vnd.ms-excel":
+        return "excel"
+    if "presentationml" in mime_type:
+        return "powerpoint"
+    return "other"
 
 
 def _google_credentials(workspace_id: str) -> tuple[str, str]:
@@ -389,21 +404,48 @@ def sync_connection(connection_id: str, job: Optional[dict] = None) -> dict:
     Slack's (messages are immutable and never revisited; Drive files are
     edited in place), so it's handled here directly rather than through
     brain_connectors.save_ingest_items, which assumes immutability.
+
+    Since Google Drive Canonical Ingestion (see 09_company_brain_roadmap.md):
+    each processed file also gets a real knowledge_items row (via the
+    drive_sync_* SECURITY DEFINER RPCs in drive_app_db.py — the ONLY place
+    those RPCs / APP_SUPABASE_SERVICE_KEY are used), a persisted copy in
+    Supabase Storage, and automated raise-only classification — the same
+    canonical document model manual uploads use, so Drive files get a real
+    Library entry instead of being orphaned vector-DB-only chunks. A file no
+    longer present in any selected folder (removed/unshared) is soft-deleted
+    the same way, at the end of this function.
     """
     conn = bc.supabase.table("connections").select("*").eq("id", connection_id).execute().data
     if not conn:
         raise HTTPException(status_code=404, detail="Connection not found.")
     conn = conn[0]
+
+    # Explicit, fail-closed checks -- worth stating plainly: since `connections`
+    # and `knowledge_items` live in different Supabase projects, the
+    # drive_sync_* RPCs structurally cannot verify connection provider/status
+    # themselves (they only ever see the workspace_id this function already
+    # resolved and passes them). THIS function's own connection lookup is
+    # therefore part of the security boundary, not just a convenience check --
+    # it is the only place in the whole call chain that can reject "wrong
+    # provider" or "inactive connection" before a workspace_id is ever handed
+    # to the RPC layer.
+    if conn.get("provider") != "google_drive":
+        raise HTTPException(status_code=400, detail="Connection is not a Google Drive connection.")
+    if conn.get("status") != "active":
+        raise HTTPException(status_code=400, detail="Connection is not active.")
+
     token = _valid_access_token(conn)
     if not token:
         raise HTTPException(status_code=400, detail="Google connection needs to be reconnected.")
 
     folders = (conn.get("config") or {}).get("folders", [])
     processed = skipped = failed = 0
+    seen_external_ids: set[str] = set()
 
     for folder in folders:
         files = _list_folder_files(token, folder["id"])
         for f in files:
+            seen_external_ids.add(f["id"])
             if job is not None:
                 job["files_processed"] = processed
 
@@ -419,31 +461,143 @@ def sync_connection(connection_id: str, job: Optional[dict] = None) -> dict:
                 skipped += 1
                 continue
 
-            try:
-                file_bytes, effective_mime, ext = _fetch_file_bytes(token, f["id"], mime)
-                document_id = (already.get("raw", {}).get("document_id") if already else None) or str(uuid.uuid4())
-                file_name = f["name"] + (ext if ext and not f["name"].endswith(ext) else "")
-
-                ingest.process_document_bytes(
-                    file_bytes, document_id=document_id, asset_id=document_id,
-                    workspace_id=conn["workspace_id"], mime_type=effective_mime,
-                    file_name=file_name, source_type="document", source_tier=1,
-                    doc_date=f.get("modifiedTime"),
-                )
-
-                row = {
-                    "workspace_id": conn["workspace_id"], "connection_id": connection_id,
-                    "provider": "google_drive", "external_id": f["id"], "kind": "drive_file",
-                    "status": "embedded",
-                    "raw": {"name": f["name"], "mime_type": mime, "modified_time": f.get("modifiedTime"),
-                           "folder_id": folder["id"], "document_id": document_id},
-                }
-                bc.supabase.table("ingest_items").upsert(
-                    row, on_conflict="connection_id,external_id"
-                ).execute()
+            if _sync_one_file(conn, connection_id, folder, f, already, token, mime):
                 processed += 1
-            except Exception as e:
-                print(f"[google] failed to process file {f.get('id')} ({f.get('name')}): {e}")
+            else:
                 failed += 1
 
-    return {"folders_checked": len(folders), "processed": processed, "skipped": skipped, "failed": failed}
+    deleted = _reconcile_deleted_files(connection_id, conn["workspace_id"], seen_external_ids)
+
+    return {"folders_checked": len(folders), "processed": processed, "skipped": skipped,
+            "failed": failed, "deleted": deleted}
+
+
+def _sync_one_file(conn: dict, connection_id: str, folder: dict, f: dict,
+                   already: Optional[dict], token: str, mime: str) -> bool:
+    """
+    One file's worth of sync_connection()'s try/except body, factored out so
+    it's independently testable (in particular: that a Storage failure
+    aborts before any knowledge_items row or chunk is created -- see the
+    REQUIRED, not best-effort docstring on drive_app_db.upload_original_file).
+    Returns True on success, False on any failure (already logged here).
+    """
+    try:
+        file_bytes, effective_mime, ext = _fetch_file_bytes(token, f["id"], mime)
+        # Stable across resyncs, restarts and retries: reused from
+        # ingest_items.raw.document_id when this file has been seen before,
+        # so re-processing a changed file replaces the SAME knowledge_items
+        # row / document_chunks set rather than creating a duplicate.
+        document_id = (already.get("raw", {}).get("document_id") if already else None) or str(uuid.uuid4())
+        file_name = f["name"] + (ext if ext and not f["name"].endswith(ext) else "")
+        file_type = _knowledge_file_type(effective_mime)
+
+        # REQUIRED, not best-effort (see drive_app_db.upload_original_file's
+        # docstring): raises on failure, which this try/except turns into a
+        # clean "failed, retry next sync pass" outcome -- BEFORE any
+        # knowledge_items row or chunk exists for this file, so there is
+        # nothing to roll back and ingest_items is never touched (the file
+        # keeps whatever state it had, so the next scheduled pass retries it
+        # exactly as if this pass never ran).
+        storage_path = drive_app_db.upload_original_file(
+            conn["workspace_id"], document_id, file_name, file_bytes, effective_mime,
+        )
+
+        # Pass 1: ensure the canonical row exists and read back its CURRENT
+        # effective sensitivity (for a brand-new document_id this is just
+        # the safe baseline, 'internal'; for a resync it's whatever a prior
+        # classification pass already raised it to — never lowered by this
+        # call, GREATEST() is monotonic on the SQL side).
+        baseline = drive_app_db.upsert_knowledge_item(
+            workspace_id=conn["workspace_id"], document_id=document_id,
+            title=file_name, file_name=file_name, file_size=len(file_bytes),
+            mime_type=effective_mime, file_type=file_type, storage_path=storage_path,
+        )
+        baseline_sensitivity = baseline.get("sensitivity") or "internal"
+
+        # Pass 2 (inside process_document_bytes): extract, classify
+        # (raise-only against baseline_sensitivity), chunk, embed, store —
+        # auto_classify=True is what makes this call apply the classifier's
+        # verdict instead of just reporting it.
+        result = ingest.process_document_bytes(
+            file_bytes, document_id=document_id, asset_id=document_id,
+            workspace_id=conn["workspace_id"], mime_type=effective_mime,
+            file_name=file_name, source_type="document", source_tier=1,
+            doc_date=f.get("modifiedTime"),
+            sensitivity=baseline_sensitivity, authority="working",
+            doc_class=None, lifecycle_status="active",
+            auto_classify=True,
+        )
+
+        # Pass 3: write the EFFECTIVE post-classification values back onto
+        # knowledge_items so it and document_chunks agree — this call's
+        # GREATEST() is a no-op versus pass 1 since pass 2 already
+        # raise-only'd against the same baseline.
+        drive_app_db.upsert_knowledge_item(
+            workspace_id=conn["workspace_id"], document_id=document_id,
+            title=file_name, file_name=file_name, file_size=len(file_bytes),
+            mime_type=effective_mime, file_type=file_type, storage_path=storage_path,
+            sensitivity=result.get("effective_sensitivity"),
+            authority=result.get("effective_authority"),
+            doc_class=result.get("effective_doc_class"),
+            lifecycle_status=result.get("effective_lifecycle_status"),
+        )
+
+        row = {
+            "workspace_id": conn["workspace_id"], "connection_id": connection_id,
+            "provider": "google_drive", "external_id": f["id"], "kind": "drive_file",
+            "status": "embedded",
+            "raw": {"name": f["name"], "mime_type": mime, "modified_time": f.get("modifiedTime"),
+                   "folder_id": folder["id"], "document_id": document_id},
+        }
+        bc.supabase.table("ingest_items").upsert(
+            row, on_conflict="connection_id,external_id"
+        ).execute()
+        return True
+    except Exception as e:
+        print(f"[google] failed to process file {f.get('id')} ({f.get('name')}): {e}")
+        return False
+
+
+def _reconcile_deleted_files(connection_id: str, workspace_id: str, seen_external_ids: set[str]) -> int:
+    """
+    A file removed from Drive (deleted, unshared, or moved out of every
+    selected folder) simply stops appearing in _list_folder_files — there is
+    no Drive-side deletion event to react to (polling, no webhooks, same as
+    the rest of this connector). So each sync pass compares what it just saw
+    against every previously-embedded file for this connection and soft-
+    deletes whatever's missing, mirroring the deletion the same way a
+    manually-deleted document already is via /document-deleted: knowledge_items
+    marked, then chunks/tables synced to match.
+
+    Safe by construction against a partial folder-listing failure: this is
+    only ever called from the end of sync_connection(), and _list_folder_files
+    is NOT wrapped in a try/except in that loop — an API error partway
+    through raises out of sync_connection() entirely, so this function is
+    simply never reached with an incomplete seen_external_ids set.
+    """
+    previously_embedded = bc.supabase.table("ingest_items") \
+        .select("id, external_id, raw") \
+        .eq("connection_id", connection_id).eq("provider", "google_drive") \
+        .eq("status", "embedded").execute().data or []
+
+    deleted = 0
+    for item in previously_embedded:
+        if item["external_id"] in seen_external_ids:
+            continue
+        document_id = (item.get("raw") or {}).get("document_id")
+        if not document_id:
+            continue
+        try:
+            drive_app_db.soft_delete_knowledge_item(workspace_id, document_id)
+            now = datetime.now(timezone.utc).isoformat()
+            ingest.supabase.table("document_chunks").update({"deleted_at": now}) \
+                .eq("document_id", document_id).eq("workspace_id", workspace_id).execute()
+            ingest.supabase.table("document_tables").update({"deleted_at": now}) \
+                .eq("document_id", document_id).eq("workspace_id", workspace_id).execute()
+            bc.supabase.table("ingest_items").update({"status": "deleted"}) \
+                .eq("id", item["id"]).execute()
+            deleted += 1
+        except Exception as e:
+            print(f"[google] failed to reconcile deletion for ingest_item {item['id']}: {e}")
+
+    return deleted
