@@ -15,3 +15,4 @@ botocore>=1.34.0
 certifi>=2025.0.0
 cryptography>=42.0.0
 PyJWT>=2.9.0
+pytest>=8.0.0  # dev/test only -- test_*.py files, not imported by app code

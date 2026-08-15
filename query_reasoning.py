@@ -29,6 +29,31 @@ from typing import Optional
 
 import ai
 
+# Weighted-Jaccard similarity (0-1) two chunks' word-shingle sets must reach
+# to count as a near-duplicate for deduplicate_chunks() below. Order-invariant
+# by design: the real case found in the 2026-08-15 live validation (a
+# generated training doc with the same paragraph repeated 18x) chunks at
+# ROLLING WINDOW boundaries, so two duplicate chunks often start at different
+# offsets into the same repeated text -- a prefix/sequence-based comparison
+# scored that real pair at only ~0.50 (looked different) while shingle
+# overlap correctly scored it 0.95 (verified against the actual live rows).
+# 0.6 was chosen with a wide margin below that 0.95 and well above genuinely
+# different chunks that merely share a topic (~0.0-0.1 in the same test).
+#
+# This threshold is unchanged from the original PLAIN-Jaccard version, but
+# the similarity itself is now shingle-frequency-WEIGHTED (see
+# _shingle_weight below), found necessary by a second real case, MFG-001
+# (2026-08-15 MFG validation): a templated "mad-libs" style document where a
+# long boilerplate sentence is repeated verbatim across ~14 genuinely
+# distinct topic paragraphs with only 2-3 words substituted per topic (e.g.
+# "The management of factory layout represents a critical variable..." vs
+# "...bom control represents a critical variable..."). Plain Jaccard can't
+# tell "shared because it's boilerplate" apart from "shared because it's a
+# real duplicate" -- both look like high shingle overlap -- so it collapsed
+# 47 real MFG-001 chunks spanning 14 distinct topics down to 1 survivor.
+_DEDUP_JACCARD_THRESHOLD = 0.6
+_DEDUP_SHINGLE_SIZE = 8  # words per shingle
+
 REFORMULATION_CAP = 2  # max alternate queries tried per question, ever — hard cap
 
 _PROMPT = """A question asked of a company knowledge bot returned a weak match on
@@ -181,3 +206,99 @@ def merge_chunk_results(primary: list[dict], retry_batches: list[list[dict]],
                 best[cid] = c
 
     return sorted(best.values(), key=_score, reverse=True)[:match_count]
+
+
+def deduplicate_chunks(chunks: list[dict]) -> list[dict]:
+    """
+    Drops near-duplicate chunks, keeping the highest-ranked (first)
+    occurrence of each. Pure function, no I/O.
+
+    WHY THIS EXISTS (found in the 2026-08-15 live Phase 1 validation, not
+    hypothetical): a real generated training document had the same
+    paragraph repeated 18 times as separate chunks. A live query against
+    that exact topic returned 7 of the top 8 results from that single
+    document -- only 1 slot carried genuinely different evidence. Highly
+    repetitive source documents can silently crowd out real evidence,
+    wasting most of the LLM's context window on redundant text and
+    inflating apparent corroboration from what is actually one source
+    repeated.
+
+    Input is assumed already ranked by match_chunks_hybrid's score (highest
+    first) -- this function only ever REMOVES a lower-ranked duplicate of
+    something already kept. It never reorders or promotes anything, so it
+    cannot change which chunk wins when two are genuinely distinct.
+
+    Matches on exact normalized content first (free, no false positives),
+    then WEIGHTED word-shingle Jaccard overlap for near-duplicates --
+    deliberately order-invariant, since real near-duplicates in this corpus
+    are rolling-window chunking offsets into the same repeated text, not just
+    paraphrase rewording. Content-based, not ID-based -- complementary to
+    merge_chunk_results()'s id-based dedup across retry batches, not a
+    replacement for it.
+
+    THE WEIGHTING (why plain Jaccard wasn't enough -- MFG-001 case): a
+    shingle that recurs across MORE THAN HALF of the chunks in this batch is
+    treated as shared boilerplate/template structure, not evidence of
+    duplication, and its contribution to the similarity score is tapered
+    down toward ~0. A shingle held by half the batch or fewer is normal,
+    full-weight content -- this is what still lets two genuinely repeated
+    real paragraphs (e.g. the same document uploaded 3x) collapse together,
+    since that kind of duplication typically doesn't touch the MAJORITY of
+    an unrelated, larger candidate pool the way a template skeleton does.
+    Computed per dedup call, from this batch alone -- no external corpus,
+    no persisted state, still a pure function.
+    """
+    def _shingles(text: str) -> set[str]:
+        words = text.split()
+        if len(words) < _DEDUP_SHINGLE_SIZE:
+            return {" ".join(words)} if words else set()
+        return {
+            " ".join(words[i:i + _DEDUP_SHINGLE_SIZE])
+            for i in range(len(words) - _DEDUP_SHINGLE_SIZE + 1)
+        }
+
+    norms = [" ".join((ch.get("content") or "").split()).lower() for ch in chunks]
+    shingle_sets = [_shingles(n) for n in norms]
+
+    n = len(chunks)
+    doc_freq: dict[str, int] = {}
+    for s in shingle_sets:
+        for sh in s:
+            doc_freq[sh] = doc_freq.get(sh, 0) + 1
+
+    _weight_cache: dict[str, float] = {}
+
+    def _weight(sh: str) -> float:
+        cached = _weight_cache.get(sh)
+        if cached is not None:
+            return cached
+        frac = doc_freq[sh] / n
+        # Full weight up to appearing in half the batch; linear taper from
+        # 1.0 -> 0.05 (never exactly 0, to avoid a fully-empty union score)
+        # as it approaches appearing in every chunk.
+        w = 1.0 if frac <= 0.5 else max(0.05, 1.0 - 1.9 * (frac - 0.5))
+        _weight_cache[sh] = w
+        return w
+
+    def _weighted_similarity(a: set[str], b: set[str]) -> float:
+        if not a or not b:
+            return 0.0
+        union = a | b
+        union_weight = sum(_weight(s) for s in union)
+        if union_weight == 0:
+            return 0.0
+        inter_weight = sum(_weight(s) for s in (a & b))
+        return inter_weight / union_weight
+
+    kept: list[dict] = []
+    kept_idx: list[int] = []
+    for i, ch in enumerate(chunks):
+        norm = norms[i]
+        is_dup = any(
+            norm == norms[j] or _weighted_similarity(shingle_sets[i], shingle_sets[j]) >= _DEDUP_JACCARD_THRESHOLD
+            for j in kept_idx
+        )
+        if not is_dup:
+            kept.append(ch)
+            kept_idx.append(i)
+    return kept

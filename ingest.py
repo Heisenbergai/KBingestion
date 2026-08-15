@@ -497,6 +497,61 @@ def extract_text(file_bytes: bytes, mime_type: str, file_name: str) -> str:
         )
 
 
+def extract_doc_date(file_bytes: bytes, mime_type: str, file_name: str) -> Optional[str]:
+    """
+    Best-effort extraction of a document's real authored/creation date from
+    its OWN embedded file metadata -- never invented, never derived from the
+    filename or upload time (that's exactly what doc_date=None already
+    correctly falls back to via `coalesce(doc_date, created_at)` in
+    match_chunks_hybrid's freshness scoring).
+
+    Phase 1 Step 6, forward-only: this only ever returns a genuinely embedded
+    date or None. A missing property or a parse failure is exactly
+    equivalent to the file never having supplied a doc_date at all --
+    retrieval's existing created_at fallback already handles that case
+    correctly, so failing here costs nothing beyond not-yet-having-a-date,
+    same as before this function existed.
+    """
+    name_lower = file_name.lower()
+    try:
+        if mime_type == "application/pdf" or name_lower.endswith(".pdf"):
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            raw = (doc.metadata or {}).get("creationDate") or ""
+            # PDF date format: D:YYYYMMDDHHmmSS(+-HH'mm') -- only the digit
+            # portion is used; the timezone-offset suffix is ignored rather
+            # than parsed, since malformed offsets are common in the wild
+            # and getting this wrong would be worse than a UTC approximation.
+            m = re.match(r"D:(\d{4})(\d{2})(\d{2})(\d{2})?(\d{2})?(\d{2})?", raw)
+            if not m:
+                return None
+            y, mo, d, h, mi, s = (m.group(i) for i in range(1, 7))
+            return datetime(
+                int(y), int(mo), int(d), int(h or 0), int(mi or 0), int(s or 0),
+                tzinfo=timezone.utc,
+            ).isoformat()
+
+        elif mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" \
+             or name_lower.endswith(".docx"):
+            created = docx.Document(io.BytesIO(file_bytes)).core_properties.created
+            return created.isoformat() if created else None
+
+        elif mime_type == "application/vnd.openxmlformats-officedocument.presentationml.presentation" \
+             or name_lower.endswith(".pptx"):
+            created = pptx.Presentation(io.BytesIO(file_bytes)).core_properties.created
+            return created.isoformat() if created else None
+
+        elif mime_type in (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-excel",
+        ) or name_lower.endswith((".xlsx", ".xlsm")):
+            created = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True).properties.created
+            return created.isoformat() if created else None
+
+    except Exception as e:
+        print(f"[ingest] doc_date extraction skipped for {file_name}: {e}")
+    return None
+
+
 def clean_text(text: str) -> str:
     text = re.sub(r'\n{3,}', '\n\n', text)
     text = re.sub(r' {2,}', ' ', text)
@@ -850,6 +905,13 @@ def process_document_bytes(
 
     set_stage("extracting")
     raw_text = extract_text(file_bytes, mime_type, file_name)
+
+    # Phase 1 Step 6: fill doc_date from the file's own embedded metadata
+    # when the caller didn't already supply one -- forward-only, never
+    # overrides an explicit caller value, never invents a date, never
+    # touches already-ingested rows. See extract_doc_date's docstring.
+    if doc_date is None:
+        doc_date = extract_doc_date(file_bytes, mime_type, file_name)
 
     # Phase H: a spreadsheet also keeps its STRUCTURE, not just its prose.
     # Best-effort by design — a structured-parse failure must never cost the

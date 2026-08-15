@@ -101,12 +101,35 @@ def hybrid_search(question: str, workspace_id: str,
     Search previously let any workspace member search up a Confidential
     document with no check at all; the caller's real ladder is resolved by
     the route handler and passed in here, same as chatbot.py's bots.
+
+    Returns up to `match_count` chunks, deduplicated (see query_reasoning.
+    deduplicate_chunks) so a highly repetitive source document can't crowd
+    out genuinely distinct evidence — found live 2026-08-15: a document
+    with the same paragraph repeated 18x filled 7 of 8 result slots with
+    near-duplicates of itself. To leave room for dedup to still return a
+    full match_count of DISTINCT chunks, this asks the RPC for a wider pool
+    than the caller requested and truncates after deduping, not before.
     """
     embedding = ai.embed_texts([question], workspace_id=workspace_id, feature="ai_search")[0]
+    # Defense in depth: ai.embed_texts() always raises on failure today (it
+    # never returns None), so this is not a fix for an observed live bug —
+    # but a null/empty embedding must NEVER be allowed to silently reach the
+    # RPC, which was confirmed live to accept one and rank by meaningless
+    # NULL-cosine-distance instead of erroring. Fail loudly here instead.
+    if not embedding:
+        raise ValueError("hybrid_search: embedding generation returned no vector for the query")
+
+    # Ask for more candidates than the caller needs so deduplicate_chunks()
+    # below has real distinct evidence to choose from, not just whatever
+    # survives after match_count already truncated the ranked list down to
+    # (say) 8. Bounded at the RPC's own candidate_pool default (40) — this
+    # adds no extra ranking work server-side, match_chunks_hybrid already
+    # computes scores over the full candidate pool regardless of match_count.
+    fetch_count = min(match_count * 4, 40)
     rpc_args = {
         "query_text":                 question,
         "query_embedding":             embedding,
-        "match_count":                 match_count,
+        "match_count":                 fetch_count,
         "filter_workspace_id":         workspace_id,
         "filter_asset_id":             asset_id,
         "filter_sensitivities":        filter_sensitivities,
@@ -120,7 +143,7 @@ def hybrid_search(question: str, workspace_id: str,
     }
     try:
         result = supabase.rpc("match_chunks_hybrid", rpc_args).execute()
-        return result.data or []
+        chunks = result.data or []
     except Exception as e:
         print(f"[query] hybrid search unavailable, falling back to vector-only: {e}")
         fallback_args = dict(rpc_args)
@@ -134,7 +157,9 @@ def hybrid_search(question: str, workspace_id: str,
         fallback_args.pop("boost_document_ids", None)
         fallback_args.pop("boost_doc_classes", None)
         result = supabase.rpc("match_chunks_workspace", fallback_args).execute()
-        return result.data or []
+        chunks = result.data or []
+
+    return query_reasoning.deduplicate_chunks(chunks)[:match_count]
 
 
 def build_context_and_citations(chunks: list[dict]) -> tuple[str, list[dict]]:
@@ -497,6 +522,13 @@ async def query_documents(request: QueryRequest,
                 chunks = query_reasoning.merge_chunk_results(
                     chunks, retry_batches, match_count=request.match_count or 8,
                 )
+                # merge_chunk_results dedupes by chunk ID across batches —
+                # a different reformulated query can surface a DIFFERENT
+                # chunk id that's still near-duplicate CONTENT of one
+                # already kept from the primary attempt. Each individual
+                # hybrid_search() call already deduped its own batch; this
+                # catches duplicates introduced by combining batches.
+                chunks = query_reasoning.deduplicate_chunks(chunks)
 
         if not chunks:
             return {

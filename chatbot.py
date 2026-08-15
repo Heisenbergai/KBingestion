@@ -216,6 +216,13 @@ def run_rag_query(
             [search_text], workspace_id=bot.workspace_id, user_id=user_id, feature=feature,
         )[0]
         t_embed_ms = (time.perf_counter() - t_step) * 1000
+        # Defense in depth: ai.embed_texts() always raises on failure today
+        # (never returns None), so this isn't a fix for an observed live
+        # bug — but a null/empty embedding must never be allowed to reach
+        # the RPC, which was confirmed live to accept one and rank by
+        # meaningless NULL-cosine-distance instead of erroring.
+        if not question_embedding:
+            raise ValueError("run_rag_query: embedding generation returned no vector for the query")
 
         # Hybrid retrieval (vector + keyword + tier/freshness boosts), still
         # workspace-isolated. Falls back to the old vector-only RPC if the
@@ -228,10 +235,17 @@ def run_rag_query(
         # security boundary and are always resolved server-side by the
         # caller, never derived from anything the bot/client sent.
         filter_document_ids = bot.linked_folder_ids or None
+        # Ask for more candidates than the bot needs (8) so deduplicate_chunks()
+        # below has real distinct evidence to pick from — found live
+        # 2026-08-15: a document repeating the same paragraph 18x filled 7 of
+        # 8 result slots with near-duplicates of itself. Bounded at the RPC's
+        # own candidate_pool default (40); no extra server-side ranking work,
+        # match_chunks_hybrid already scores the full pool regardless.
+        BOT_MATCH_COUNT = 8
         rpc_args = {
             "query_text":                 search_text,
             "query_embedding":             question_embedding,
-            "match_count":                 8,
+            "match_count":                 min(BOT_MATCH_COUNT * 4, 40),
             "filter_workspace_id":         bot.workspace_id,  # ← workspace isolation
             "filter_asset_id":             None,
             "filter_document_ids":         filter_document_ids,
@@ -249,7 +263,7 @@ def run_rag_query(
             search_result = supabase.rpc("match_chunks_workspace", fallback_args).execute()
         t_retrieval_ms = (time.perf_counter() - t_step) * 1000
 
-        chunks = search_result.data or []
+        chunks = query_reasoning.deduplicate_chunks(search_result.data or [])[:BOT_MATCH_COUNT]
 
         # R-B: the first attempt came back weak (top_sim < 0.30 is exactly the
         # 'none'/'low' confidence boundary computed below — checked early so a
@@ -280,6 +294,11 @@ def run_rag_query(
                     print(f"[chatbot] reformulated retrieval failed for one alt query (non-fatal): {e}")
             if retry_batches:
                 chunks = query_reasoning.merge_chunk_results(chunks, retry_batches, match_count=8)
+                # Each batch was already content-deduped individually; this
+                # catches duplicates introduced by combining batches (a
+                # reformulated query surfacing a different chunk id that's
+                # still near-duplicate content of one already kept).
+                chunks = query_reasoning.deduplicate_chunks(chunks)
             t_reformulation_ms = (time.perf_counter() - t_step) * 1000
 
         if chunks:
