@@ -1532,3 +1532,148 @@ def test_provenance_sensitivity_enforcement_via_run_filtration(monkeypatch):
     finally:
         _cleanup_notes(note_id)
         _delete_test_connection(conn_id)
+
+
+# =====================================================================
+# Slack routing isolation fix (2026-08-15) -- external_team_id is NOT
+# globally unique (real unique index is workspace_id+provider+
+# external_team_id), so the same Slack team can legitimately be connected
+# to multiple Knova workspaces. connector_slack._resolve_slack_connection
+# replaces the old "just take connections[0]" webhook routing, which could
+# silently misfile a live message into the wrong workspace's brain under
+# real, confirmed ambiguity (two real connections share both
+# external_team_id AND bot_user_id/app_id today).
+# =====================================================================
+
+import connector_slack
+
+
+def _make_test_slack_connection(team_id: str, workspace_id: str, app_id: str = None) -> str:
+    row = supabase.table("connections").insert({
+        "workspace_id": workspace_id,
+        "provider": "slack",
+        "external_team_id": team_id,
+        "external_team_name": "Phase 2B-Routing Test Team",
+        "access_token_enc": "not-a-real-token-never-decrypted-in-these-tests",
+        "app_id": app_id,
+        "status": "active",  # must be 'active' -- _resolve_slack_connection filters on it
+    }).execute().data
+    return row[0]["id"]
+
+
+def test_resolve_slack_connection_single_match_returns_it():
+    import uuid as _uuid
+    team_id = f"TROUTE-{_uuid.uuid4()}"
+    conn_id = _make_test_slack_connection(team_id, MAGIC_SMART_HOMES_WS)
+    try:
+        resolved = connector_slack._resolve_slack_connection(team_id)
+        assert resolved is not None
+        assert resolved["id"] == conn_id
+    finally:
+        _delete_test_connection(conn_id)
+
+
+def test_resolve_slack_connection_two_matches_different_app_id_disambiguates():
+    """The one case that CAN be safely resolved: two connections share a
+    team_id but were authorized through genuinely different Slack apps."""
+    import uuid as _uuid
+    team_id = f"TROUTE-{_uuid.uuid4()}"
+    conn_a = _make_test_slack_connection(team_id, MAGIC_SMART_HOMES_WS, app_id="A_APP_ONE")
+    conn_b = _make_test_slack_connection(team_id, DEFAULT_WORKSPACE_WS, app_id="A_APP_TWO")
+    try:
+        resolved_a = connector_slack._resolve_slack_connection(team_id, api_app_id="A_APP_ONE")
+        assert resolved_a is not None
+        assert resolved_a["id"] == conn_a
+
+        resolved_b = connector_slack._resolve_slack_connection(team_id, api_app_id="A_APP_TWO")
+        assert resolved_b is not None
+        assert resolved_b["id"] == conn_b
+    finally:
+        _delete_test_connection(conn_a)
+        _delete_test_connection(conn_b)
+
+
+def test_resolve_slack_connection_two_matches_same_app_id_fails_closed():
+    """Reproduces the REAL live ambiguity: two connections share both
+    team_id and app_id (both used the same underlying Slack app). No
+    signal in the event can disambiguate this -- must return None, never
+    guess which workspace."""
+    import uuid as _uuid
+    team_id = f"TROUTE-{_uuid.uuid4()}"
+    conn_a = _make_test_slack_connection(team_id, MAGIC_SMART_HOMES_WS, app_id="A_SHARED_APP")
+    conn_b = _make_test_slack_connection(team_id, DEFAULT_WORKSPACE_WS, app_id="A_SHARED_APP")
+    try:
+        assert connector_slack._resolve_slack_connection(team_id, api_app_id="A_SHARED_APP") is None
+        assert connector_slack._resolve_slack_connection(team_id, api_app_id=None) is None
+    finally:
+        _delete_test_connection(conn_a)
+        _delete_test_connection(conn_b)
+
+
+def test_resolve_slack_connection_two_matches_no_app_id_in_event_fails_closed():
+    """Even if the two connections COULD be told apart by app_id, an event
+    that doesn't carry api_app_id at all must still fail closed rather than
+    picking either one."""
+    import uuid as _uuid
+    team_id = f"TROUTE-{_uuid.uuid4()}"
+    conn_a = _make_test_slack_connection(team_id, MAGIC_SMART_HOMES_WS, app_id="A_APP_ONE")
+    conn_b = _make_test_slack_connection(team_id, DEFAULT_WORKSPACE_WS, app_id="A_APP_TWO")
+    try:
+        assert connector_slack._resolve_slack_connection(team_id, api_app_id=None) is None
+    finally:
+        _delete_test_connection(conn_a)
+        _delete_test_connection(conn_b)
+
+
+def test_resolve_slack_connection_unknown_team_returns_none():
+    assert connector_slack._resolve_slack_connection("T_DOES_NOT_EXIST") is None
+
+
+def test_resolve_slack_connection_missing_team_id_returns_none():
+    assert connector_slack._resolve_slack_connection(None) is None
+    assert connector_slack._resolve_slack_connection("") is None
+
+
+def test_resolve_slack_connection_inactive_connections_excluded():
+    """Only status='active' connections are candidates -- a revoked/inactive
+    connection sharing a team_id must not create ambiguity or get chosen."""
+    import uuid as _uuid
+    team_id = f"TROUTE-{_uuid.uuid4()}"
+    active_id = _make_test_slack_connection(team_id, MAGIC_SMART_HOMES_WS)
+    inactive_id = _make_test_slack_connection(team_id, DEFAULT_WORKSPACE_WS)
+    supabase.table("connections").update({"status": "inactive"}).eq("id", inactive_id).execute()
+    try:
+        resolved = connector_slack._resolve_slack_connection(team_id)
+        assert resolved is not None
+        assert resolved["id"] == active_id
+    finally:
+        _delete_test_connection(active_id)
+        _delete_test_connection(inactive_id)
+
+
+def test_slack_real_ambiguous_connections_cannot_be_resolved_live():
+    """LIVE VERIFICATION against the two REAL connections currently present
+    (Test company 1 / Magic Smart Homes, both sharing external_team_id
+    T02S2CXGC7R and, confirmed live, the same bot_user_id/app_id since both
+    used the env-var fallback app). Read-only -- no synthetic rows, no new
+    messages. Proves the real ambiguity fails closed rather than silently
+    routing to either real workspace."""
+    real_team_id = "T02S2CXGC7R"
+    real_connections = supabase.table("connections").select("id,workspace_id,app_id") \
+        .eq("provider", "slack").eq("external_team_id", real_team_id).eq("status", "active").execute().data
+    if len(real_connections) < 2:
+        import pytest as _pytest
+        _pytest.skip("the real two-connection ambiguity no longer exists live -- nothing to prove here")
+
+    workspace_ids = {c["workspace_id"] for c in real_connections}
+    assert len(workspace_ids) >= 2, "sanity check: these must be genuinely different workspaces"
+
+    # Without api_app_id (most realistic -- Slack always sends it, but this
+    # proves the fail-closed path even in its absence):
+    assert connector_slack._resolve_slack_connection(real_team_id) is None
+
+    # With the real app_id both connections actually share (confirmed live):
+    real_app_id = real_connections[0].get("app_id")
+    assert connector_slack._resolve_slack_connection(real_team_id, api_app_id=real_app_id) is None, (
+        "real connections share the same app_id -- must still fail closed, not guess"
+    )

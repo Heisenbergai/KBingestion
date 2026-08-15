@@ -241,6 +241,19 @@ async def slack_callback(code: str = "", state: str = "", error: str = ""):
         "external_team_name": team.get("name"),
         "access_token_enc":   bc.encrypt_secret(access_token),
         "bot_user_id":        data.get("bot_user_id"),
+        # Slack's own per-installation app identifier (real field on every
+        # oauth.v2.access response, per Slack's documented OAuth v2 shape) --
+        # stored so a live webhook event (which also carries this as
+        # api_app_id) can disambiguate WHICH connection it belongs to when
+        # the same Slack team is connected to more than one Knova workspace
+        # (real, legitimate case: connections' true uniqueness is
+        # (workspace_id, provider, external_team_id), not external_team_id
+        # alone -- see 2026-08-15 routing fix). Only helps when the two
+        # installs used genuinely different Slack apps; if they share the
+        # same app (e.g. both used the env-var fallback), app_id is
+        # identical too and the event stays genuinely ambiguous -- see
+        # _resolve_slack_connection's fail-closed handling for that case.
+        "app_id":             data.get("app_id"),
         "scopes":             data.get("scope", SLACK_SCOPES),
         "status":             "active",
         "connected_by":       user_id,
@@ -396,6 +409,60 @@ def _verify_slack_signature(request: Request, body: bytes, signing_secret: str) 
     return hmac.compare_digest(mine, sig)
 
 
+def _resolve_slack_connection(team_id: Optional[str], api_app_id: Optional[str] = None) -> Optional[dict]:
+    """
+    Resolves the SINGLE KNOVA connection a Slack event belongs to.
+
+    2026-08-15 routing fix. external_team_id is NOT globally unique --
+    connections' real uniqueness is (workspace_id, provider,
+    external_team_id) (the actual unique index; see slack_callback's
+    upsert), so the SAME Slack team can legitimately be authorized into
+    MULTIPLE Knova workspaces (e.g. the same admin connecting the same
+    Slack org into two different client accounts, or during onboarding/
+    testing -- a real, confirmed live case, not hypothetical). Previously
+    this function's job was done inline by taking connections[0] from a
+    query that could return more than one row -- a silent, undeterministic
+    misrouting risk: a live message could have been filed into the WRONG
+    workspace's brain depending on row order.
+
+    Disambiguation: if more than one active connection shares team_id, try
+    Slack's own api_app_id (stored on the connection as `app_id` at OAuth
+    time, present on every Events API payload) -- this only helps when the
+    ambiguous connections were authorized through genuinely DIFFERENT Slack
+    apps. If they share the same app too (e.g. both used the env-var
+    fallback app -- the real, confirmed state of today's two ambiguous
+    connections), app_id can't disambiguate either.
+
+    FAILS CLOSED: zero or more-than-one unresolvable match returns None.
+    Callers MUST treat None as "do not ingest this event" -- never fall
+    back to picking any row. The opposite bias from most fail-open
+    functions in this codebase, deliberately: an unrouted event costs
+    nothing (Slack redelivers, or the backfill covers it later); a
+    MISROUTED event puts one company's Slack message in another company's
+    knowledge base, which cannot be silently undone.
+    """
+    if not team_id:
+        return None
+    candidates = bc.supabase.table("connections").select("*") \
+        .eq("provider", "slack").eq("external_team_id", team_id) \
+        .eq("status", "active").execute().data or []
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        return None
+
+    if api_app_id:
+        matching = [c for c in candidates if c.get("app_id") == api_app_id]
+        if len(matching) == 1:
+            return matching[0]
+
+    print(f"[slack] AMBIGUOUS event: team_id={team_id} api_app_id={api_app_id} matches "
+          f"{len(candidates)} active connections ({[c['id'] for c in candidates]}) and could not "
+          f"be disambiguated -- discarding this event rather than guessing which Knova workspace "
+          f"it belongs to.")
+    return None
+
+
 @router.post("/slack/events")
 async def slack_events(request: Request):
     """
@@ -404,9 +471,10 @@ async def slack_events(request: Request):
     events with ITS OWN signing secret — verifying against a single global
     secret would fail every real customer's events except possibly the first
     one configured, silently breaking live ingestion for everyone else. So the
-    signing secret is resolved from the payload's team_id BEFORE verifying,
-    not read from env, except as a fallback for the one connection that
-    predates per-workspace credentials.
+    signing secret is resolved from the payload's team_id (and, if ambiguous,
+    api_app_id -- see _resolve_slack_connection) BEFORE verifying, not read
+    from env, except as a fallback for connections that predate per-workspace
+    credentials or whose team_id is genuinely ambiguous.
 
     Handles the one-time url_verification handshake (no team_id, no signature
     needed — Slack's own onboarding step) and live message events (captured
@@ -420,8 +488,19 @@ async def slack_events(request: Request):
         return PlainTextResponse(payload.get("challenge", ""))
 
     team_id = payload.get("team_id")
-    creds = bc.get_provider_credentials_by_external_team("slack", team_id) if team_id else None
-    signing_secret = creds["webhook_secret"] if creds and creds.get("webhook_secret") else SLACK_SIGNING_SECRET
+    api_app_id = payload.get("api_app_id")
+    # Resolved ONCE, reused for both the signing-secret lookup and the
+    # event-routing decision below -- previously these were two SEPARATE
+    # lookups (get_provider_credentials_by_external_team for the secret,
+    # a raw connections query for routing) that could each independently
+    # pick a different row under ambiguity, disagreeing with each other.
+    conn = _resolve_slack_connection(team_id, api_app_id) if team_id else None
+
+    signing_secret = SLACK_SIGNING_SECRET
+    if conn:
+        creds = bc.get_provider_credentials(conn["workspace_id"], "slack")
+        if creds and creds.get("webhook_secret"):
+            signing_secret = creds["webhook_secret"]
 
     if not _verify_slack_signature(request, body, signing_secret):
         raise HTTPException(status_code=401, detail="Bad Slack signature.")
@@ -429,11 +508,10 @@ async def slack_events(request: Request):
     if payload.get("type") == "event_callback":
         event = payload.get("event", {})
         if event.get("type") == "message" and not event.get("subtype") and not event.get("bot_id"):
-            conn = bc.supabase.table("connections").select("*") \
-                .eq("provider", "slack").eq("external_team_id", team_id) \
-                .eq("status", "active").execute().data
-            if conn:
-                conn = conn[0]
+            if conn is None:
+                print(f"[slack] discarding live message event -- no unambiguous connection for "
+                      f"team_id={team_id} api_app_id={api_app_id}")
+            else:
                 selected = {c["id"] for c in (conn.get("config") or {}).get("channels", [])}
                 ch = event.get("channel")
                 if ch in selected or not selected:
