@@ -640,3 +640,392 @@ def test_extract_doc_date_never_raises_on_corrupt_file():
         "corrupt.docx",
     )
     assert result is None
+
+
+# =====================================================================
+# Phase 2A -- connector-note classification hardening (2026-08-15)
+# =====================================================================
+#
+# create_note_and_embed() now classifies every connector note like an
+# uploaded document (ingest.classify_document) instead of letting
+# sensitivity/authority/doc_class/lifecycle_status fall back to raw
+# document_chunks column defaults. These tests exercise the REAL function
+# against the REAL live DB (real knowledge_notes/document_chunks rows,
+# real match_chunks_hybrid calls) -- only ai.chat_json (the one real
+# network/Bedrock call inside classify_document) and embed_chunks (the one
+# real Bedrock embedding call, unavailable in this environment -- see
+# ai.py) are mocked. Mocking embed_chunks does NOT weaken what's being
+# proven: classification/sensitivity-ladder/retrieval-filtering/deletion
+# behavior are all real Postgres/RPC behavior against real rows; only the
+# embedding VECTOR itself is a stand-in (a real, valid vector borrowed from
+# an existing production chunk via _embedding_of, not a fake shape).
+#
+# Every test creates real rows and cleans them up in a finally block via
+# the real brain_connectors.delete_note() -- itself under test (item 12).
+
+import brain_connectors as bc
+
+_stand_in_vector_cache: list = []
+
+
+def _stand_in_vector() -> list[float]:
+    """Lazy + cached so a fixture disappearing only fails a Phase 2A test
+    when it actually runs, not the whole file's collection."""
+    if not _stand_in_vector_cache:
+        _stand_in_vector_cache.append(_embedding_of(ENG003_SLIDE3_CHUNK))
+    return _stand_in_vector_cache[0]
+
+
+def _mock_classification(monkeypatch, verdict: dict):
+    """Patches the one real LLM call inside ingest.classify_document (via
+    brain_connectors' own `ai` import, since classify_document is imported
+    BY NAME into brain_connectors -- but the ai.chat_json call happens
+    inside ingest.py's own module, so the patch target is ingest.ai) and
+    the one real Bedrock embedding call inside create_note_and_embed."""
+    import ingest as ingest_module
+    monkeypatch.setattr(ingest_module.ai, "chat_json", lambda **k: verdict)
+    monkeypatch.setattr(bc, "embed_chunks",
+                        lambda chunks, **k: [_stand_in_vector()] * len(chunks))
+
+
+def _create_synthetic_note(monkeypatch, verdict: dict, workspace_id: str = MAGIC_SMART_HOMES_WS,
+                           title: str = "Phase 2A synthetic test note") -> str:
+    _mock_classification(monkeypatch, verdict)
+    return bc.create_note_and_embed(
+        workspace_id, connection_id=None, provider="slack",
+        note={"title": title, "body": "Synthetic body for Phase 2A regression testing."},
+        source_type="slack", source_tier=3,
+    )
+
+
+def _row_metadata(note_id: str) -> tuple[dict, list[dict]]:
+    note = supabase.table("knowledge_notes").select(
+        "sensitivity,authority,doc_class,lifecycle_status"
+    ).eq("id", note_id).single().execute().data
+    chunks = supabase.table("document_chunks").select(
+        "sensitivity,authority,doc_class,lifecycle_status"
+    ).eq("document_id", note_id).execute().data
+    return note, chunks
+
+
+def test_connector_note_classification_raises_sensitivity_when_more_restrictive(monkeypatch):
+    """Classifier proposes 'confidential' from the safe 'internal' baseline
+    -- more restrictive, so it MUST be applied (the raise direction)."""
+    note_id = _create_synthetic_note(monkeypatch, {
+        "sensitivity": "confidential", "authority": "canonical",
+        "doc_class": "strategy", "lifecycle_status": "active", "confidence": "high",
+    })
+    try:
+        note, chunks = _row_metadata(note_id)
+        assert note["sensitivity"] == "confidential"
+        assert all(c["sensitivity"] == "confidential" for c in chunks)
+    finally:
+        bc.delete_note(note_id)
+
+
+def test_connector_note_classification_never_lowers_sensitivity_below_internal(monkeypatch):
+    """Classifier proposes 'public' -- LESS restrictive than the 'internal'
+    baseline. The security rule: automated classification may only RAISE
+    sensitivity, never lower it. Effective sensitivity must stay 'internal'."""
+    note_id = _create_synthetic_note(monkeypatch, {
+        "sensitivity": "public", "authority": "working",
+        "doc_class": None, "lifecycle_status": "active", "confidence": "high",
+    })
+    try:
+        note, chunks = _row_metadata(note_id)
+        assert note["sensitivity"] == "internal", "sensitivity must never be auto-lowered from the baseline"
+        assert all(c["sensitivity"] == "internal" for c in chunks)
+    finally:
+        bc.delete_note(note_id)
+
+
+def test_connector_note_classification_keeps_internal_when_classifier_says_internal(monkeypatch):
+    """Classifier proposes 'internal' -- same as baseline, no change either way."""
+    note_id = _create_synthetic_note(monkeypatch, {
+        "sensitivity": "internal", "authority": "working",
+        "doc_class": None, "lifecycle_status": "active", "confidence": "medium",
+    })
+    try:
+        note, chunks = _row_metadata(note_id)
+        assert note["sensitivity"] == "internal"
+        assert all(c["sensitivity"] == "internal" for c in chunks)
+    finally:
+        bc.delete_note(note_id)
+
+
+def test_connector_note_classification_raises_to_restricted(monkeypatch):
+    """Classifier proposes 'restricted' -- the most restrictive tier, must
+    be applied (raise direction, same as the confidential case)."""
+    note_id = _create_synthetic_note(monkeypatch, {
+        "sensitivity": "restricted", "authority": "canonical",
+        "doc_class": "legal", "lifecycle_status": "active", "confidence": "high",
+    })
+    try:
+        note, chunks = _row_metadata(note_id)
+        assert note["sensitivity"] == "restricted"
+        assert all(c["sensitivity"] == "restricted" for c in chunks)
+    finally:
+        bc.delete_note(note_id)
+
+
+def test_connector_note_classification_invalid_sensitivity_stays_internal(monkeypatch):
+    """A malformed/unrecognised sensitivity value from the model must never
+    create a BROADER access level than the safe baseline -- classify_document
+    itself already validates this (falls back to 'internal'), so this proves
+    the guarantee holds all the way through create_note_and_embed, not just
+    inside classify_document."""
+    note_id = _create_synthetic_note(monkeypatch, {
+        "sensitivity": "top-secret-banana", "authority": "working",
+        "doc_class": None, "lifecycle_status": "active", "confidence": "low",
+    })
+    try:
+        note, chunks = _row_metadata(note_id)
+        assert note["sensitivity"] == "internal"
+        assert all(c["sensitivity"] == "internal" for c in chunks)
+    finally:
+        bc.delete_note(note_id)
+
+
+def test_connector_note_classification_invalid_authority_stays_working(monkeypatch):
+    note_id = _create_synthetic_note(monkeypatch, {
+        "sensitivity": "internal", "authority": "not-a-real-authority-tier",
+        "doc_class": None, "lifecycle_status": "active", "confidence": "low",
+    })
+    try:
+        note, chunks = _row_metadata(note_id)
+        assert note["authority"] == "working"
+        assert all(c["authority"] == "working" for c in chunks)
+    finally:
+        bc.delete_note(note_id)
+
+
+def test_connector_note_classification_invalid_lifecycle_stays_active(monkeypatch):
+    note_id = _create_synthetic_note(monkeypatch, {
+        "sensitivity": "internal", "authority": "working",
+        "doc_class": None, "lifecycle_status": "not-a-real-lifecycle-value", "confidence": "low",
+    })
+    try:
+        note, chunks = _row_metadata(note_id)
+        assert note["lifecycle_status"] == "active"
+        assert all(c["lifecycle_status"] == "active" for c in chunks)
+    finally:
+        bc.delete_note(note_id)
+
+
+def test_connector_note_classification_failure_falls_back_to_all_safe_defaults(monkeypatch):
+    """If the LLM call inside classify_document() fails outright, every
+    SECURITY-RELEVANT axis (sensitivity/authority/lifecycle_status -- the
+    ones the LLM alone resolves) must land on its safe default.
+
+    doc_class is the one deliberate exception: classify_document()'s rules
+    engine resolves doc_class deterministically from source_type BEFORE the
+    LLM ever runs (source_type in ("meeting","slack","note") -> "meeting"),
+    and that resolution survives an LLM failure by design (classify_document's
+    own except-branch still merges rules_result in) -- a real connector note
+    is always one of those source_types, so doc_class="meeting" here is
+    correct, existing, LLM-independent behavior, not a gap this fix touches."""
+    import ingest as ingest_module
+
+    def _raise(**k):
+        raise RuntimeError("simulated Bedrock outage")
+
+    monkeypatch.setattr(ingest_module.ai, "chat_json", _raise)
+    monkeypatch.setattr(bc, "embed_chunks", lambda chunks, **k: [_stand_in_vector()] * len(chunks))
+
+    note_id = bc.create_note_and_embed(
+        MAGIC_SMART_HOMES_WS, connection_id=None, provider="slack",
+        note={"title": "Phase 2A classification-failure test", "body": "Body text."},
+        source_type="slack", source_tier=3,
+    )
+    try:
+        note, chunks = _row_metadata(note_id)
+        assert note["sensitivity"] == "internal"
+        assert note["authority"] == "working"
+        assert note["doc_class"] == "meeting"  # deterministic rules engine, not the failed LLM
+        assert note["lifecycle_status"] == "active"
+        for c in chunks:
+            assert c["sensitivity"] == "internal"
+            assert c["authority"] == "working"
+            assert c["doc_class"] == "meeting"
+            assert c["lifecycle_status"] == "active"
+    finally:
+        bc.delete_note(note_id)
+
+
+def test_connector_note_doc_class_is_deterministically_meeting_for_slack_source(monkeypatch):
+    """Real connector notes always use source_type in ("slack","meeting","note")
+    -- classify_document's rules engine resolves doc_class="meeting" for all
+    three, deterministically, and it WINS over the LLM's own guess (see
+    classify_document's docstring: "Rules-engine doc_class wins over the
+    LLM's guess"). So even when the mocked model proposes a different class,
+    the effective doc_class must still be "meeting" for a Slack-sourced note."""
+    note_id = _create_synthetic_note(monkeypatch, {
+        "sensitivity": "internal", "authority": "official",
+        "doc_class": "product",  # LLM's guess -- must be overridden by the rules engine
+        "lifecycle_status": "active", "confidence": "medium",
+    })
+    try:
+        note, chunks = _row_metadata(note_id)
+        assert note["doc_class"] == "meeting"
+        assert all(c["doc_class"] == "meeting" for c in chunks)
+    finally:
+        bc.delete_note(note_id)
+
+
+def test_connector_note_doc_class_propagates_from_llm_when_rules_engine_has_no_signal(monkeypatch):
+    """Proves the PROPAGATION mechanism itself (LLM verdict -> effective
+    doc_class) works, using a source_type outside the rules engine's
+    deterministic set ("document", not "slack"/"meeting"/"note") so nothing
+    overrides the LLM's answer -- no real Slack/Zoom note takes this
+    source_type today, but this is what proves the wiring is correct rather
+    than coincidentally always showing "meeting"."""
+    _mock_classification(monkeypatch, {
+        "sensitivity": "internal", "authority": "official",
+        "doc_class": "product", "lifecycle_status": "active", "confidence": "medium",
+    })
+    note_id = bc.create_note_and_embed(
+        MAGIC_SMART_HOMES_WS, connection_id=None, provider="google_drive",
+        note={"title": "Phase 2A doc_class propagation test", "body": "Body text."},
+        source_type="document", source_tier=1,
+    )
+    try:
+        note, chunks = _row_metadata(note_id)
+        assert note["doc_class"] == "product"
+        assert all(c["doc_class"] == "product" for c in chunks)
+    finally:
+        bc.delete_note(note_id)
+
+
+def test_connector_note_and_all_chunks_share_identical_effective_metadata(monkeypatch):
+    """knowledge_notes and every document_chunks row for the same note must
+    NEVER disagree -- one is what a future Library UI would show, the other
+    is what retrieval's SQL-side filtering actually reads."""
+    note_id = _create_synthetic_note(monkeypatch, {
+        "sensitivity": "confidential", "authority": "official",
+        "doc_class": "financial", "lifecycle_status": "under_review", "confidence": "high",
+    })
+    try:
+        note, chunks = _row_metadata(note_id)
+        assert chunks, "expected at least one chunk"
+        for c in chunks:
+            assert c["sensitivity"] == note["sensitivity"]
+            assert c["authority"] == note["authority"]
+            assert c["doc_class"] == note["doc_class"]
+            assert c["lifecycle_status"] == note["lifecycle_status"]
+    finally:
+        bc.delete_note(note_id)
+
+
+def test_bot_learning_explicit_sensitivity_still_overrides_classification(monkeypatch):
+    """bot_learning.py's pattern: call create_note_and_embed(), then an
+    explicit admin-supplied sensitivity UPDATE on both tables. That update
+    must still win over whatever the automated classifier decided --
+    reproduces bot_learning.py's exact two-step sequence without touching
+    that file, proving Phase 2A didn't change its behavior."""
+    note_id = _create_synthetic_note(monkeypatch, {
+        "sensitivity": "confidential", "authority": "working",  # classifier raises to confidential
+        "doc_class": None, "lifecycle_status": "active", "confidence": "high",
+    })
+    try:
+        note, chunks = _row_metadata(note_id)
+        assert note["sensitivity"] == "confidential"  # classification applied first, as expected
+
+        # bot_learning.py's own explicit override (same two-table update it performs)
+        admin_choice = "restricted"
+        supabase.table("knowledge_notes").update({"sensitivity": admin_choice}).eq("id", note_id).execute()
+        supabase.table("document_chunks").update({"sensitivity": admin_choice}).eq("document_id", note_id).execute()
+
+        note2, chunks2 = _row_metadata(note_id)
+        assert note2["sensitivity"] == admin_choice, "explicit admin override must win over automated classification"
+        assert all(c["sensitivity"] == admin_choice for c in chunks2)
+    finally:
+        bc.delete_note(note_id)
+
+
+def test_filtration_discard_verdict_never_creates_note_or_chunk(monkeypatch):
+    """run_filtration()'s DISCARD path -- classify_batch() returning
+    worth_keeping:false -- must never reach create_note_and_embed() at all.
+    Pure logic test, no note is ever created so nothing to clean up."""
+    monkeypatch.setattr(bc.ai, "chat_json", lambda **k: {"worth_keeping": False})
+    result = bc.classify_batch("someone: running 5 min late", "general")
+    assert result is None
+
+
+def test_delete_note_removes_note_and_its_chunks(monkeypatch):
+    note_id = _create_synthetic_note(monkeypatch, {
+        "sensitivity": "internal", "authority": "working",
+        "doc_class": None, "lifecycle_status": "active", "confidence": "low",
+    })
+    note_before, chunks_before = _row_metadata(note_id)
+    assert note_before is not None
+    assert chunks_before
+
+    bc.delete_note(note_id)
+
+    note_after = supabase.table("knowledge_notes").select("id").eq("id", note_id).execute().data
+    chunks_after = supabase.table("document_chunks").select("id").eq("document_id", note_id).execute().data
+    assert note_after == []
+    assert chunks_after == []
+
+
+def test_connector_note_workspace_isolation(monkeypatch):
+    """A connector note created in Magic Smart Homes must never surface
+    from a query scoped to a different real workspace."""
+    note_id = _create_synthetic_note(monkeypatch, {
+        "sensitivity": "internal", "authority": "working",
+        "doc_class": None, "lifecycle_status": "active", "confidence": "low",
+    }, workspace_id=MAGIC_SMART_HOMES_WS, title="Phase 2A isolation test note")
+    try:
+        cross_workspace = supabase.rpc("match_chunks_hybrid", {
+            "query_text": "Phase 2A isolation test note",
+            "query_embedding": _stand_in_vector(),
+            "match_count": 50,
+            "filter_workspace_id": DEFAULT_WORKSPACE_WS,
+            "filter_document_ids": [note_id],
+        }).execute()
+        assert (cross_workspace.data or []) == [], "note must not be reachable from a different workspace"
+
+        same_workspace = supabase.rpc("match_chunks_hybrid", {
+            "query_text": "Phase 2A isolation test note",
+            "query_embedding": _stand_in_vector(),
+            "match_count": 50,
+            "filter_workspace_id": MAGIC_SMART_HOMES_WS,
+            "filter_document_ids": [note_id],
+        }).execute()
+        assert any(r["id"] for r in (same_workspace.data or [])), "sanity check: note must be findable in its own workspace"
+    finally:
+        bc.delete_note(note_id)
+
+
+def test_connector_note_confidential_sensitivity_enforced_by_retrieval(monkeypatch):
+    """A connector note raised to 'confidential' by classification must be
+    excluded from a low-tier caller's sensitivity ladder, and included for
+    an authorized ladder -- proves the SQL-side Phase 1 filter (unchanged
+    by this work) enforces the classification this fix now applies."""
+    note_id = _create_synthetic_note(monkeypatch, {
+        "sensitivity": "confidential", "authority": "official",
+        "doc_class": "strategy", "lifecycle_status": "active", "confidence": "high",
+    }, title="Phase 2A confidential retrieval test note")
+    try:
+        low_tier = supabase.rpc("match_chunks_hybrid", {
+            "query_text": "Phase 2A confidential retrieval test note",
+            "query_embedding": _stand_in_vector(),
+            "match_count": 50,
+            "filter_workspace_id": MAGIC_SMART_HOMES_WS,
+            "filter_document_ids": [note_id],
+            "filter_sensitivities": ["public", "internal"],
+        }).execute()
+        assert (low_tier.data or []) == [], "a low-tier ladder must never retrieve a confidential connector note"
+
+        authorized = supabase.rpc("match_chunks_hybrid", {
+            "query_text": "Phase 2A confidential retrieval test note",
+            "query_embedding": _stand_in_vector(),
+            "match_count": 50,
+            "filter_workspace_id": MAGIC_SMART_HOMES_WS,
+            "filter_document_ids": [note_id],
+            "filter_sensitivities": ["public", "internal", "confidential"],
+        }).execute()
+        row_ids = [r["id"] for r in (authorized.data or [])]
+        assert row_ids, "an authorized ladder must retrieve the confidential connector note"
+    finally:
+        bc.delete_note(note_id)

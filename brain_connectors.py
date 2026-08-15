@@ -29,7 +29,7 @@ from typing import Optional
 from supabase import create_client
 from dotenv import load_dotenv
 
-from ingest import chunk_text, embed_chunks
+from ingest import chunk_text, embed_chunks, classify_document
 
 load_dotenv()
 
@@ -361,6 +361,73 @@ def distill_meeting_transcript(transcript: str, meeting_title: str,
     }
 
 
+# Same ranking every retrieval/classification axis in this project treats as
+# an ordered ladder (see Phase C's locked sensitivity spec) — used ONLY to
+# decide whether an automated classification is allowed to move sensitivity,
+# never to rank authority/doc_class/lifecycle (those are not access-control
+# axes and have no "more/less restrictive" ordering).
+_SENSITIVITY_RANK = {"public": 0, "internal": 1, "confidential": 2, "restricted": 3}
+_SAFE_BASELINE_SENSITIVITY = "internal"
+
+
+def _classify_connector_note(title: str, body: str, source_type: str,
+                             workspace_id: Optional[str]) -> dict:
+    """
+    Phase 2A (2026-08-15): reuses ingest.classify_document() — the SAME
+    classifier uploaded documents already go through — instead of letting
+    connector notes silently fall back to raw document_chunks column
+    defaults (internal/working/null/active) regardless of actual content.
+    No second classifier, no connector-specific prompt.
+
+    SECURITY RULE, deliberately asymmetric between sensitivity and the other
+    three axes: sensitivity starts at the safe baseline 'internal' and may
+    ONLY be RAISED by the classifier, never lowered. This mirrors the
+    upload flow's own raise-only/review-queue split (src/lib/knowledge.ts)
+    — except a connector note has no prior human-chosen value to protect
+    and no frontend review step in the loop, so there is no safe way to
+    apply a WEAKER-than-baseline verdict at all; it is silently ignored
+    rather than silently trusted. Concretely:
+        classifier says public,       baseline internal -> effective internal (ignored, would lower)
+        classifier says internal,     baseline internal -> effective internal (no change)
+        classifier says confidential, baseline internal -> effective confidential (raised)
+        classifier says restricted,   baseline internal -> effective restricted (raised)
+    Authority/doc_class/lifecycle_status have no such asymmetry -- they are
+    not access-control axes, so the classifier's result is used directly
+    (or the safe default, if invalid/missing/classification failed).
+
+    classify_document() itself never raises (see its own docstring) and
+    already validates every field against its own allowed-value sets,
+    falling back to internal/working/None/active on any failure or
+    malformed output -- this function still wraps the call in its own
+    try/except as defense in depth, so a change to that contract can never
+    let a connector note escape with a broader access level than intended.
+    """
+    safe_defaults = {"sensitivity": _SAFE_BASELINE_SENSITIVITY, "authority": "working",
+                     "doc_class": None, "lifecycle_status": "active"}
+    try:
+        classification = classify_document(
+            title=title, raw_text=f"{title}\n\n{body}",
+            source_type=source_type, workspace_id=workspace_id,
+        )
+    except Exception as e:
+        print(f"[connectors] classification failed, using safe defaults (non-fatal): {e}")
+        return safe_defaults
+
+    proposed_sensitivity = classification.get("sensitivity")
+    if (proposed_sensitivity in _SENSITIVITY_RANK
+            and _SENSITIVITY_RANK[proposed_sensitivity] > _SENSITIVITY_RANK[_SAFE_BASELINE_SENSITIVITY]):
+        sensitivity = proposed_sensitivity  # raised -- allowed
+    else:
+        sensitivity = _SAFE_BASELINE_SENSITIVITY  # same, lower, or invalid -- never auto-lowered
+
+    return {
+        "sensitivity":      sensitivity,
+        "authority":        classification.get("authority") or safe_defaults["authority"],
+        "doc_class":        classification.get("doc_class"),
+        "lifecycle_status": classification.get("lifecycle_status") or safe_defaults["lifecycle_status"],
+    }
+
+
 def create_note_and_embed(workspace_id: str, connection_id: Optional[str], provider: str,
                           note: dict, source_type: str = "slack", source_tier: int = 3,
                           source_ref: str = None, occurred_at: str = None,
@@ -375,20 +442,37 @@ def create_note_and_embed(workspace_id: str, connection_id: Optional[str], provi
     from an admin's answer to an escalated question — a note has no natural
     knowledge_folders placement, so chatbot.py's folder-scope filter checks
     this instead to keep a bot-specific learned answer retrievable regardless
-    of that bot's folder scope.
+    of that bot's folder scope. bot_learning.py also does its own explicit
+    sensitivity UPDATE on both tables right after calling this (an admin's
+    deliberate choice) — that still runs afterward and still wins over the
+    classification below, unchanged by this function.
+
+    Phase 2A: classifies via _classify_connector_note() (see its docstring
+    for the full sensitivity-never-auto-lowers rule) so sensitivity/
+    authority/doc_class/lifecycle_status reflect the note's real content
+    instead of raw column defaults. The SAME effective values are written
+    to knowledge_notes AND every document_chunks row -- they must never
+    disagree, since knowledge_notes is what a future Library UI would show
+    and document_chunks is what retrieval's SQL-side filtering actually reads.
     """
+    classification = _classify_connector_note(note["title"], note["body"], source_type, workspace_id)
+
     note_row = {
-        "workspace_id":  workspace_id,
-        "connection_id": connection_id,
-        "provider":      provider,
-        "source_type":   source_type,
-        "source_tier":   source_tier,
-        "category":      note.get("category"),
-        "title":         note["title"],
-        "body":          note["body"],
-        "participants":  note.get("participants", []),
-        "source_ref":    source_ref,
-        "occurred_at":   occurred_at,
+        "workspace_id":     workspace_id,
+        "connection_id":    connection_id,
+        "provider":         provider,
+        "source_type":      source_type,
+        "source_tier":      source_tier,
+        "category":         note.get("category"),
+        "title":            note["title"],
+        "body":             note["body"],
+        "participants":     note.get("participants", []),
+        "source_ref":       source_ref,
+        "occurred_at":      occurred_at,
+        "sensitivity":      classification["sensitivity"],
+        "authority":        classification["authority"],
+        "doc_class":        classification["doc_class"],
+        "lifecycle_status": classification["lifecycle_status"],
     }
     res = supabase.table("knowledge_notes").insert(note_row).execute()
     note_id = res.data[0]["id"]
@@ -407,6 +491,10 @@ def create_note_and_embed(workspace_id: str, connection_id: Optional[str], provi
         "source_type":  source_type,
         "source_tier":  source_tier,
         "doc_date":     occurred_at,
+        "sensitivity":      classification["sensitivity"],
+        "authority":        classification["authority"],
+        "doc_class":        classification["doc_class"],
+        "lifecycle_status": classification["lifecycle_status"],
         "metadata": {
             "file_name":    note["title"],
             "chunk_index":  i,
