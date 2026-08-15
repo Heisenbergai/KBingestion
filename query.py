@@ -617,10 +617,14 @@ Formatting:
         # Only runs when a gap exists -- zero added cost on the (much more
         # common) no-gap path. See validate_gap_relevance's docstring for
         # the fail-open reasoning.
-        if gaps and not query_reasoning.validate_gap_relevance(
-            request.question, gaps, workspace_id=request.workspace_id, user_id=auth.user_id,
-        ):
-            gaps = None
+        if gaps:
+            original_gap = gaps
+            if not query_reasoning.validate_gap_relevance(
+                request.question, gaps, workspace_id=request.workspace_id, user_id=auth.user_id,
+            ):
+                gaps = None
+            print(f"[gap_validation] original_question={request.question!r} "
+                  f"original_gap={original_gap!r} final_gaps={gaps!r}")
 
         # Confidence from the best chunk's semantic similarity
         top_sim = max((c.get("similarity") or 0) for c in chunks)

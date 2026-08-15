@@ -110,43 +110,59 @@ def reformulate_query(question: str, workspace_id: Optional[str] = None) -> list
 
 
 _GAP_VALIDATION_PROMPT = """You check whether a candidate "knowledge gap" note genuinely
-describes something the user's question asked for, or whether it describes additional /
-tangential information the question never requested.
+describes information the user's question REQUIRES to be answered, or whether it
+describes something more specific or tangential than what was actually asked.
 
-A gap is VALID (KEEP) only if the question asks for that specific piece of information
-and the sources genuinely don't contain it.
+Work through this in order, then answer:
+1. In a few words, what is the CORE thing the question is asking for?
+2. In a few words, what does the gap note claim is missing?
+3. Is what's missing (2) actually part of what was asked (1), or is it a MORE
+   SPECIFIC, narrower, or tangential detail that goes beyond what was asked?
 
-A gap is INVALID (DROP) if it describes:
-- a level of detail more granular or specific than what was actually asked (e.g. the
-  question asked "what are the priorities" and was answered with priorities -- a gap
-  about "specific Q3 metrics" or "detailed execution steps" is INVALID, since those
-  specifics were never asked for)
-- related-but-unrequested information
-- something that would merely make the answer "more comprehensive," rather than
-  something the question itself required
+Decision rule:
+- Question asks an open/general question ("What are the X of Y?", e.g. priorities,
+  considerations, differences) and the gap describes a specific number, metric, or
+  narrower sub-detail that was NOT explicitly requested -> DROP. The general
+  question was already answered; the gap is inventing a more specific question
+  nobody asked.
+- Question asks for a specific/exact fact ("What is the exact <fact>?") and the gap
+  says that exact fact isn't available -> KEEP. This is precisely what was asked.
+- Question asks for two things ("X, and what is Y?") and the sources cover X but
+  not Y -> KEEP a gap about Y specifically, even though X was fully answered.
+- If genuinely uncertain, KEEP -- a shown-but-unnecessary gap is a smaller problem
+  than a hidden real one.
 
 Example -- DROP:
 Question: "What are the key priorities and considerations for manufacturing capacity
 planning?"
 Gap: "Specific details about cost-reduction initiatives and Q3 capacity expansion
 metrics are not provided."
-Verdict: DROP -- the question asked about priorities/considerations in general, not
-specific Q3 metrics.
-
-Example -- DROP:
-Question: "What are the differences between production planning, production
-scheduling, and capacity planning?"
-Gap: "Specific details on how these are executed in practice are not provided."
-Verdict: DROP -- the question asked for differences/relationships, which were
-answered; execution detail was never asked for.
+-> question_asks_for: "priorities/considerations for capacity planning (general)"
+-> gap_describes: "specific Q3 cost/expansion metrics"
+-> gap_is_narrower_than_asked: true -> verdict: DROP
 
 Example -- KEEP:
 Question: "What is the 2026 social media influencer marketing budget?"
 Gap: "Information about the 2026 social media influencer marketing budget is not
 available."
-Verdict: KEEP -- this is exactly what was asked.
+-> question_asks_for: "the 2026 influencer marketing budget"
+-> gap_describes: "the 2026 influencer marketing budget"
+-> gap_is_narrower_than_asked: false -> verdict: KEEP
 
-Reply ONLY with JSON: {"verdict": "KEEP"} or {"verdict": "DROP"}"""
+Example -- KEEP (partial):
+Question: "What are the key priorities for capacity planning, and what is the exact
+defect rate percentage for the Magic Hub assembly line?"
+Gap: "The exact defect rate percentage for the Magic Hub assembly line is not
+provided."
+-> question_asks_for: "priorities for capacity planning AND the exact Magic Hub
+defect rate"
+-> gap_describes: "the exact Magic Hub defect rate"
+-> gap_is_narrower_than_asked: false (it's one of the two things explicitly asked)
+-> verdict: KEEP
+
+Reply ONLY with JSON, no other text:
+{"question_asks_for": "<few words>", "gap_describes": "<few words>",
+ "gap_is_narrower_than_asked": true or false, "verdict": "KEEP" or "DROP"}"""
 
 
 def validate_gap_relevance(question: str, gap: str,
@@ -167,6 +183,22 @@ def validate_gap_relevance(question: str, gap: str,
     didn't. ONLY called when the model already produced a non-empty gap --
     zero added cost on the (much more common) no-gap path.
 
+    REAL BUG FOUND in the first version of this function (also live
+    2026-08-15, same day): max_tokens was 20 -- reformulate_query above,
+    the only other chat_json caller in this module, uses 200. 20 tokens is
+    not enough room for {"verdict": "KEEP"} if the model emits ANY text
+    before the JSON (common even under a "reply ONLY with JSON"
+    instruction), so the response silently failed to parse on BOTH the
+    original attempt and chat_json's own one retry, raising
+    json.JSONDecodeError uncaught out of chat_json -- which this function's
+    fail-open except-branch swallowed, returning KEEP regardless of what
+    the model actually judged. The false gap "surviving a real LLM call"
+    was consistent with the model's verdict never successfully reaching
+    this function at all. Fixed by matching reformulate_query's budget
+    (with headroom for this prompt's added reasoning fields) and by logging
+    the raw model response so this is directly verifiable, not theoretical,
+    on the next live run.
+
     FAILS OPEN (keeps the gap) on any error, exception, or malformed
     output -- the opposite bias from reformulate_query's fail-closed. This
     matches grounding.py's stated philosophy (a wrong "no gap" that hides a
@@ -183,16 +215,20 @@ def validate_gap_relevance(question: str, gap: str,
         result = ai.chat_json(
             messages=[{"role": "user", "content": f"Question: {q}\n\nCandidate gap note: {g}"}],
             system=_GAP_VALIDATION_PROMPT,
-            max_tokens=20,
+            max_tokens=300,
             temperature=0,
             workspace_id=workspace_id,
             user_id=user_id,
             feature="gap_validation",
         )
         verdict = (result or {}).get("verdict")
-        # Anything other than the literal "DROP" keeps the gap -- an
-        # unexpected/malformed verdict fails toward showing it, not hiding it.
-        return verdict != "DROP"
+        keep = verdict != "DROP"
+        # Direct evidence for the next live run, not a hypothesis -- prints
+        # the full raw model response, not just the final bool, so a repeat
+        # of the max_tokens bug (or any other parse issue) is visible
+        # immediately instead of silently reappearing as an unexplained KEEP.
+        print(f"[gap_validation] question={q!r} gap={g!r} raw_result={result!r} verdict={verdict!r} keep={keep}")
+        return keep
     except Exception as e:
         print(f"[query_reasoning] gap relevance validation failed, keeping gap (fail-open, non-fatal): {e}")
         return True

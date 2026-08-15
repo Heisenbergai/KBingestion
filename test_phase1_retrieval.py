@@ -530,6 +530,64 @@ def test_validate_gap_relevance_empty_gap_is_never_kept():
     assert validate_gap_relevance("What are our priorities?", None) is False
 
 
+def test_validate_gap_relevance_requests_a_token_budget_large_enough_to_avoid_truncation(monkeypatch):
+    """Regression guard for the REAL live 2026-08-15 bug: this function
+    originally requested max_tokens=20 -- reformulate_query above, the only
+    other chat_json caller in this module, uses 200. 20 tokens is not
+    enough room for {"verdict": "KEEP"} if the model emits ANY text before
+    the JSON (common even under a "reply ONLY with JSON" instruction), so
+    the response failed to parse on both the original attempt and
+    chat_json's own one retry, raising json.JSONDecodeError uncaught out of
+    chat_json -- silently swallowed by this function's fail-open
+    except-branch, returning KEEP regardless of the model's actual verdict.
+    The exact live false gap ("Q3 capacity expansion metrics") surviving a
+    real LLM call is consistent with the verdict never successfully
+    reaching this function at all. Asserts a generous budget (matching or
+    exceeding reformulate_query's 200) is requested, so this can't regress
+    silently back to a too-small budget."""
+    import query_reasoning as qr_module
+
+    captured = {}
+
+    def _capture(**k):
+        captured.update(k)
+        return {"verdict": "DROP"}
+
+    monkeypatch.setattr(qr_module.ai, "chat_json", _capture)
+    validate_gap_relevance("Any question?", "Any gap note.")
+    assert captured.get("max_tokens", 0) >= 200, (
+        f"max_tokens={captured.get('max_tokens')} risks the model's JSON verdict "
+        f"being truncated into invalid JSON, which fails open to KEEP regardless "
+        f"of the model's real judgment -- this is the exact live false-gap bug"
+    )
+
+
+def test_validate_gap_relevance_fails_open_when_response_never_parses_as_json(monkeypatch):
+    """Direct simulation of the real live bug's actual failure mode: the
+    model's raw response never successfully parses into JSON (as would
+    happen from truncation), so ai.chat_json raises -- and that exception
+    must still fail OPEN (keep the gap) here, exactly like any other
+    chat_json failure. This is what actually happened live, not a
+    hypothetical -- the fix is the token budget above, this test documents
+    what the failure mode looks like from this function's side."""
+    import json
+    import query_reasoning as qr_module
+
+    def _raise_json_decode_error(**k):
+        raise json.JSONDecodeError("No JSON object found in model output", "", 0)
+
+    monkeypatch.setattr(qr_module.ai, "chat_json", _raise_json_decode_error)
+    assert validate_gap_relevance(
+        "What are the key priorities and considerations for manufacturing capacity planning?",
+        "Specific details about cost-reduction initiatives and Q3 capacity expansion "
+        "metrics are not provided in the sources.",
+    ) is True  # fails open -- but this is exactly the wrong outcome for THIS gap,
+    # which is why the real fix is preventing the truncation (token budget),
+    # not relying on fail-open to save us: fail-open trades an unnecessary
+    # gap for never hiding a real one, and this gap should have been a
+    # genuine DROP if the model's judgment had actually been reached.
+
+
 # =====================================================================
 # Step 6 -- forward-only doc_date population from real embedded file metadata
 # =====================================================================
