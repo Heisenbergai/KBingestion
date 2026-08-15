@@ -109,6 +109,95 @@ def reformulate_query(question: str, workspace_id: Optional[str] = None) -> list
         return []
 
 
+_GAP_VALIDATION_PROMPT = """You check whether a candidate "knowledge gap" note genuinely
+describes something the user's question asked for, or whether it describes additional /
+tangential information the question never requested.
+
+A gap is VALID (KEEP) only if the question asks for that specific piece of information
+and the sources genuinely don't contain it.
+
+A gap is INVALID (DROP) if it describes:
+- a level of detail more granular or specific than what was actually asked (e.g. the
+  question asked "what are the priorities" and was answered with priorities -- a gap
+  about "specific Q3 metrics" or "detailed execution steps" is INVALID, since those
+  specifics were never asked for)
+- related-but-unrequested information
+- something that would merely make the answer "more comprehensive," rather than
+  something the question itself required
+
+Example -- DROP:
+Question: "What are the key priorities and considerations for manufacturing capacity
+planning?"
+Gap: "Specific details about cost-reduction initiatives and Q3 capacity expansion
+metrics are not provided."
+Verdict: DROP -- the question asked about priorities/considerations in general, not
+specific Q3 metrics.
+
+Example -- DROP:
+Question: "What are the differences between production planning, production
+scheduling, and capacity planning?"
+Gap: "Specific details on how these are executed in practice are not provided."
+Verdict: DROP -- the question asked for differences/relationships, which were
+answered; execution detail was never asked for.
+
+Example -- KEEP:
+Question: "What is the 2026 social media influencer marketing budget?"
+Gap: "Information about the 2026 social media influencer marketing budget is not
+available."
+Verdict: KEEP -- this is exactly what was asked.
+
+Reply ONLY with JSON: {"verdict": "KEEP"} or {"verdict": "DROP"}"""
+
+
+def validate_gap_relevance(question: str, gap: str,
+                            workspace_id: Optional[str] = None,
+                            user_id: Optional[str] = None) -> bool:
+    """
+    Returns True if `gap` should be shown to the user (it genuinely describes
+    something the question asked for), False if it should be dropped
+    (tangential/unrequested detail).
+
+    WHY THIS EXISTS. Live 2026-08-15: even after tightening the answer
+    system prompt's own gap instructions, the model still produced gaps like
+    "Specific details about cost-reduction initiatives... are not provided"
+    on a fully-answered "what are the priorities" question -- real,
+    demonstrated LLM self-regulation failure, not a hypothetical. A second,
+    narrowly-scoped, cheap validation call (same pattern as
+    reformulate_query above) catches what the generation prompt alone
+    didn't. ONLY called when the model already produced a non-empty gap --
+    zero added cost on the (much more common) no-gap path.
+
+    FAILS OPEN (keeps the gap) on any error, exception, or malformed
+    output -- the opposite bias from reformulate_query's fail-closed. This
+    matches grounding.py's stated philosophy (a wrong "no gap" that hides a
+    real limitation costs more than an unnecessary gap shown), so an
+    unavailable validator must never silently suppress a possibly-real gap.
+    """
+    q = (question or "").strip()
+    g = (gap or "").strip()
+    if not g:
+        return False
+    if not q:
+        return True
+    try:
+        result = ai.chat_json(
+            messages=[{"role": "user", "content": f"Question: {q}\n\nCandidate gap note: {g}"}],
+            system=_GAP_VALIDATION_PROMPT,
+            max_tokens=20,
+            temperature=0,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            feature="gap_validation",
+        )
+        verdict = (result or {}).get("verdict")
+        # Anything other than the literal "DROP" keeps the gap -- an
+        # unexpected/malformed verdict fails toward showing it, not hiding it.
+        return verdict != "DROP"
+    except Exception as e:
+        print(f"[query_reasoning] gap relevance validation failed, keeping gap (fail-open, non-fatal): {e}")
+        return True
+
+
 _CONDENSE_PROMPT = """You rewrite a follow-up question from an ongoing conversation into a
 single, fully self-contained question that makes sense with NO access to the
 earlier turns -- no "it", "these", "that", "compared to before", etc.

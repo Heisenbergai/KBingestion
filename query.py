@@ -562,6 +562,11 @@ Honesty about gaps (important):
   unasked fact isn't mentioned, or the answer could simply be more comprehensive. If
   you have fully answered the question as asked, do NOT write a gap note, even if the
   sources could say more about the broader subject.
+- Do NOT invent a more specific follow-on question the person didn't ask, then flag
+  ITS answer as missing. Example: if asked "what are the key priorities for X", and
+  you answer with the priorities the sources support, do NOT then add a gap saying
+  "specific metrics/execution details/Q3 figures for X are not provided" -- those are
+  a MORE SPECIFIC question than the one actually asked, not a gap in the one asked.
 - If the sources answer the question but a SPECIFIC part of what was actually asked is
   missing, answer what you can with citations, then on a new final line write
   "{GAP_MARKER}" followed by ONE plain sentence naming exactly what part of the
@@ -602,6 +607,20 @@ Formatting:
             workspace_id=request.workspace_id, user_id=auth.user_id, feature="ai_search",
         )
         answer, gaps = split_answer_and_gaps(raw)
+
+        # R-B-2: a second, narrow validation pass on the model's OWN gap note
+        # -- found live 2026-08-15 that the generation prompt's gap
+        # instructions alone (tightened above) still weren't enough: the
+        # model kept flagging a MORE SPECIFIC, unasked-for follow-on
+        # question ("Q3 capacity expansion metrics") as though it were a gap
+        # in the question actually asked ("what are the key priorities").
+        # Only runs when a gap exists -- zero added cost on the (much more
+        # common) no-gap path. See validate_gap_relevance's docstring for
+        # the fail-open reasoning.
+        if gaps and not query_reasoning.validate_gap_relevance(
+            request.question, gaps, workspace_id=request.workspace_id, user_id=auth.user_id,
+        ):
+            gaps = None
 
         # Confidence from the best chunk's semantic similarity
         top_sim = max((c.get("similarity") or 0) for c in chunks)

@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 import pytest
 
 from query import supabase, build_context_and_citations, split_answer_and_gaps
-from query_reasoning import deduplicate_chunks
+from query_reasoning import deduplicate_chunks, validate_gap_relevance
 from ingest import extract_doc_date
 
 # ---- Real fixture IDs, from the 2026-08-15 live validation pass ----
@@ -459,6 +459,75 @@ def test_mfg001_templated_content_not_collapsed_by_dedup():
         f"{len(out)} survivors for {distinct_topics_after} topics -- "
         f"within-topic rolling-window duplicates are no longer collapsing"
     )
+
+
+# =====================================================================
+# Gap semantics -- validate_gap_relevance (2026-08-15 false-gap fix)
+# =====================================================================
+
+def test_validate_gap_relevance_drops_a_gap_the_model_flags_as_drop(monkeypatch):
+    """When the validation model explicitly says DROP, the gap must not
+    survive -- this is the mechanism that catches the real live false
+    positive (a "what are the key priorities" question fully answered, then
+    flagged with a gap about unasked-for Q3 metrics)."""
+    import query_reasoning as qr_module
+
+    monkeypatch.setattr(qr_module.ai, "chat_json", lambda **k: {"verdict": "DROP"})
+    assert validate_gap_relevance(
+        "What are the key priorities and considerations for manufacturing capacity planning?",
+        "Specific details about cost-reduction initiatives and Q3 capacity expansion "
+        "metrics are not provided in the sources.",
+    ) is False
+
+
+def test_validate_gap_relevance_keeps_a_gap_the_model_flags_as_keep(monkeypatch):
+    """A genuine gap -- the question asks for X, X isn't in the sources --
+    must survive validation. This is the true-gap case (marketing budget
+    query) that must keep working exactly as before this fix."""
+    import query_reasoning as qr_module
+
+    monkeypatch.setattr(qr_module.ai, "chat_json", lambda **k: {"verdict": "KEEP"})
+    assert validate_gap_relevance(
+        "What is Magic Smart Homes' social media influencer marketing budget for 2026?",
+        "Information about the 2026 social media influencer marketing budget is not "
+        "available in the current knowledge base.",
+    ) is True
+
+
+def test_validate_gap_relevance_fails_open_on_error(monkeypatch):
+    """An unavailable/broken validator must never SILENTLY suppress a
+    possibly-real gap -- fails open (keeps the gap), the opposite bias from
+    reformulate_query's fail-closed. Matches grounding.py's stated
+    philosophy: a wrong 'no gap' costs more than an unnecessary one shown."""
+    import query_reasoning as qr_module
+
+    def _raise(**k):
+        raise RuntimeError("simulated model outage")
+
+    monkeypatch.setattr(qr_module.ai, "chat_json", _raise)
+    assert validate_gap_relevance("Any question?", "Any gap note.") is True
+
+
+def test_validate_gap_relevance_treats_malformed_verdict_as_keep(monkeypatch):
+    """Anything other than the literal string 'DROP' (missing key, None,
+    unexpected value) must keep the gap -- same fail-toward-showing-it bias
+    as the error path above, for a response that came back but didn't
+    match the expected shape."""
+    import query_reasoning as qr_module
+
+    monkeypatch.setattr(qr_module.ai, "chat_json", lambda **k: {"verdict": "MAYBE"})
+    assert validate_gap_relevance("Any question?", "Any gap note.") is True
+
+    monkeypatch.setattr(qr_module.ai, "chat_json", lambda **k: {})
+    assert validate_gap_relevance("Any question?", "Any gap note.") is True
+
+
+def test_validate_gap_relevance_empty_gap_is_never_kept():
+    """No gap text at all is trivially not a gap to show -- must return
+    False without even attempting a model call (no question/gap round-trip
+    needed to know there's nothing to validate)."""
+    assert validate_gap_relevance("What are our priorities?", "") is False
+    assert validate_gap_relevance("What are our priorities?", None) is False
 
 
 # =====================================================================
