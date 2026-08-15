@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Depends
 from auth import AuthContext, current_user
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Callable
 from supabase import create_client
 from dotenv import load_dotenv
 
@@ -226,64 +226,140 @@ def batch_conversations(items: list[dict]) -> list[list[dict]]:
     return batches
 
 
-def _format_batch(batch: list[dict]) -> tuple[str, str]:
-    """Renders a batch as a readable transcript; returns (transcript, channel)."""
-    lines, channel = [], "unknown"
-    for it in batch:
+def _format_batch(batch: list[dict]) -> tuple[str, str, list[int]]:
+    """
+    Renders a batch as an INDEXED transcript ("[0] alice: ...", "[1] bob:
+    ...") the classifier can cite specific lines from, plus index_map: the
+    printed index i refers to batch[index_map[i]] -- NOT necessarily i
+    itself, since messages with empty text are skipped entirely (nothing
+    for a citation to point at) without shifting anything already printed.
+    Returns (transcript, channel, index_map).
+    """
+    lines, channel, index_map = [], "unknown", []
+    for pos, it in enumerate(batch):
         raw = it.get("raw", {})
         channel = raw.get("channel_name") or raw.get("channel", channel)
         who = raw.get("user_name") or raw.get("user", "someone")
         text = (raw.get("text") or "").strip()
         if text:
-            lines.append(f"{who}: {text}")
-    return "\n".join(lines), channel
+            idx = len(index_map)
+            lines.append(f"[{idx}] {who}: {text}")
+            index_map.append(pos)
+    return "\n".join(lines), channel, index_map
 
 
 CLASSIFY_SYSTEM = """You are the filter that decides what enters a company's permanent knowledge base.
-You will see a short workplace conversation. Decide if it contains DURABLE, REUSABLE company \
-knowledge that a colleague might search for later — a decision made, a process or how-to, an \
-announcement, a factual answer, or a policy. Casual chatter, greetings, logistics ("running 5 min \
-late"), reactions, and banter are NOISE and must be discarded.
+You will see a NUMBERED workplace conversation window -- each line is prefixed with its index in
+brackets, e.g. "[0] alice: ...". The window may contain ZERO, ONE, or MULTIPLE independent pieces
+of durable knowledge, mixed with noise -- messages in the same window are NOT guaranteed to be
+about the same topic just because they were posted close together.
 
-If it is worth keeping, rewrite it as a clean, standalone knowledge note written in the third person \
-as settled fact — NOT "someone said". Include the concrete substance (numbers, names, decisions).
+For each GENUINELY independent, durable, REUSABLE piece of company knowledge that a colleague
+might search for later -- a decision made, a process or how-to, an announcement, a factual answer,
+or a policy -- produce ONE item. Casual chatter, greetings, logistics ("running 5 min late"),
+reactions, and banter are NOISE -- do not produce an item for them.
+
+Do NOT invent a connection between unrelated messages just because they're in the same window --
+combine messages into ONE item only when they are genuinely the same topic/discussion. Keep
+genuinely separate topics as separate items, each with its own entry. Preserve qualifiers and
+uncertainty -- an opinion or suggestion ("I think we should...", "maybe we could...") is NOT a
+settled decision; never rewrite it as one, and do not treat it as durable knowledge unless the
+window shows it was actually decided.
+
+If worth keeping, rewrite each item as a clean, standalone knowledge note written in the third
+person as settled fact -- NOT "someone said". Include the concrete substance (numbers, names,
+decisions).
+
+Every item MUST cite exactly which message indices (from the numbered list above) support it, in
+"source_message_indices" -- only indices that genuinely contain that item's content, never a
+nearby index just because it's close by. An item with no genuinely supporting index must not be
+produced at all.
 
 Respond ONLY with valid JSON, no markdown fences:
-{
-  "worth_keeping": true,
-  "category": "decision" | "process" | "announcement" | "fact" | "qa",
-  "title": "concise, searchable title",
-  "note": "1-4 sentences of standalone knowledge",
-  "participants": ["first names of key people involved"]
-}
-If it is noise: {"worth_keeping": false}"""
+{"items": [
+  {"title": "concise, searchable title",
+   "note": "1-4 sentences of standalone knowledge",
+   "category": "decision" | "process" | "announcement" | "fact" | "qa",
+   "participants": ["first names of key people involved"],
+   "source_message_indices": [0, 2]}
+]}
+If nothing in the window is worth keeping: {"items": []}"""
 
 
-def classify_batch(transcript: str, channel: str, workspace_id: Optional[str] = None) -> Optional[dict]:
-    """Runs one conversation through the LLM filter. Returns a note dict or
-    None (noise / empty / unparseable — fail safe by discarding)."""
+def classify_batch(transcript: str, channel: str, index_map: list[int],
+                   workspace_id: Optional[str] = None) -> list[dict]:
+    """
+    Runs one conversation WINDOW through the LLM filter. Returns a list of
+    note dicts (possibly empty -- pure noise, an empty transcript, or a
+    call/parse failure all fail safe to zero items, never a guess).
+
+    Each returned item carries "source_batch_positions": real positions in
+    the ORIGINAL batch list (already translated through index_map), not the
+    printed transcript indices -- callers never have to re-derive the
+    mapping themselves.
+
+    VALIDATION, not trust (2026-08-15 provenance fix): every
+    source_message_indices value the model returns is checked against
+    index_map's real bounds before being used. An item with a missing,
+    empty, non-list, non-integer, or out-of-range index is DROPPED
+    ENTIRELY -- never partially attached to the wrong messages, never
+    guessed at. This is what "the model must not create a note without
+    identifying which messages support it" is enforced as code, not just
+    a prompt instruction the model might ignore. One bad item in a
+    multi-item response does not discard the others.
+    """
     if not transcript.strip():
-        return None
+        return []
     try:
         verdict = ai.chat_json(
             messages=[{"role": "user",
                        "content": f"Channel: #{channel}\n\nConversation:\n{transcript}"}],
-            system=CLASSIFY_SYSTEM, max_tokens=500, temperature=0.2,
+            system=CLASSIFY_SYSTEM, max_tokens=1200, temperature=0.2,
             workspace_id=workspace_id, feature="filtration",
         )
     except Exception as e:
-        print(f"[filtration] classify failed (discarding): {e}")
-        return None
-    if not isinstance(verdict, dict) or not verdict.get("worth_keeping"):
-        return None
-    if not verdict.get("note") or not verdict.get("title"):
-        return None
-    return {
-        "category":     verdict.get("category", "fact"),
-        "title":        str(verdict["title"])[:200],
-        "body":         str(verdict["note"]),
-        "participants": [str(p) for p in (verdict.get("participants") or [])][:10],
-    }
+        print(f"[filtration] classify failed (discarding batch, non-fatal): {e}")
+        return []
+    if not isinstance(verdict, dict):
+        return []
+    raw_items = verdict.get("items")
+    if not isinstance(raw_items, list):
+        return []
+
+    n = len(index_map)
+    results: list[dict] = []
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            continue
+        if not raw_item.get("note") or not raw_item.get("title"):
+            continue
+        indices = raw_item.get("source_message_indices")
+        if not isinstance(indices, list) or not indices:
+            continue  # no cited support at all -- never create a note without attribution
+        seen: set[int] = set()
+        positions: list[int] = []
+        valid = True
+        for idx in indices:
+            # isinstance(idx, bool) excluded deliberately: bool is a subclass
+            # of int in Python, and True/False must never be silently
+            # treated as 1/0 array indices.
+            if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0 or idx >= n:
+                valid = False
+                break
+            if idx in seen:
+                continue
+            seen.add(idx)
+            positions.append(index_map[idx])
+        if not valid or not positions:
+            continue  # malformed/out-of-range citation -- drop THIS item, not the whole batch
+        results.append({
+            "category":     raw_item.get("category", "fact"),
+            "title":        str(raw_item["title"])[:200],
+            "body":         str(raw_item["note"]),
+            "participants": [str(p) for p in (raw_item.get("participants") or [])][:10],
+            "source_batch_positions": positions,
+        })
+    return results
 
 
 MEETING_SYSTEM = """You are the filter that decides what enters a company's permanent knowledge base.
@@ -431,7 +507,8 @@ def _classify_connector_note(title: str, body: str, source_type: str,
 def create_note_and_embed(workspace_id: str, connection_id: Optional[str], provider: str,
                           note: dict, source_type: str = "slack", source_tier: int = 3,
                           source_ref: str = None, occurred_at: str = None,
-                          extra_metadata: Optional[dict] = None) -> str:
+                          extra_metadata: Optional[dict] = None,
+                          sources: Optional[list[dict]] = None) -> str:
     """
     Inserts a knowledge_note and embeds its body into document_chunks
     (document_id = note id, so its chunks are searchable via hybrid search
@@ -454,6 +531,19 @@ def create_note_and_embed(workspace_id: str, connection_id: Optional[str], provi
     to knowledge_notes AND every document_chunks row -- they must never
     disagree, since knowledge_notes is what a future Library UI would show
     and document_chunks is what retrieval's SQL-side filtering actually reads.
+
+    Phase 2B provenance fix (2026-08-15): `source_ref` alone is a SINGLE
+    nullable column -- it stays populated for backward compatibility
+    (bot_learning.py and any other single-source caller still gets exactly
+    the old behavior, untouched), but it can only ever name ONE contributor.
+    `sources` -- optional, additive, only used by callers that pass it
+    (currently: run_filtration's Slack path) -- is a list of
+    {channel_id, message_ts, thread_ts, source_ref, occurred_at} dicts, one
+    per REAL message that actually supports this note (never the whole
+    batch a message happened to be captured alongside), written to the new
+    knowledge_note_sources table. A caller that omits `sources` (bot_learning,
+    Zoom's single-transcript notes) creates zero rows there -- source_ref
+    remains the only provenance for those, exactly as before this fix.
     """
     classification = _classify_connector_note(note["title"], note["body"], source_type, workspace_id)
 
@@ -476,6 +566,21 @@ def create_note_and_embed(workspace_id: str, connection_id: Optional[str], provi
     }
     res = supabase.table("knowledge_notes").insert(note_row).execute()
     note_id = res.data[0]["id"]
+
+    if sources:
+        source_rows = [{
+            "note_id":       note_id,
+            "workspace_id":  workspace_id,
+            "provider":      provider,
+            "source_type":   source_type,
+            "connection_id": connection_id,
+            "channel_id":    s.get("channel_id"),
+            "message_ts":    s.get("message_ts"),
+            "thread_ts":     s.get("thread_ts"),
+            "source_ref":    s.get("source_ref"),
+            "occurred_at":   s.get("occurred_at"),
+        } for s in sources]
+        supabase.table("knowledge_note_sources").insert(source_rows).execute()
 
     # Embed the note body into the searchable brain (tier 3 by default)
     full_text = f"{note['title']}\n\n{note['body']}"
@@ -510,11 +615,33 @@ def create_note_and_embed(workspace_id: str, connection_id: Optional[str], provi
 
 
 def run_filtration(workspace_id: str, connection_id: str, provider: str,
-                   job: Optional[dict] = None) -> dict:
+                   job: Optional[dict] = None,
+                   resolve_permalink: Optional[Callable[[dict], Optional[str]]] = None) -> dict:
     """
     Processes all pending ingest_items for a connection:
-    batch → classify → distill keepers into notes → mark items.
-    This is the step that turns raw chat into curated company knowledge.
+    batch → classify (possibly multiple items per batch) → distill each
+    KEEP item into its own note, attributed only to its real contributing
+    messages → mark items. This is the step that turns raw chat into
+    curated company knowledge.
+
+    Phase 2B provenance fix (2026-08-15): a batch is a CONTEXT WINDOW, not
+    a guarantee of one topic. classify_batch() now returns a LIST of items,
+    each carrying which real batch positions support it
+    (source_batch_positions, already validated -- see classify_batch's
+    docstring). An ingest_item is marked 'noted' with a note_id ONLY if it
+    was actually cited by that note's classification -- never because it
+    merely shared a batch with something that got kept. Anything in the
+    batch not cited by any KEEP item is marked 'discarded', exactly the
+    same as before this fix for genuinely pure-noise batches.
+
+    resolve_permalink(raw_message_dict) -> Optional[str], if given, is
+    called ONLY for messages that actually end up contributing to a KEEP
+    item (never for the whole batch, never for discarded messages) --
+    provider-specific (currently Slack's real chat.getPermalink), passed in
+    by the caller rather than looked up here, since this function is
+    provider-agnostic and must not import a specific connector module.
+    A None return (lookup failed, or no resolver given) is stored as-is --
+    never fabricated into a guessed URL, and never blocks note creation.
     """
     pending = supabase.table("ingest_items").select("*") \
         .eq("connection_id", connection_id).eq("status", "pending") \
@@ -528,28 +655,59 @@ def run_filtration(workspace_id: str, connection_id: str, provider: str,
     discarded = 0
 
     for bi, batch in enumerate(batches):
-        transcript, channel = _format_batch(batch)
-        note = classify_batch(transcript, channel, workspace_id=workspace_id)
-        item_ids = [it["id"] for it in batch]
+        transcript, channel, index_map = _format_batch(batch)
+        items = classify_batch(transcript, channel, index_map, workspace_id=workspace_id)
 
-        if note:
-            first_raw = batch[0].get("raw", {})
+        attributed_ids: set = set()
+        for item in items:
+            contributing = [batch[p] for p in item["source_batch_positions"]]
+            item_ids = [it["id"] for it in contributing]
+
+            sources = []
+            for it in contributing:
+                raw = it.get("raw", {})
+                permalink = None
+                if resolve_permalink is not None:
+                    try:
+                        permalink = resolve_permalink(raw)
+                    except Exception as e:
+                        # A permalink lookup failure must never cost the
+                        # note itself -- real channel/ts metadata is kept
+                        # regardless, source_ref just stays None instead of
+                        # a fabricated URL.
+                        print(f"[connectors] permalink lookup failed (non-fatal): {e}")
+                sources.append({
+                    "channel_id":  raw.get("channel"),
+                    "message_ts":  raw.get("ts"),
+                    "thread_ts":   raw.get("thread_ts"),
+                    "source_ref":  permalink,
+                    "occurred_at": raw.get("iso_ts"),
+                })
+
             note_id = create_note_and_embed(
-                workspace_id, connection_id, provider, note,
+                workspace_id, connection_id, provider, item,
                 source_type=provider if provider != "google_drive" else "document",
                 source_tier=3 if provider == "slack" else 2,
-                source_ref=first_raw.get("permalink"),
-                occurred_at=first_raw.get("iso_ts"),
+                # Legacy single-value column: the first real contributor's
+                # permalink, for backward-compat callers that only ever
+                # read knowledge_notes.source_ref (see create_note_and_embed's
+                # docstring) -- knowledge_note_sources is the complete record.
+                source_ref=sources[0]["source_ref"] if sources else None,
+                occurred_at=sources[0]["occurred_at"] if sources else None,
+                sources=sources,
             )
             supabase.table("ingest_items").update(
                 {"status": "noted", "note_id": note_id}
             ).in_("id", item_ids).execute()
+            attributed_ids.update(item_ids)
             notes_created += 1
-        else:
+
+        unattributed_ids = [it["id"] for it in batch if it["id"] not in attributed_ids]
+        if unattributed_ids:
             supabase.table("ingest_items").update(
                 {"status": "discarded"}
-            ).in_("id", item_ids).execute()
-            discarded += len(item_ids)
+            ).in_("id", unattributed_ids).execute()
+            discarded += len(unattributed_ids)
 
         if job is not None:
             job["batches_done"] = bi + 1
@@ -559,8 +717,13 @@ def run_filtration(workspace_id: str, connection_id: str, provider: str,
 
 
 def delete_note(note_id: str) -> None:
-    """Removes a note and every chunk it produced (chunks share document_id = note id)."""
+    """Removes a note, every chunk it produced (chunks share document_id =
+    note id), and every provenance row it has (knowledge_note_sources also
+    has an ON DELETE CASCADE FK to knowledge_notes as a second layer, but
+    this stays explicit here to match the existing document_chunks pattern
+    and to not depend solely on the FK firing)."""
     supabase.table("document_chunks").delete().eq("document_id", note_id).execute()
+    supabase.table("knowledge_note_sources").delete().eq("note_id", note_id).execute()
     supabase.table("knowledge_notes").delete().eq("id", note_id).execute()
 
 
@@ -660,8 +823,17 @@ async def trigger_filtration(body: SyncRequest,
 
     def _work():
         try:
+            resolver = None
+            if conn["provider"] == "slack":
+                # Deferred import: connector_slack.py imports THIS module at
+                # module load time, so a top-level import here would be
+                # circular. Safe as a call-time import -- both modules are
+                # already fully loaded by the time a request reaches this
+                # background thread.
+                import connector_slack
+                resolver = connector_slack.build_permalink_resolver(conn)
             result = run_filtration(conn["workspace_id"], conn["id"], conn["provider"],
-                                    job=SYNC_JOBS[job_id])
+                                    job=SYNC_JOBS[job_id], resolve_permalink=resolver)
             SYNC_JOBS[job_id].update({"status": "completed", **result})
         except Exception as e:
             import traceback; print(f"[connectors] filtration job failed: {e}"); print(traceback.format_exc())

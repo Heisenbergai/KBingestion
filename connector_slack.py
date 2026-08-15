@@ -116,6 +116,52 @@ def _user_name_map(token: str) -> dict:
     return names
 
 
+def get_permalink(token: str, channel: str, ts: str) -> Optional[str]:
+    """
+    Phase 2B provenance fix (2026-08-15): real Slack chat.getPermalink call --
+    the only reliable source for a working link back to a specific message,
+    per Slack's own docs. NEVER manually constructs a URL (workspace domain
+    slug isn't reliably derivable from what's already stored, and Slack
+    itself warns manual construction has edge cases -- Enterprise Grid,
+    custom domains). Returns None on any failure (missing channel/ts, API
+    error, network failure) -- the caller (run_filtration) treats a missing
+    permalink as "real metadata kept, no link available," never fabricates
+    one, and never lets this failure block note creation.
+    """
+    if not channel or not ts:
+        return None
+    try:
+        data = _slack_get("chat.getPermalink", token, {"channel": channel, "message_ts": ts})
+        permalink = data.get("permalink")
+        return permalink if isinstance(permalink, str) and permalink else None
+    except Exception as e:
+        print(f"[slack] permalink lookup failed for {channel}:{ts} (non-fatal): {e}")
+        return None
+
+
+def build_permalink_resolver(conn: dict):
+    """
+    Returns a `raw_message_dict -> Optional[str]` closure bound to this
+    connection's real decrypted token, for brain_connectors.run_filtration's
+    `resolve_permalink` parameter -- or None if this connection can't
+    resolve permalinks (wrong provider, no token) so callers that don't
+    know the provider in advance (worker.py, the generic /connectors/sync
+    route) can build one uniformly without a provider-specific branch of
+    their own beyond "is this a Slack connection."
+    """
+    if conn.get("provider") != "slack":
+        return None
+    token_enc = conn.get("access_token_enc")
+    if not token_enc:
+        return None
+    token = bc.decrypt_secret(token_enc)
+
+    def _resolve(raw: dict) -> Optional[str]:
+        return get_permalink(token, raw.get("channel"), raw.get("ts"))
+
+    return _resolve
+
+
 # ── Routes ──────────────────────────────────────────────────────────────────────
 
 def _slack_client_credentials(workspace_id: str) -> tuple[str, str]:
@@ -276,8 +322,11 @@ async def slack_select_channels(body: SelectChannelsRequest,
                 total += captured
                 bc.SYNC_JOBS[job_id]["messages_captured"] = total
             bc.SYNC_JOBS[job_id]["stage"] = "filtering"
-            result = bc.run_filtration(conn["workspace_id"], conn["id"], "slack",
-                                       job=bc.SYNC_JOBS[job_id])
+            result = bc.run_filtration(
+                conn["workspace_id"], conn["id"], "slack",
+                job=bc.SYNC_JOBS[job_id],
+                resolve_permalink=lambda raw: get_permalink(token, raw.get("channel"), raw.get("ts")),
+            )
             bc.SYNC_JOBS[job_id].update({"status": "completed", "stage": "completed", **result})
         except Exception as e:
             import traceback; print(f"[slack] backfill failed: {e}"); print(traceback.format_exc())

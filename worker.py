@@ -52,6 +52,7 @@ from datetime import datetime, timezone, timedelta
 
 import brain_connectors as bc
 import connector_google
+import connector_slack
 import connector_zoom
 
 # How soon is "expiring soon" for the flag-only checks below.
@@ -82,7 +83,10 @@ def run_pending_filtration() -> dict:
     filtration pass, same pipeline POST /connectors/sync already triggers
     on demand — this is what makes it run without a human clicking it.
     """
-    connections = bc.supabase.table("connections").select("id, workspace_id, provider") \
+    # access_token_enc is needed here (not just id/workspace_id/provider) so
+    # a Slack connection can resolve real chat.getPermalink calls for its
+    # kept messages -- see connector_slack.build_permalink_resolver.
+    connections = bc.supabase.table("connections").select("id, workspace_id, provider, access_token_enc") \
         .eq("status", "active").execute().data or []
 
     processed, failed = 0, 0
@@ -94,7 +98,9 @@ def run_pending_filtration() -> dict:
 
         run_id = _start_run("filtration", conn["id"], conn["workspace_id"])
         try:
-            result = bc.run_filtration(conn["workspace_id"], conn["id"], conn["provider"])
+            resolver = connector_slack.build_permalink_resolver(conn)
+            result = bc.run_filtration(conn["workspace_id"], conn["id"], conn["provider"],
+                                       resolve_permalink=resolver)
             _finish_run(run_id, "completed", stats=result)
             processed += 1
             print(f"[worker] filtration OK connection={conn['id']} provider={conn['provider']} {result}")

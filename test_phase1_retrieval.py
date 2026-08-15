@@ -943,12 +943,13 @@ def test_bot_learning_explicit_sensitivity_still_overrides_classification(monkey
 
 
 def test_filtration_discard_verdict_never_creates_note_or_chunk(monkeypatch):
-    """run_filtration()'s DISCARD path -- classify_batch() returning
-    worth_keeping:false -- must never reach create_note_and_embed() at all.
-    Pure logic test, no note is ever created so nothing to clean up."""
-    monkeypatch.setattr(bc.ai, "chat_json", lambda **k: {"worth_keeping": False})
-    result = bc.classify_batch("someone: running 5 min late", "general")
-    assert result is None
+    """run_filtration()'s DISCARD path -- classify_batch() returning an
+    empty items list (2026-08-15 provenance fix: multi-item schema, see
+    that function's docstring) -- must never reach create_note_and_embed()
+    at all. Pure logic test, no note is ever created so nothing to clean up."""
+    monkeypatch.setattr(bc.ai, "chat_json", lambda **k: {"items": []})
+    result = bc.classify_batch("[0] someone: running 5 min late", "general", index_map=[0])
+    assert result == []
 
 
 def test_delete_note_removes_note_and_its_chunks(monkeypatch):
@@ -1029,3 +1030,505 @@ def test_connector_note_confidential_sensitivity_enforced_by_retrieval(monkeypat
         assert row_ids, "an authorized ladder must retrieve the confidential connector note"
     finally:
         bc.delete_note(note_id)
+
+
+# =====================================================================
+# Phase 2B -- provenance fix: multi-item classification, per-message
+# attribution, knowledge_note_sources, real Slack permalinks (2026-08-15)
+# =====================================================================
+#
+# Root cause this fixes (found live, real Slack data, 2026-08-15): a batch
+# is a CONTEXT WINDOW, not a guarantee of one topic. The old classify_batch
+# returned a single note for the whole batch transcript, and run_filtration
+# marked EVERY ingest_item in the batch 'noted' with that one note_id
+# regardless of whether the note's content actually came from that specific
+# message. Two real batches from the first live run each merged 3 unrelated
+# messages into one note that only represented ONE of them -- the other two
+# were marked 'noted' pointing to a note that didn't cover them at all.
+#
+# These tests use a SYNTHETIC connections row (status='inactive', so the
+# real Railway worker's run_pending_filtration() -- which only queries
+# status='active' -- can never pick it up) to avoid any risk of colliding
+# with the real live Slack connection's real data. ingest_items.connection_id
+# has a real FK to connections(id) ON DELETE CASCADE, so deleting the test
+# connection at teardown removes its ingest_items automatically; notes/
+# chunks/sources are still cleaned up explicitly via delete_note().
+
+def _make_test_connection(workspace_id: str = MAGIC_SMART_HOMES_WS) -> str:
+    import uuid as _uuid
+    row = supabase.table("connections").insert({
+        "workspace_id": workspace_id,
+        "provider": "slack",
+        "external_team_id": f"TEST-{_uuid.uuid4()}",
+        "external_team_name": "Phase 2B Test Connection",
+        "access_token_enc": "not-a-real-token-never-decrypted-in-these-tests",
+        "status": "inactive",  # never picked up by the real scheduled worker
+    }).execute().data
+    return row[0]["id"]
+
+
+def _delete_test_connection(connection_id: str) -> None:
+    supabase.table("connections").delete().eq("id", connection_id).execute()
+
+
+def _insert_test_ingest_items(connection_id: str, workspace_id: str, messages: list[dict]) -> list[dict]:
+    """messages: [{channel, text, ts, user?, user_name?, iso_ts?, thread_ts?}]."""
+    rows = [{
+        "workspace_id":  workspace_id,
+        "connection_id": connection_id,
+        "provider":      "slack",
+        "external_id":   f"{m['channel']}:{m['ts']}",
+        "kind":          "message",
+        "raw": {
+            "channel": m["channel"], "channel_name": m.get("channel_name", m["channel"]),
+            "user": m.get("user", "U_TEST"), "user_name": m.get("user_name", "Test User"),
+            "text": m["text"], "ts": m["ts"],
+            "iso_ts": m.get("iso_ts", "2026-08-15T00:00:00+00:00"),
+            "thread_ts": m.get("thread_ts"),
+        },
+        "status": "pending",
+    } for m in messages]
+    return supabase.table("ingest_items").insert(rows).execute().data
+
+
+def _run_test_filtration(connection_id, workspace_id, monkeypatch, classify_response, resolve_permalink=None):
+    monkeypatch.setattr(bc.ai, "chat_json", lambda **k: classify_response)
+    monkeypatch.setattr(bc, "embed_chunks", lambda chunks, **k: [_stand_in_vector()] * len(chunks))
+    return bc.run_filtration(workspace_id, connection_id, "slack", resolve_permalink=resolve_permalink)
+
+
+def _item_status_map(item_ids: list[str]) -> dict:
+    rows = supabase.table("ingest_items").select("id,status,note_id").in_("id", item_ids).execute().data
+    return {r["id"]: r for r in rows}
+
+
+def _cleanup_notes(*note_ids):
+    for note_id in note_ids:
+        if note_id:
+            bc.delete_note(note_id)
+
+
+def test_provenance_one_message_keep_one_note_one_source_row(monkeypatch):
+    conn_id = _make_test_connection()
+    try:
+        items = _insert_test_ingest_items(conn_id, MAGIC_SMART_HOMES_WS, [
+            {"channel": "C_TEST1", "text": "We are standardizing the Monday capacity review.", "ts": "1000.001"},
+        ])
+        result = _run_test_filtration(conn_id, MAGIC_SMART_HOMES_WS, monkeypatch, {
+            "items": [{"title": "Monday capacity review", "note": "The team standardized a Monday capacity review.",
+                       "category": "process", "participants": [], "source_message_indices": [0]}]
+        })
+        assert result["notes_created"] == 1
+        assert result["items_discarded"] == 0
+
+        statuses = _item_status_map([items[0]["id"]])
+        assert statuses[items[0]["id"]]["status"] == "noted"
+        note_id = statuses[items[0]["id"]]["note_id"]
+        assert note_id
+
+        sources = supabase.table("knowledge_note_sources").select("*").eq("note_id", note_id).execute().data
+        assert len(sources) == 1
+        assert sources[0]["channel_id"] == "C_TEST1"
+        assert sources[0]["message_ts"] == "1000.001"
+    finally:
+        note_id_var = locals().get("note_id")
+        _cleanup_notes(note_id_var)
+        _delete_test_connection(conn_id)
+
+
+def test_provenance_two_related_messages_one_note_two_source_rows(monkeypatch):
+    conn_id = _make_test_connection()
+    try:
+        items = _insert_test_ingest_items(conn_id, MAGIC_SMART_HOMES_WS, [
+            {"channel": "C_TEST2", "text": "We should move the firmware release to Sept 12.", "ts": "2000.001"},
+            {"channel": "C_TEST2", "text": "Agreed, Sept 12 it is, no new features after Sept 5.", "ts": "2000.002"},
+        ])
+        item_ids = [it["id"] for it in items]
+        result = _run_test_filtration(conn_id, MAGIC_SMART_HOMES_WS, monkeypatch, {
+            "items": [{"title": "Firmware release schedule", "note": "Firmware release targeted for Sept 12; feature freeze Sept 5.",
+                       "category": "decision", "participants": [], "source_message_indices": [0, 1]}]
+        })
+        assert result["notes_created"] == 1
+
+        statuses = _item_status_map(item_ids)
+        note_ids = {s["note_id"] for s in statuses.values()}
+        assert all(s["status"] == "noted" for s in statuses.values())
+        assert len(note_ids) == 1, "both messages of one genuinely-related topic must point to the SAME note"
+        note_id = note_ids.pop()
+
+        sources = supabase.table("knowledge_note_sources").select("*").eq("note_id", note_id).execute().data
+        assert len(sources) == 2
+        assert {s["message_ts"] for s in sources} == {"2000.001", "2000.002"}
+    finally:
+        _cleanup_notes(locals().get("note_id"))
+        _delete_test_connection(conn_id)
+
+
+def test_provenance_mixed_batch_two_independent_topics_plus_noise(monkeypatch):
+    """PERMANENT REGRESSION FIXTURE for the exact real bug found live
+    2026-08-15: a 3-message window with 2 independent durable topics and 1
+    noise message. The original bug merged all 3 into one note that only
+    represented one topic, while marking all 3 ingest_items 'noted'. The
+    fix must produce 2 notes, each attributed ONLY to its real message, and
+    correctly discard the noise message rather than falsely attaching it
+    to either note."""
+    conn_id = _make_test_connection()
+    note_a_id = note_b_id = None
+    try:
+        items = _insert_test_ingest_items(conn_id, MAGIC_SMART_HOMES_WS, [
+            {"channel": "C_TEST3", "text": "We're standardizing production planning around a Monday capacity review.", "ts": "3000.001"},
+            {"channel": "C_TEST3", "text": "The next firmware release will prioritize Matter stability over new features.", "ts": "3000.002"},
+            {"channel": "C_TEST3", "text": "lol nice", "ts": "3000.003"},
+        ])
+        item_ids = [it["id"] for it in items]
+        result = _run_test_filtration(conn_id, MAGIC_SMART_HOMES_WS, monkeypatch, {
+            "items": [
+                {"title": "Monday capacity review process", "note": "Production planning is standardized around a Monday capacity review.",
+                 "category": "process", "participants": [], "source_message_indices": [0]},
+                {"title": "Firmware release priorities", "note": "The next firmware release prioritizes Matter stability over new features.",
+                 "category": "decision", "participants": [], "source_message_indices": [1]},
+                # index 2 ("lol nice") deliberately never cited -- noise
+            ]
+        })
+        assert result["notes_created"] == 2, "two independent topics must produce two separate notes"
+
+        statuses = _item_status_map(item_ids)
+        assert statuses[item_ids[0]]["status"] == "noted"
+        assert statuses[item_ids[1]]["status"] == "noted"
+        assert statuses[item_ids[2]]["status"] == "discarded", "the noise message must NOT be attached to either note"
+        assert statuses[item_ids[2]]["note_id"] is None
+
+        note_a_id = statuses[item_ids[0]]["note_id"]
+        note_b_id = statuses[item_ids[1]]["note_id"]
+        assert note_a_id != note_b_id, "the two independent topics must NOT share a note"
+
+        sources_a = supabase.table("knowledge_note_sources").select("message_ts").eq("note_id", note_a_id).execute().data
+        sources_b = supabase.table("knowledge_note_sources").select("message_ts").eq("note_id", note_b_id).execute().data
+        assert [s["message_ts"] for s in sources_a] == ["3000.001"]
+        assert [s["message_ts"] for s in sources_b] == ["3000.002"]
+    finally:
+        _cleanup_notes(note_a_id, note_b_id)
+        _delete_test_connection(conn_id)
+
+
+def test_provenance_keep_plus_noise_only_keep_source_noted(monkeypatch):
+    conn_id = _make_test_connection()
+    note_id = None
+    try:
+        items = _insert_test_ingest_items(conn_id, MAGIC_SMART_HOMES_WS, [
+            {"channel": "C_TEST4", "text": "Only the controlled BOM folder revision is valid for production.", "ts": "4000.001"},
+            {"channel": "C_TEST4", "text": "haha same", "ts": "4000.002"},
+        ])
+        item_ids = [it["id"] for it in items]
+        result = _run_test_filtration(conn_id, MAGIC_SMART_HOMES_WS, monkeypatch, {
+            "items": [{"title": "BOM revision policy", "note": "Only the controlled BOM folder revision is valid for production.",
+                       "category": "policy", "participants": [], "source_message_indices": [0]}]
+        })
+        assert result["notes_created"] == 1
+        assert result["items_discarded"] == 1
+
+        statuses = _item_status_map(item_ids)
+        assert statuses[item_ids[0]]["status"] == "noted"
+        assert statuses[item_ids[1]]["status"] == "discarded"
+        assert statuses[item_ids[1]]["note_id"] is None
+        note_id = statuses[item_ids[0]]["note_id"]
+    finally:
+        _cleanup_notes(note_id)
+        _delete_test_connection(conn_id)
+
+
+def test_provenance_pure_noise_no_notes_or_chunks(monkeypatch):
+    conn_id = _make_test_connection()
+    try:
+        items = _insert_test_ingest_items(conn_id, MAGIC_SMART_HOMES_WS, [
+            {"channel": "C_TEST5", "text": "good morning", "ts": "5000.001"},
+            {"channel": "C_TEST5", "text": "running 5 min late", "ts": "5000.002"},
+        ])
+        item_ids = [it["id"] for it in items]
+        result = _run_test_filtration(conn_id, MAGIC_SMART_HOMES_WS, monkeypatch, {"items": []})
+        assert result["notes_created"] == 0
+        assert result["items_discarded"] == 2
+
+        statuses = _item_status_map(item_ids)
+        assert all(s["status"] == "discarded" for s in statuses.values())
+        assert all(s["note_id"] is None for s in statuses.values())
+    finally:
+        _delete_test_connection(conn_id)
+
+
+def test_provenance_invalid_source_index_item_safely_rejected(monkeypatch):
+    """An out-of-range index makes THAT ITEM invalid -- dropped entirely,
+    never attached to the wrong (or any) message."""
+    conn_id = _make_test_connection()
+    try:
+        items = _insert_test_ingest_items(conn_id, MAGIC_SMART_HOMES_WS, [
+            {"channel": "C_TEST6", "text": "Some real message.", "ts": "6000.001"},
+        ])
+        item_ids = [it["id"] for it in items]
+        result = _run_test_filtration(conn_id, MAGIC_SMART_HOMES_WS, monkeypatch, {
+            "items": [{"title": "Bad", "note": "Bad note.", "category": "fact",
+                       "participants": [], "source_message_indices": [99]}]
+        })
+        assert result["notes_created"] == 0
+        statuses = _item_status_map(item_ids)
+        assert statuses[item_ids[0]]["status"] == "discarded"
+        assert statuses[item_ids[0]]["note_id"] is None
+    finally:
+        _delete_test_connection(conn_id)
+
+
+def test_provenance_duplicate_source_indices_deduped(monkeypatch):
+    """[0, 0] must not create two provenance rows for the same message."""
+    conn_id = _make_test_connection()
+    note_id = None
+    try:
+        items = _insert_test_ingest_items(conn_id, MAGIC_SMART_HOMES_WS, [
+            {"channel": "C_TEST7", "text": "Support will tag hardware cases by batch number.", "ts": "7000.001"},
+        ])
+        item_ids = [it["id"] for it in items]
+        _run_test_filtration(conn_id, MAGIC_SMART_HOMES_WS, monkeypatch, {
+            "items": [{"title": "Batch tagging", "note": "Support tags hardware cases by batch number.",
+                       "category": "process", "participants": [], "source_message_indices": [0, 0]}]
+        })
+        statuses = _item_status_map(item_ids)
+        note_id = statuses[item_ids[0]]["note_id"]
+        sources = supabase.table("knowledge_note_sources").select("*").eq("note_id", note_id).execute().data
+        assert len(sources) == 1, "a duplicated index must not create duplicate provenance rows"
+    finally:
+        _cleanup_notes(note_id)
+        _delete_test_connection(conn_id)
+
+
+def test_provenance_matches_ingest_item_attribution_exactly(monkeypatch):
+    """For a multi-note batch, the set of note_ids referenced by
+    ingest_items must exactly equal the set of note_ids that have
+    knowledge_note_sources rows -- no orphaned attribution either direction."""
+    conn_id = _make_test_connection()
+    note_a_id = note_b_id = None
+    try:
+        items = _insert_test_ingest_items(conn_id, MAGIC_SMART_HOMES_WS, [
+            {"channel": "C_TEST8", "text": "Credential changes must be logged and reviewed.", "ts": "8000.001"},
+            {"channel": "C_TEST8", "text": "Installation kits will be reserved before dispatch.", "ts": "8000.002"},
+        ])
+        item_ids = [it["id"] for it in items]
+        _run_test_filtration(conn_id, MAGIC_SMART_HOMES_WS, monkeypatch, {
+            "items": [
+                {"title": "Credential change policy", "note": "Credential changes must be logged and reviewed.",
+                 "category": "policy", "participants": [], "source_message_indices": [0]},
+                {"title": "Installation kit reservation", "note": "Installation kits will be reserved before dispatch.",
+                 "category": "policy", "participants": [], "source_message_indices": [1]},
+            ]
+        })
+        statuses = _item_status_map(item_ids)
+        note_a_id, note_b_id = statuses[item_ids[0]]["note_id"], statuses[item_ids[1]]["note_id"]
+        ingest_note_ids = {note_a_id, note_b_id}
+
+        source_note_ids = {
+            r["note_id"] for r in supabase.table("knowledge_note_sources")
+            .select("note_id").in_("note_id", list(ingest_note_ids)).execute().data
+        }
+        assert ingest_note_ids == source_note_ids
+    finally:
+        _cleanup_notes(note_a_id, note_b_id)
+        _delete_test_connection(conn_id)
+
+
+def test_provenance_permalink_success_stored_on_note_and_source(monkeypatch):
+    conn_id = _make_test_connection()
+    note_id = None
+    try:
+        items = _insert_test_ingest_items(conn_id, MAGIC_SMART_HOMES_WS, [
+            {"channel": "C_TEST9", "text": "Q4 roadmap prioritizes reliability improvements.", "ts": "9000.001"},
+        ])
+        item_ids = [it["id"] for it in items]
+        fake_url = "https://test-workspace.slack.com/archives/C_TEST9/p9000001"
+        _run_test_filtration(conn_id, MAGIC_SMART_HOMES_WS, monkeypatch, {
+            "items": [{"title": "Q4 roadmap", "note": "Q4 roadmap prioritizes reliability improvements.",
+                       "category": "decision", "participants": [], "source_message_indices": [0]}]
+        }, resolve_permalink=lambda raw: fake_url)
+
+        statuses = _item_status_map(item_ids)
+        note_id = statuses[item_ids[0]]["note_id"]
+        note = supabase.table("knowledge_notes").select("source_ref").eq("id", note_id).single().execute().data
+        assert note["source_ref"] == fake_url
+
+        sources = supabase.table("knowledge_note_sources").select("source_ref").eq("note_id", note_id).execute().data
+        assert sources[0]["source_ref"] == fake_url
+    finally:
+        _cleanup_notes(note_id)
+        _delete_test_connection(conn_id)
+
+
+def test_provenance_permalink_failure_does_not_destroy_note(monkeypatch):
+    """A resolver that raises must not fail the note -- real metadata is
+    kept, source_ref just stays None instead of a fabricated URL."""
+    conn_id = _make_test_connection()
+    note_id = None
+    try:
+        items = _insert_test_ingest_items(conn_id, MAGIC_SMART_HOMES_WS, [
+            {"channel": "C_TEST10", "text": "Support escalation process updated.", "ts": "10000.001"},
+        ])
+        item_ids = [it["id"] for it in items]
+
+        def _raise(raw):
+            raise RuntimeError("simulated Slack API outage")
+
+        result = _run_test_filtration(conn_id, MAGIC_SMART_HOMES_WS, monkeypatch, {
+            "items": [{"title": "Escalation process", "note": "Support escalation process updated.",
+                       "category": "process", "participants": [], "source_message_indices": [0]}]
+        }, resolve_permalink=_raise)
+        assert result["notes_created"] == 1, "a permalink failure must not prevent note creation"
+
+        statuses = _item_status_map(item_ids)
+        note_id = statuses[item_ids[0]]["note_id"]
+        note = supabase.table("knowledge_notes").select("source_ref").eq("id", note_id).single().execute().data
+        assert note["source_ref"] is None, "must never fabricate a URL on lookup failure"
+
+        sources = supabase.table("knowledge_note_sources").select("source_ref,channel_id,message_ts").eq("note_id", note_id).execute().data
+        assert sources[0]["source_ref"] is None
+        assert sources[0]["channel_id"] == "C_TEST10"  # real metadata preserved regardless
+        assert sources[0]["message_ts"] == "10000.001"
+    finally:
+        _cleanup_notes(note_id)
+        _delete_test_connection(conn_id)
+
+
+def test_provenance_thread_message_preserves_thread_ts(monkeypatch):
+    conn_id = _make_test_connection()
+    note_id = None
+    try:
+        items = _insert_test_ingest_items(conn_id, MAGIC_SMART_HOMES_WS, [
+            {"channel": "C_TEST11", "text": "Replying with the final decision on the release date.",
+             "ts": "11000.002", "thread_ts": "11000.001"},
+        ])
+        item_ids = [it["id"] for it in items]
+        _run_test_filtration(conn_id, MAGIC_SMART_HOMES_WS, monkeypatch, {
+            "items": [{"title": "Release date decision", "note": "The release date was finalized.",
+                       "category": "decision", "participants": [], "source_message_indices": [0]}]
+        })
+        statuses = _item_status_map(item_ids)
+        note_id = statuses[item_ids[0]]["note_id"]
+        sources = supabase.table("knowledge_note_sources").select("thread_ts").eq("note_id", note_id).execute().data
+        assert sources[0]["thread_ts"] == "11000.001"
+    finally:
+        _cleanup_notes(note_id)
+        _delete_test_connection(conn_id)
+
+
+def test_provenance_reprocessing_already_noted_batch_creates_no_duplicates(monkeypatch):
+    """run_filtration only ever queries status='pending' -- once items are
+    'noted'/'discarded', a second run must find nothing left to process."""
+    conn_id = _make_test_connection()
+    note_id = None
+    try:
+        items = _insert_test_ingest_items(conn_id, MAGIC_SMART_HOMES_WS, [
+            {"channel": "C_TEST12", "text": "Reprocessing idempotency check message.", "ts": "12000.001"},
+        ])
+        item_ids = [it["id"] for it in items]
+        first = _run_test_filtration(conn_id, MAGIC_SMART_HOMES_WS, monkeypatch, {
+            "items": [{"title": "Idempotency check", "note": "Reprocessing idempotency check message.",
+                       "category": "fact", "participants": [], "source_message_indices": [0]}]
+        })
+        assert first["notes_created"] == 1
+        statuses = _item_status_map(item_ids)
+        note_id = statuses[item_ids[0]]["note_id"]
+
+        second = _run_test_filtration(conn_id, MAGIC_SMART_HOMES_WS, monkeypatch, {
+            "items": [{"title": "Should not fire", "note": "Should not fire.",
+                       "category": "fact", "participants": [], "source_message_indices": [0]}]
+        })
+        assert second["notes_created"] == 0, "already-processed items must not be reprocessed"
+        assert second["batches"] == 0
+
+        remaining_notes = supabase.table("knowledge_notes").select("id").eq("id", note_id).execute().data
+        assert len(remaining_notes) == 1  # still exactly the one note from the first run
+    finally:
+        _cleanup_notes(note_id)
+        _delete_test_connection(conn_id)
+
+
+def test_provenance_workspace_isolation_via_run_filtration(monkeypatch):
+    conn_id = _make_test_connection(workspace_id=MAGIC_SMART_HOMES_WS)
+    note_id = None
+    try:
+        items = _insert_test_ingest_items(conn_id, MAGIC_SMART_HOMES_WS, [
+            {"channel": "C_TEST13", "text": "Phase 2B workspace isolation check message.", "ts": "13000.001"},
+        ])
+        item_ids = [it["id"] for it in items]
+        _run_test_filtration(conn_id, MAGIC_SMART_HOMES_WS, monkeypatch, {
+            "items": [{"title": "Isolation check", "note": "Phase 2B workspace isolation check message.",
+                       "category": "fact", "participants": [], "source_message_indices": [0]}]
+        })
+        statuses = _item_status_map(item_ids)
+        note_id = statuses[item_ids[0]]["note_id"]
+
+        cross = supabase.rpc("match_chunks_hybrid", {
+            "query_text": "Phase 2B workspace isolation check message",
+            "query_embedding": _stand_in_vector(),
+            "match_count": 50,
+            "filter_workspace_id": DEFAULT_WORKSPACE_WS,
+            "filter_document_ids": [note_id],
+        }).execute()
+        assert (cross.data or []) == [], "note must not be reachable from a different workspace"
+    finally:
+        _cleanup_notes(note_id)
+        _delete_test_connection(conn_id)
+
+
+def test_provenance_sensitivity_enforcement_via_run_filtration(monkeypatch):
+    """End-to-end through the real run_filtration entry point (not just
+    create_note_and_embed directly): Phase 2A classification still applies
+    and is still enforced by real retrieval filtering."""
+    conn_id = _make_test_connection()
+    note_id = None
+    try:
+        # bc.ai and ingest.ai are the SAME cached module object (both do
+        # `import ai` -- Python only loads it once) -- a single dispatcher
+        # keyed on `feature` is required, not two separate monkeypatches,
+        # or the second silently overwrites the first for both call sites.
+        _FILTRATION_VERDICT = {
+            "items": [{"title": "Executive compensation", "note": "Executive compensation details for next fiscal year.",
+                       "category": "fact", "participants": [], "source_message_indices": [0]}]
+        }
+        _CLASSIFICATION_VERDICT = {
+            "sensitivity": "restricted", "authority": "canonical",
+            "doc_class": "financial", "lifecycle_status": "active", "confidence": "high",
+        }
+
+        def _dispatch_chat_json(**k):
+            return _CLASSIFICATION_VERDICT if k.get("feature") == "classification" else _FILTRATION_VERDICT
+
+        items = _insert_test_ingest_items(conn_id, MAGIC_SMART_HOMES_WS, [
+            {"channel": "C_TEST14", "text": "Executive compensation details for next fiscal year.", "ts": "14000.001"},
+        ])
+        item_ids = [it["id"] for it in items]
+
+        monkeypatch.setattr(bc.ai, "chat_json", _dispatch_chat_json)
+        monkeypatch.setattr(bc, "embed_chunks", lambda chunks, **k: [_stand_in_vector()] * len(chunks))
+        bc.run_filtration(MAGIC_SMART_HOMES_WS, conn_id, "slack")
+
+        statuses = _item_status_map(item_ids)
+        note_id = statuses[item_ids[0]]["note_id"]
+
+        low_tier = supabase.rpc("match_chunks_hybrid", {
+            "query_text": "Executive compensation details for next fiscal year",
+            "query_embedding": _stand_in_vector(),
+            "match_count": 50,
+            "filter_workspace_id": MAGIC_SMART_HOMES_WS,
+            "filter_document_ids": [note_id],
+            "filter_sensitivities": ["public", "internal", "confidential"],
+        }).execute()
+        assert (low_tier.data or []) == [], "restricted content must not be retrievable by a non-restricted ladder"
+
+        authorized = supabase.rpc("match_chunks_hybrid", {
+            "query_text": "Executive compensation details for next fiscal year",
+            "query_embedding": _stand_in_vector(),
+            "match_count": 50,
+            "filter_workspace_id": MAGIC_SMART_HOMES_WS,
+            "filter_document_ids": [note_id],
+            "filter_sensitivities": ["public", "internal", "confidential", "restricted"],
+        }).execute()
+        assert authorized.data, "an authorized ladder must retrieve the restricted connector note"
+    finally:
+        _cleanup_notes(note_id)
+        _delete_test_connection(conn_id)
