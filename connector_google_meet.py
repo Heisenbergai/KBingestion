@@ -141,6 +141,7 @@ def _process_one_conference(conn: dict, token: str, workspace_id: str, record: d
             )
             google.resolve_drive_references_in_text(
                 workspace_id, transcript_text, "knowledge_note", note_id,
+                connection_id=conn["id"],
             )
             status = "noted"
             created_any = True

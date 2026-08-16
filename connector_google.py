@@ -22,15 +22,22 @@ are left in place, unused by this module for now, in case a future explicit
 product decision authorizes individual-file import — see that module's
 docstring.
 
-ONE CONNECTION PER WORKSPACE covers all four surfaces (Correction 1 of the
-scope lock: provider stays "google_drive", not renamed to "google_workspace").
+Each Google CONNECTION (a workspace may have several — multi-integration
+management, 2026-08-16, e.g. "CEO Personal Google" + "Company Workspace
+Google" as two separate connection rows) covers up to all four surfaces.
 `connections.config.enabled_surfaces` (a list of "calendar"|"meet"|"chat"|
 "drive") controls which OAuth scopes get requested and which pollers treat
-this connection as theirs — see SURFACE_SCOPES / scopes_for_surfaces() below.
+that ONE connection as theirs — see SURFACE_SCOPES / scopes_for_surfaces()
+below. Provider stays "google_drive" for every Google connection regardless
+of which surfaces it covers (Correction 1 of the original scope lock).
 
 CREDENTIAL MODEL (single-tenant, same as Slack — see 09_company_brain_roadmap.md):
 Each CUSTOMER creates their own project in Google Cloud Console and pastes its
-client_id / client_secret into the Integrations panel.
+client_id / client_secret into the Integrations panel — ONE credential set
+per workspace+provider, shared by every Google connection in that workspace
+(there's no per-connection credential storage; two Google connections in one
+workspace are necessarily authorized through the same Google Cloud OAuth
+client, just against different real Google accounts).
 """
 import os
 import re
@@ -96,45 +103,32 @@ def _google_credentials(workspace_id: str) -> tuple[str, str]:
     return creds["client_id"], creds["client_secret"]
 
 
-def _existing_enabled_surfaces(workspace_id: str) -> list[str]:
-    """
-    The current connection's already-granted surfaces, if any -- ONE Google
-    connection per workspace (never a second row), so enabling a new surface
-    means RE-consenting on the same connection with a wider scope, never
-    silently assuming an old token already covers it. Looks at any
-    non-revoked row (matches list_integrations' own convention) so an
-    'error'-status connection (e.g. token needs a refresh) still counts as
-    "this workspace already has a Google connection" for merge purposes.
-    """
-    rows = bc.supabase.table("connections").select("config") \
-        .eq("workspace_id", workspace_id).eq("provider", "google_drive") \
-        .neq("status", "revoked").execute().data or []
-    if not rows:
-        return []
-    return [s for s in (rows[0].get("config") or {}).get("enabled_surfaces", []) if s in VALID_SURFACES]
-
-
-def build_install_url(workspace_id: str, user_id: str = "",
+def build_install_url(workspace_id: str, user_id: str, connection_id: str,
                       enabled_surfaces: Optional[list[str]] = None) -> str:
     """
-    Mirrors connector_slack.build_install_url — see its docstring. Scope
-    string is built from the UNION of already-granted surfaces (if a
-    connection already exists) and newly-requested ones — re-consenting
-    to add Meet must never silently drop Drive, and requesting a fresh
-    consent for the full union (rather than trusting the old token already
-    covers the new surface) is deliberate, not an oversight: Google doesn't
-    reliably let you widen an existing token's scope any other way. The
-    chosen surfaces are also sealed into the Fernet-signed OAuth state
-    (Google's redirect_uri is fixed and registered with Google in advance,
-    so it can't carry a dynamic query param the way a plain link could) —
-    google_callback() reads them back out of state, not from any callback
-    query param, and independently re-merges with whatever's currently
-    saved as a second safety net against a stale/raced client request.
+    Mirrors connector_slack.build_install_url — see its docstring. Sealed to
+    ONE specific connection_id (multi-integration management, 2026-08-16:
+    a workspace may have several Google connections, so both a brand-new
+    "+ Add integration" and a "re-consent to add a surface" on an existing
+    connection must name exactly which connection_id they're for).
+
+    Scope string is the UNION of that connection's already-granted surfaces
+    (read directly off its row — empty for a fresh pending connection) and
+    newly-requested ones — re-consenting to add Meet on an existing
+    connection must never silently drop Drive. Requesting a fresh consent
+    for the full union (rather than trusting the old token already covers
+    the new surface) is deliberate: Google doesn't reliably let you widen
+    an existing token's scope any other way.
     """
     client_id, _ = _google_credentials(workspace_id)
+    conn = bc.get_connection_for_workspace(connection_id, workspace_id)
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connection not found.")
+    existing = [s for s in (conn.get("config") or {}).get("enabled_surfaces", []) if s in VALID_SURFACES]
     requested = [s for s in (enabled_surfaces or ["drive"]) if s in VALID_SURFACES]
-    enabled = list(dict.fromkeys(_existing_enabled_surfaces(workspace_id) + requested)) or ["drive"]
-    state = bc.encode_oauth_state(workspace_id, user_id, extra={"surfaces": enabled})
+    enabled = list(dict.fromkeys(existing + requested)) or ["drive"]
+    state = bc.encode_oauth_state(workspace_id, user_id,
+                                  extra={"connection_id": connection_id, "surfaces": enabled})
     scope = scopes_for_surfaces(enabled)
     return (
         "https://accounts.google.com/o/oauth2/v2/auth"
@@ -148,32 +142,44 @@ def build_install_url(workspace_id: str, user_id: str = "",
 
 
 @router.get("/google/install")
-async def google_install(workspace_id: str, user_id: str = "", surfaces: str = "drive",
-                         auth: AuthContext = Depends(current_user)):
+async def google_install(workspace_id: str, connection_id: str, user_id: str = "",
+                         surfaces: str = "drive", auth: AuthContext = Depends(current_user)):
     """Redirect variant of the install URL, for non-browser callers. `surfaces`
     is a comma-separated list, e.g. "calendar,meet,chat,drive"."""
     auth.assert_workspace(workspace_id)
     enabled = [s.strip() for s in surfaces.split(",") if s.strip() in VALID_SURFACES]
-    return RedirectResponse(build_install_url(workspace_id, user_id, enabled or ["drive"]))
+    return RedirectResponse(build_install_url(workspace_id, user_id, connection_id, enabled or ["drive"]))
 
 
 @router.get("/google/oauth/callback")
 async def google_callback(code: str = "", state: str = "", error: str = ""):
-    """Exchanges the OAuth code for tokens and stores the connection, with
-    enabled_surfaces (read back from the signed state — see build_install_url)
-    persisted into config so every poller/resolver knows which surfaces this
-    connection actually consented to."""
+    """Exchanges the OAuth code for tokens and finalizes the ONE pending/
+    existing connection named in state — an UPDATE by connection_id, never
+    an upsert-by-team-id guess (see connector_slack.slack_callback's
+    docstring for the full reasoning). enabled_surfaces (read back from the
+    signed state — see build_install_url) is persisted into that row's
+    config so every poller/resolver knows which surfaces THIS connection
+    actually consented to."""
     from integrations import oauth_complete_html
     if error:
         return oauth_complete_html("google_drive", "error")
     st = bc.decode_oauth_state(state)
     workspace_id, user_id = st["w"], st.get("u", "")
+    connection_id = st.get("connection_id")
     requested = [s for s in st.get("surfaces", ["drive"]) if s in VALID_SURFACES]
-    # Re-merge with whatever's currently saved -- covers the case where the
-    # existing connection changed between mint-URL and callback (a second
-    # safety net; build_install_url already merged once when the state was
+    if not connection_id:
+        print(f"[google] oauth callback missing connection_id in state for workspace={workspace_id}")
+        return oauth_complete_html("google_drive", "error")
+    conn = bc.get_connection_for_workspace(connection_id, workspace_id)
+    if not conn:
+        print(f"[google] oauth callback: connection {connection_id} not found/owned by workspace {workspace_id}")
+        return oauth_complete_html("google_drive", "error")
+    # Re-merge with whatever's currently saved on THIS row -- covers the
+    # case where it changed between mint-URL and callback (a second safety
+    # net; build_install_url already merged once when the state was
     # sealed, so in the normal case this is a no-op union with itself).
-    enabled = list(dict.fromkeys(_existing_enabled_surfaces(workspace_id) + requested)) or ["drive"]
+    existing = [s for s in (conn.get("config") or {}).get("enabled_surfaces", []) if s in VALID_SURFACES]
+    enabled = list(dict.fromkeys(existing + requested)) or ["drive"]
     client_id, client_secret = _google_credentials(workspace_id)
 
     res = httpx.post("https://oauth2.googleapis.com/token", data={
@@ -183,6 +189,9 @@ async def google_callback(code: str = "", state: str = "", error: str = ""):
     data = res.json()
     if "access_token" not in data:
         print(f"[google] oauth exchange failed: {data}")
+        bc.supabase.table("connections").update(
+            {"status": "error", "error_detail": f"OAuth exchange failed: {data.get('error', 'unknown')}"}
+        ).eq("id", connection_id).execute()
         return oauth_complete_html("google_drive", "error")
 
     if not data.get("refresh_token"):
@@ -196,9 +205,7 @@ async def google_callback(code: str = "", state: str = "", error: str = ""):
 
     expires_at = (datetime.now(timezone.utc) + timedelta(seconds=data.get("expires_in", 3600))).isoformat()
 
-    row = {
-        "workspace_id":       workspace_id,
-        "provider":           "google_drive",
+    update_row = {
         "external_team_id":   account_email,       # one Google account = one "team" here
         "external_team_name": account_email,
         "access_token_enc":   bc.encrypt_secret(data["access_token"]),
@@ -209,9 +216,18 @@ async def google_callback(code: str = "", state: str = "", error: str = ""):
         "connected_by":       user_id,
         "config":             {"enabled_surfaces": enabled},
     }
-    bc.supabase.table("connections").upsert(
-        row, on_conflict="workspace_id,provider,external_team_id"
-    ).execute()
+    try:
+        bc.supabase.table("connections").update(update_row).eq("id", connection_id).execute()
+    except Exception as e:
+        # This exact Google account is already connected via a DIFFERENT
+        # connection row in this workspace (unique index on workspace_id+
+        # provider+external_team_id) -- fail visibly, leave the row
+        # disconnectable/retryable rather than a silent overwrite.
+        print(f"[google] failed to finalize connection {connection_id}: {e}")
+        bc.supabase.table("connections").update(
+            {"status": "error", "error_detail": f"Could not finish connecting: {e}"}
+        ).eq("id", connection_id).execute()
+        return oauth_complete_html("google_drive", "error")
 
     return oauth_complete_html("google_drive", "connected")
 
@@ -265,7 +281,8 @@ def _valid_access_token(conn: dict) -> Optional[str]:
     return refresh_access_token(conn)
 
 
-def get_active_connection(workspace_id: str, required_surface: str) -> Optional[dict]:
+def get_active_connection(workspace_id: str, required_surface: str,
+                          connection_id: Optional[str] = None) -> Optional[dict]:
     """
     Shared fail-closed lookup used by every Google Workspace poller
     (Calendar/Meet/Chat) and by resolve_drive_reference(): a connection is
@@ -276,9 +293,27 @@ def get_active_connection(workspace_id: str, required_surface: str) -> Optional[
     Workspace scope-lock notes on why this check cannot be pushed down into
     any RPC (connections lives in a different Supabase project from
     knowledge_items/app-DB tables).
+
+    connection_id (multi-integration management, 2026-08-16): when given,
+    resolves EXACTLY that connection (still re-verifying workspace/status/
+    surface — a caller passing a stale or wrong id gets None, never a
+    different connection). This is what lets Drive-reference resolution
+    prefer the SAME Google connection that captured the Meet/Chat note
+    mentioning the file, rather than an arbitrary one when a workspace has
+    several Google connections. Omitted (the pre-multi-connection default),
+    this returns the first active connection with the surface enabled --
+    still correct for workspaces with only one Google connection, and for
+    callers (worker.py's pollers) that already iterate every matching
+    connection themselves and pass each one's own id downstream.
     """
     if required_surface not in VALID_SURFACES:
         return None
+    if connection_id:
+        conn = bc.get_connection_for_workspace(connection_id, workspace_id)
+        if not conn or conn.get("provider") != "google_drive" or conn.get("status") != "active":
+            return None
+        enabled = (conn.get("config") or {}).get("enabled_surfaces", [])
+        return conn if required_surface in enabled else None
     conns = bc.supabase.table("connections").select("*") \
         .eq("workspace_id", workspace_id).eq("provider", "google_drive") \
         .eq("status", "active").execute().data or []
@@ -317,7 +352,8 @@ def extract_drive_file_ids(text: str) -> list[str]:
 
 
 def resolve_drive_reference(workspace_id: str, file_id: str,
-                            linked_object_type: str, linked_object_id: str) -> Optional[dict]:
+                            linked_object_type: str, linked_object_id: str,
+                            connection_id: Optional[str] = None) -> Optional[dict]:
     """
     THE ONLY Drive read path left in this codebase that touches a file's
     content-adjacent metadata, and even this never reads the file's bytes —
@@ -326,12 +362,18 @@ def resolve_drive_reference(workspace_id: str, file_id: str,
     see the UNIQUE constraint on external_references) exactly one reference
     row. No knowledge_items row, no Storage write, ever.
 
+    connection_id: prefer resolving through the SAME Google connection that
+    captured the Meet/Chat note mentioning this file (that's the account
+    with actual read access to it) -- falls back to "any Drive-enabled
+    connection in the workspace" only when not given, same as
+    get_active_connection().
+
     Returns the reference dict, or None if no active Drive-enabled
     connection exists for this workspace, or the file isn't reachable
     (deleted, no permission) — logged, never raised, since a broken Drive
     link inside an otherwise-good Meet/Chat note must not cost the note.
     """
-    conn = get_active_connection(workspace_id, "drive")
+    conn = get_active_connection(workspace_id, "drive", connection_id=connection_id)
     if not conn:
         print(f"[google] no active Drive-enabled connection for workspace {workspace_id}, skipping reference")
         return None
@@ -362,13 +404,17 @@ def resolve_drive_reference(workspace_id: str, file_id: str,
 
 
 def resolve_drive_references_in_text(workspace_id: str, text: str,
-                                     linked_object_type: str, linked_object_id: str) -> list[dict]:
+                                     linked_object_type: str, linked_object_id: str,
+                                     connection_id: Optional[str] = None) -> list[dict]:
     """Convenience wrapper: scans text for Drive links and resolves each one
     found. Used by connector_google_meet.py / connector_google_chat.py right
-    after a note is created, on the note's own body/transcript text."""
+    after a note is created, on the note's own body/transcript text --
+    connection_id should be that Meet/Chat connection's own id, so Drive
+    links resolve through the account that actually captured them."""
     refs = []
     for file_id in extract_drive_file_ids(text):
-        ref = resolve_drive_reference(workspace_id, file_id, linked_object_type, linked_object_id)
+        ref = resolve_drive_reference(workspace_id, file_id, linked_object_type, linked_object_id,
+                                      connection_id=connection_id)
         if ref:
             refs.append(ref)
     return refs

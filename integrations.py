@@ -223,18 +223,23 @@ def _provider_public(pid: str, p: dict) -> dict:
 async def list_integrations(workspace_id: str,
                             auth: AuthContext = Depends(current_user)):
     """
-    Everything the admin Integrations page needs: every provider with its
-    live connection status for this workspace. The page renders purely from
-    this — no provider-specific frontend code.
+    Everything the admin Integrations page needs: every provider with EVERY
+    one of its connections for this workspace (multi-integration
+    management, 2026-08-16: a workspace may have several connections for
+    the same provider — this no longer collapses to one, each provider
+    entry carries a `connections` LIST, possibly empty). The page renders
+    purely from this — no provider-specific frontend code.
     """
     if not workspace_id:
         raise HTTPException(status_code=400, detail="workspace_id is required.")
     auth.assert_workspace(workspace_id)
 
     conns = bc.supabase.table("connections").select(
-        "id, provider, external_team_name, status, error_detail, config, created_at"
-    ).eq("workspace_id", workspace_id).neq("status", "revoked").execute().data or []
-    by_provider = {c["provider"]: c for c in conns}
+        "id, provider, display_name, external_team_name, status, error_detail, config, created_at"
+    ).eq("workspace_id", workspace_id).neq("status", "revoked").order("created_at").execute().data or []
+    by_provider: dict[str, list[dict]] = {}
+    for c in conns:
+        by_provider.setdefault(c["provider"], []).append(c)
 
     creds_rows = bc.supabase.table("provider_credentials").select("provider") \
         .eq("workspace_id", workspace_id).execute().data or []
@@ -244,35 +249,91 @@ async def list_integrations(workspace_id: str,
     for pid, p in PROVIDERS.items():
         entry = _provider_public(pid, p)
         entry["credentials_configured"] = pid in configured_providers
-        conn = by_provider.get(pid)
-        if conn and p["status"] == "available":
-            cfg = conn.get("config") or {}
-            entry["status"] = "connected" if conn.get("status") == "active" else conn.get("status", "connected")
-            entry["connection"] = {
-                "id": conn["id"],
-                "team": conn.get("external_team_name"),
-                "connected_at": conn.get("created_at"),
+        provider_conns = by_provider.get(pid, []) if p["status"] == "available" else []
+        entry["connections"] = [
+            {
+                "id":                  c["id"],
+                "display_name":        c.get("display_name"),
+                "team":                c.get("external_team_name"),
+                "status":              c.get("status"),
+                "connected_at":        c.get("created_at"),
                 # "resources_selected" covers both Slack's channels and Drive's
-                # folders — one generic count so the frontend doesn't need a
-                # provider-specific field name for what is conceptually the
-                # same thing (how many things this connection watches).
-                "resources_selected": len(cfg.get("channels", cfg.get("folders", []))),
-                "error": conn.get("error_detail"),
+                # (legacy) folders — one generic count so the frontend doesn't
+                # need a provider-specific field name for what is conceptually
+                # the same thing (how many things this connection watches).
+                "resources_selected":  len((c.get("config") or {}).get(
+                    "channels", (c.get("config") or {}).get("folders", []))),
+                "error":               c.get("error_detail"),
                 # google_drive only (see connector_google.py) -- lets the
                 # frontend seed a surface picker with what's already granted
-                # so re-consenting to add one never looks like it's asking
-                # to re-pick everything from scratch.
-                "enabled_surfaces": cfg.get("enabled_surfaces", []),
+                # on THIS connection, so re-consenting to add one never
+                # looks like it's asking to re-pick everything from scratch.
+                "enabled_surfaces":    (c.get("config") or {}).get("enabled_surfaces", []),
             }
-        else:
-            entry["connection"] = None
+            for c in provider_conns
+        ]
         items.append(entry)
 
     return {
         "categories": CATEGORY_ORDER,
         "railway_base": RAILWAY_BASE,
         "integrations": items,
+        "active_connections_count": bc.count_active_connections(workspace_id),
+        "max_active_connections": bc.MAX_ACTIVE_CONNECTIONS_PER_WORKSPACE,
     }
+
+
+class CreateConnectionRequest(BaseModel):
+    workspace_id: str
+    provider:     str
+    display_name: Optional[str] = None
+    user_id:      Optional[str] = ""
+
+
+@router.post("/integrations/connections")
+async def create_connection(body: CreateConnectionRequest,
+                            auth: AuthContext = Depends(current_user)):
+    """
+    "+ Add integration": creates a real connection_id immediately, BEFORE
+    OAuth (or, for API-key providers, before the key is even entered) —
+    this is what makes Disconnect always available regardless of how far
+    setup gets. Server-side 10-active-integration limit enforced inside
+    bc.create_pending_connection (never rely on the UI alone to block an
+    11th). A workspace may have any number of connections for the SAME
+    provider — this deliberately does not check for an existing one.
+    """
+    auth.assert_workspace(body.workspace_id)
+    p = PROVIDERS.get(body.provider)
+    if not p:
+        raise HTTPException(status_code=404, detail=f"Unknown provider '{body.provider}'.")
+    if p["status"] != "available":
+        raise HTTPException(status_code=400, detail=f"{p['name']} integration is coming soon.")
+
+    conn = bc.create_pending_connection(
+        body.workspace_id, body.provider,
+        display_name=body.display_name, connected_by=body.user_id or "",
+    )
+    return {"success": True, "connection_id": conn["id"], "status": conn["status"]}
+
+
+class RenameConnectionRequest(BaseModel):
+    workspace_id: str
+    display_name: Optional[str] = None
+
+
+@router.patch("/integrations/connections/{connection_id}")
+async def rename_connection_route(connection_id: str, body: RenameConnectionRequest,
+                                  auth: AuthContext = Depends(current_user)):
+    """
+    Renames ONLY this connection. display_name is purely descriptive
+    metadata — it never affects authorization, workspace isolation,
+    provider routing, or replaces connection_id as identity. Ownership is
+    verified via bc.get_connection_for_workspace (workspace A can never
+    rename workspace B's connection) before anything is written.
+    """
+    auth.assert_workspace(body.workspace_id)
+    conn = bc.rename_connection(connection_id, body.workspace_id, body.display_name)
+    return {"success": True, "connection_id": conn["id"], "display_name": conn["display_name"]}
 
 
 class ApiKeyConnectRequest(BaseModel):
@@ -280,6 +341,7 @@ class ApiKeyConnectRequest(BaseModel):
     provider:     str
     api_key:      str
     user_id:      Optional[str] = ""
+    display_name: Optional[str] = None
     config:       Optional[dict] = {}
 
 
@@ -288,8 +350,10 @@ async def connect_api_key(body: ApiKeyConnectRequest,
                           auth: AuthContext = Depends(current_user)):
     """
     Connect an API-key-based provider (e.g. Confluence). OAuth providers use
-    their own /{provider}/install popup instead. Stored encrypted, same as
-    OAuth tokens. Refuses providers that aren't 'available' yet.
+    their own two-step flow instead (POST /integrations/connections then
+    POST /integrations/oauth-url). Stored encrypted, same as OAuth tokens.
+    Refuses providers that aren't 'available' yet, and enforces the same
+    10-active-integration server-side limit as the OAuth path.
     """
     auth.assert_workspace(body.workspace_id)
 
@@ -302,18 +366,25 @@ async def connect_api_key(body: ApiKeyConnectRequest,
         raise HTTPException(status_code=400, detail=f"{p['name']} integration is coming soon.")
     if not body.api_key.strip():
         raise HTTPException(status_code=400, detail="API key is required.")
+    if bc.count_active_connections(body.workspace_id) >= bc.MAX_ACTIVE_CONNECTIONS_PER_WORKSPACE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"This workspace already has {bc.MAX_ACTIVE_CONNECTIONS_PER_WORKSPACE} active "
+                   f"integrations, the maximum. Disconnect one before adding another.",
+        )
 
     row = {
         "workspace_id":     body.workspace_id,
         "provider":         body.provider,
+        "display_name":     (body.display_name or "").strip() or None,
         "external_team_name": p["name"],
         "access_token_enc": bc.encrypt_secret(body.api_key.strip()),
         "status":           "active",
         "connected_by":     body.user_id,
         "config":           body.config or {},
     }
-    bc.supabase.table("connections").insert(row).execute()
-    return {"success": True, "provider": body.provider}
+    result = bc.supabase.table("connections").insert(row).execute()
+    return {"success": True, "provider": body.provider, "connection_id": result.data[0]["id"]}
 
 
 def _require_admin(auth: AuthContext, workspace_id: str) -> None:
@@ -410,13 +481,13 @@ async def get_credentials_status(workspace_id: str, provider: str,
 
 
 class OAuthUrlRequest(BaseModel):
-    workspace_id: str
-    provider:     str
-    user_id:      Optional[str] = ""
+    workspace_id:  str
+    provider:      str
+    connection_id: str
+    user_id:       Optional[str] = ""
     # google_drive only (see connector_google.SURFACE_SCOPES / VALID_SURFACES):
     # which of calendar/meet/chat/drive the admin picked when connecting.
-    # Ignored by every other provider. Defaults to ["drive"] (the pre-scope-
-    # lock behavior) if omitted, so an unmodified frontend keeps working.
+    # Ignored by every other provider. Defaults to ["drive"] if omitted.
     enabled_surfaces: Optional[list[str]] = None
 
 
@@ -424,14 +495,19 @@ class OAuthUrlRequest(BaseModel):
 async def oauth_url(body: OAuthUrlRequest,
                     auth: AuthContext = Depends(current_user)):
     """
-    Mints the provider's OAuth consent URL for one workspace.
+    Mints the OAuth consent URL for ONE already-created connection (see
+    POST /integrations/connections — must be called first). connection_id
+    is required and re-verified against the caller's authenticated
+    workspace_id (never trusted from the client for anything but that
+    proof) — this is what lets a workspace have several connections for
+    the same provider without one flow ever being able to touch another.
 
-    This exists because a popup navigation cannot carry an Authorization header,
-    so the old "just open /{provider}/install?workspace_id=…" pattern could not be
-    authenticated at all — any workspace UUID was enough to start a flow that
-    attached the attacker's Slack team to that workspace. The membership check
-    happens here, and the workspace is then sealed into the Fernet-signed state,
-    so the popup itself carries no credential and needs none.
+    This exists as a POST because a popup navigation cannot carry an
+    Authorization header, so the old "just open /{provider}/install?..."
+    pattern could not be authenticated at all. The membership + ownership
+    checks happen here, and the connection is then sealed into the
+    Fernet-signed OAuth state, so the popup itself carries no credential
+    and needs none.
     """
     auth.assert_workspace(body.workspace_id)
 
@@ -443,32 +519,35 @@ async def oauth_url(body: OAuthUrlRequest,
     if p["status"] != "available":
         raise HTTPException(status_code=400, detail=f"{p['name']} integration is coming soon.")
 
+    conn = bc.get_connection_for_workspace(body.connection_id, body.workspace_id)
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connection not found.")
+    if conn["provider"] != body.provider:
+        raise HTTPException(status_code=400, detail="Connection does not belong to this provider.")
+    # Modifying an already-ACTIVE connection (re-consenting to widen scope —
+    # e.g. add a Google surface — or reconnecting after an 'error') is
+    # admin-gated, same bar as /integrations/credentials. A brand-new
+    # 'pending' connection (first-time setup) stays open to any workspace
+    # member, matching every provider's un-gated first Connect.
+    if conn["status"] == "active":
+        _require_admin(auth, body.workspace_id)
+
     if body.provider == "slack":
         import connector_slack
-        url = connector_slack.build_install_url(body.workspace_id, body.user_id or "")
+        url = connector_slack.build_install_url(body.workspace_id, body.user_id or "", body.connection_id)
     elif body.provider == "google_drive":
         import connector_google
-        # Modifying an EXISTING connection's surfaces (re-consenting to add
-        # Meet/Chat/Calendar) is admin-gated, same bar as
-        # /integrations/credentials -- the first-ever connect for this
-        # workspace stays open to any member, matching every other
-        # provider's un-gated Connect button.
-        already_connected = bc.supabase.table("connections").select("id") \
-            .eq("workspace_id", body.workspace_id).eq("provider", "google_drive") \
-            .neq("status", "revoked").execute().data
-        if already_connected:
-            _require_admin(auth, body.workspace_id)
         url = connector_google.build_install_url(
-            body.workspace_id, body.user_id or "", body.enabled_surfaces,
+            body.workspace_id, body.user_id or "", body.connection_id, body.enabled_surfaces,
         )
     elif body.provider == "zoom":
         import connector_zoom
-        url = connector_zoom.build_install_url(body.workspace_id, body.user_id or "")
+        url = connector_zoom.build_install_url(body.workspace_id, body.user_id or "", body.connection_id)
     else:
         # This is the one line each new OAuth connector must add here.
         raise HTTPException(status_code=400, detail=f"No OAuth builder for '{body.provider}'.")
 
-    return {"url": url, "provider": body.provider}
+    return {"url": url, "provider": body.provider, "connection_id": body.connection_id}
 
 
 def oauth_complete_html(provider: str, status: str) -> HTMLResponse:

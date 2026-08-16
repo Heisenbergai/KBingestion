@@ -183,25 +183,30 @@ def _slack_client_credentials(workspace_id: str) -> tuple[str, str]:
     )
 
 
-def build_install_url(workspace_id: str, user_id: str = "") -> str:
+def build_install_url(workspace_id: str, user_id: str, connection_id: str) -> str:
     """
-    The Slack consent URL for one workspace, with the workspace baked into a
-    Fernet-signed state so the callback cannot be pointed at someone else's
-    workspace. Shared with POST /integrations/oauth-url, which is what the
-    browser actually uses — a popup navigation cannot carry an Authorization
-    header, so the URL is minted by an authenticated call and only then opened.
+    The Slack consent URL for one SPECIFIC connection row (multi-integration
+    management, 2026-08-16: a workspace may have several Slack connections,
+    so the state must name exactly which pending/existing connection_id
+    this consent is for -- not just which workspace). The connection is
+    sealed into a Fernet-signed state so a stale/forged callback can never
+    complete a DIFFERENT connection. Shared with POST /integrations/oauth-url,
+    which is what the browser actually uses — a popup navigation cannot
+    carry an Authorization header, so the URL is minted by an authenticated
+    call and only then opened.
     """
     client_id, _ = _slack_client_credentials(workspace_id)
-    state = _encode_state(workspace_id, user_id)
+    state = _encode_state(workspace_id, user_id, extra={"connection_id": connection_id})
     return (f"https://slack.com/oauth/v2/authorize?client_id={client_id}"
             f"&scope={SLACK_SCOPES}&redirect_uri={REDIRECT_URI}&state={state}")
 
 
 @router.get("/slack/install")
-async def slack_install(workspace_id: str, user_id: str = "",
+async def slack_install(workspace_id: str, connection_id: str, user_id: str = "",
                         auth: AuthContext = Depends(current_user)):
     """
-    Redirects the admin to Slack's consent screen.
+    Redirects the admin to Slack's consent screen for one specific,
+    already-created pending connection (see POST /integrations/connections).
 
     Authenticated: without this check anyone could mint a valid state for a
     workspace they do not belong to and bind their own Slack team to it —
@@ -209,17 +214,30 @@ async def slack_install(workspace_id: str, user_id: str = "",
     POST /integrations/oauth-url instead, which returns the same URL as JSON.
     """
     auth.assert_workspace(workspace_id)
-    return RedirectResponse(build_install_url(workspace_id, user_id))
+    if not bc.get_connection_for_workspace(connection_id, workspace_id):
+        raise HTTPException(status_code=404, detail="Connection not found.")
+    return RedirectResponse(build_install_url(workspace_id, user_id, connection_id))
 
 
 @router.get("/slack/oauth/callback")
 async def slack_callback(code: str = "", state: str = "", error: str = ""):
-    """Exchanges the OAuth code for a token and stores the connection."""
+    """Exchanges the OAuth code for a token and finalizes the ONE pending
+    connection named in state — never an upsert-by-team-id guess, an UPDATE
+    by connection_id, so a stale/forged callback structurally cannot touch
+    a different connection."""
     from integrations import oauth_complete_html
     if error:
         return oauth_complete_html("slack", "error")
     st = _decode_state(state)
     workspace_id, user_id = st["w"], st.get("u", "")
+    connection_id = st.get("connection_id")
+    if not connection_id:
+        print(f"[slack] oauth callback missing connection_id in state for workspace={workspace_id}")
+        return oauth_complete_html("slack", "error")
+    if not bc.get_connection_for_workspace(connection_id, workspace_id):
+        print(f"[slack] oauth callback: connection {connection_id} not found/owned by workspace {workspace_id}")
+        return oauth_complete_html("slack", "error")
+
     client_id, client_secret = _slack_client_credentials(workspace_id)
 
     res = httpx.post("https://slack.com/api/oauth.v2.access", data={
@@ -229,14 +247,15 @@ async def slack_callback(code: str = "", state: str = "", error: str = ""):
     data = res.json()
     if not data.get("ok"):
         print(f"[slack] oauth exchange failed: {data.get('error')}")
+        bc.supabase.table("connections").update(
+            {"status": "error", "error_detail": f"OAuth exchange failed: {data.get('error')}"}
+        ).eq("id", connection_id).execute()
         return oauth_complete_html("slack", "error")
 
     team = data.get("team", {})
     access_token = data.get("access_token")  # bot token (xoxb-…)
 
-    row = {
-        "workspace_id":       workspace_id,
-        "provider":           "slack",
+    update_row = {
         "external_team_id":   team.get("id"),
         "external_team_name": team.get("name"),
         "access_token_enc":   bc.encrypt_secret(access_token),
@@ -245,24 +264,31 @@ async def slack_callback(code: str = "", state: str = "", error: str = ""):
         # oauth.v2.access response, per Slack's documented OAuth v2 shape) --
         # stored so a live webhook event (which also carries this as
         # api_app_id) can disambiguate WHICH connection it belongs to when
-        # the same Slack team is connected to more than one Knova workspace
-        # (real, legitimate case: connections' true uniqueness is
-        # (workspace_id, provider, external_team_id), not external_team_id
-        # alone -- see 2026-08-15 routing fix). Only helps when the two
-        # installs used genuinely different Slack apps; if they share the
-        # same app (e.g. both used the env-var fallback), app_id is
-        # identical too and the event stays genuinely ambiguous -- see
-        # _resolve_slack_connection's fail-closed handling for that case.
+        # the same Slack team is connected more than once in this workspace
+        # (real, legitimate case now that multiple same-provider connections
+        # are explicitly supported). Only helps when the two installs used
+        # genuinely different Slack apps; if they share the same app (e.g.
+        # both used the env-var fallback), app_id is identical too and the
+        # event stays genuinely ambiguous -- see _resolve_slack_connection's
+        # fail-closed handling for that case, unchanged by this refactor.
         "app_id":             data.get("app_id"),
         "scopes":             data.get("scope", SLACK_SCOPES),
         "status":             "active",
         "connected_by":       user_id,
-        "config":             {},
     }
-    # upsert so reconnecting the same Slack workspace refreshes the token
-    bc.supabase.table("connections").upsert(
-        row, on_conflict="workspace_id,provider,external_team_id"
-    ).execute()
+    try:
+        bc.supabase.table("connections").update(update_row).eq("id", connection_id).execute()
+    except Exception as e:
+        # Real, expected case: this exact Slack team is already connected
+        # via a DIFFERENT connection row in this workspace (unique index
+        # on workspace_id+provider+external_team_id) -- fail visibly, not
+        # silently, and leave the pending row in a state the admin can see
+        # and disconnect/retry from.
+        print(f"[slack] failed to finalize connection {connection_id}: {e}")
+        bc.supabase.table("connections").update(
+            {"status": "error", "error_detail": f"Could not finish connecting: {e}"}
+        ).eq("id", connection_id).execute()
+        return oauth_complete_html("slack", "error")
 
     return oauth_complete_html("slack", "connected")
 

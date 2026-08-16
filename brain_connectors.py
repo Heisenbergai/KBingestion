@@ -126,6 +126,100 @@ def has_provider_credentials(workspace_id: str, provider: str) -> bool:
     return bool(row)
 
 
+# ── Multi-integration management (Phase 2, 2026-08-16) ──────────────────────────
+# A workspace may have MULTIPLE connections for the SAME provider (e.g. two
+# Slack teams, two Google accounts) -- the real unique index on `connections`
+# is (workspace_id, provider, external_team_id), confirmed live
+# (connections_provider_team_idx), so this was already schema-legal; the
+# gap was application code assuming one-per-provider in several places.
+# `connection_id` is the only real identity from here on -- workspace_id is
+# used solely to verify OWNERSHIP of a given connection_id, never as part of
+# how a connection is looked up or resolved.
+
+MAX_ACTIVE_CONNECTIONS_PER_WORKSPACE = 10
+# Statuses that occupy a slot. 'revoked' (soft-deleted via disconnect) never
+# counts. 'pending' (mid-setup, OAuth not finished) and 'error' (broken,
+# needs reconnect/disconnect) DO count -- they're real rows a user would
+# need to explicitly disconnect to free up, per the locked requirement
+# "if a pending/stuck connection counts temporarily, Disconnect must
+# immediately free that slot" (DELETE /connections/{id} already does,
+# unconditionally, regardless of status -- see disconnect() below).
+ACTIVE_CONNECTION_STATUSES = ("active", "error", "pending")
+
+
+def count_active_connections(workspace_id: str) -> int:
+    res = supabase.table("connections").select("id", count="exact") \
+        .eq("workspace_id", workspace_id).in_("status", list(ACTIVE_CONNECTION_STATUSES)) \
+        .execute()
+    return res.count or 0
+
+
+def create_pending_connection(workspace_id: str, provider: str,
+                              display_name: Optional[str] = None,
+                              connected_by: str = "") -> dict:
+    """
+    The row a brand-new "+ Add integration" click creates, BEFORE OAuth ever
+    starts -- this is what makes Disconnect always available regardless of
+    how far setup got (credentials saved but OAuth not started, popup
+    opened, cancelled, failed, partially completed): there's a real
+    connection_id to act on from the very first click, not just once OAuth
+    happens to succeed.
+
+    external_team_id is left NULL (not yet known -- OAuth hasn't resolved a
+    real account) -- Postgres treats multiple NULLs as distinct under the
+    unique index, so several pending rows for the same provider never
+    collide with each other or with a real connected row.
+
+    Raises HTTPException(400) if the workspace is already at the 10-active
+    limit -- enforced HERE, server-side, not just in the UI.
+    """
+    if count_active_connections(workspace_id) >= MAX_ACTIVE_CONNECTIONS_PER_WORKSPACE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"This workspace already has {MAX_ACTIVE_CONNECTIONS_PER_WORKSPACE} active "
+                   f"integrations, the maximum. Disconnect one before adding another.",
+        )
+    row = {
+        "workspace_id":  workspace_id,
+        "provider":      provider,
+        "external_team_id": None,
+        "status":        "pending",
+        "config":        {},
+        "connected_by":  connected_by,
+        "display_name":  (display_name or "").strip() or None,
+    }
+    result = supabase.table("connections").insert(row).execute()
+    return result.data[0]
+
+
+def get_connection_for_workspace(connection_id: str, workspace_id: str) -> Optional[dict]:
+    """
+    THE cross-tenant verification helper: a connection_id alone is never
+    trusted -- every operation that names one must also prove it belongs to
+    the CALLER'S authenticated workspace_id (never a client-supplied one
+    used for anything but that proof). Returns None both when the
+    connection doesn't exist AND when it belongs to a different workspace --
+    deliberately identical, same "never confirm existence to a non-member"
+    principle auth.py's assert_workspace already uses.
+    """
+    rows = supabase.table("connections").select("*").eq("id", connection_id).execute().data
+    if not rows or rows[0]["workspace_id"] != workspace_id:
+        return None
+    return rows[0]
+
+
+def rename_connection(connection_id: str, workspace_id: str, display_name: Optional[str]) -> dict:
+    """Renames ONLY this connection -- display_name is purely descriptive
+    metadata (never used for auth/routing/provider identity), so this is a
+    plain single-row update once ownership is verified."""
+    conn = get_connection_for_workspace(connection_id, workspace_id)
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connection not found.")
+    name = (display_name or "").strip() or None
+    supabase.table("connections").update({"display_name": name}).eq("id", connection_id).execute()
+    return {**conn, "display_name": name}
+
+
 # ── OAuth state (workspace_id + user_id, Fernet-signed so it can't be forged) ──
 # Shared by every OAuth connector (connector_slack.py, connector_google.py, …) —
 # the shape (which workspace + which user started the flow, plus a timestamp)
@@ -158,11 +252,27 @@ def get_provider_credentials_by_external_team(provider: str, external_team_id: s
     work with (Slack's event payload carries team_id, not our workspace_id).
     Used to verify a webhook against the RIGHT customer's signing secret
     before trusting anything else in the payload.
+
+    Multi-integration management (2026-08-16): the same external_team_id can
+    now legitimately belong to connections in MORE THAN ONE workspace (the
+    real, already-documented case: one Slack team connected into both "Test
+    company 1" and "Magic Smart Homes"). Picking an arbitrary row here would
+    be non-deterministic and could verify against the wrong workspace's
+    secret -- fails safe (signature check then fails, request rejected) but
+    is not something to leave to chance. Fails closed (returns None) when
+    more than one DISTINCT workspace has an active connection for this
+    external_team_id -- same "never guess" contract as
+    connector_slack._resolve_slack_connection.
     """
     conn = supabase.table("connections").select("workspace_id") \
         .eq("provider", provider).eq("external_team_id", external_team_id) \
         .eq("status", "active").execute().data
     if not conn:
+        return None
+    workspaces = {c["workspace_id"] for c in conn}
+    if len(workspaces) > 1:
+        print(f"[connections] AMBIGUOUS credential lookup: provider={provider} "
+              f"external_team_id={external_team_id} matches {len(workspaces)} workspaces — refusing to guess.")
         return None
     return get_provider_credentials(conn[0]["workspace_id"], provider)
 

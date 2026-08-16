@@ -90,10 +90,11 @@ def _zoom_credentials(workspace_id: str) -> tuple[str, str]:
     return creds["client_id"], creds["client_secret"]
 
 
-def build_install_url(workspace_id: str, user_id: str = "") -> str:
-    """Mirrors connector_slack.build_install_url — see its docstring."""
+def build_install_url(workspace_id: str, user_id: str, connection_id: str) -> str:
+    """Mirrors connector_slack.build_install_url — see its docstring. Sealed
+    to one specific connection_id (multi-integration management, 2026-08-16)."""
     client_id, _ = _zoom_credentials(workspace_id)
-    state = bc.encode_oauth_state(workspace_id, user_id)
+    state = bc.encode_oauth_state(workspace_id, user_id, extra={"connection_id": connection_id})
     return (
         "https://zoom.us/oauth/authorize"
         f"?response_type=code&client_id={client_id}&redirect_uri={REDIRECT_URI}"
@@ -102,11 +103,13 @@ def build_install_url(workspace_id: str, user_id: str = "") -> str:
 
 
 @router.get("/zoom/install")
-async def zoom_install(workspace_id: str, user_id: str = "",
+async def zoom_install(workspace_id: str, connection_id: str, user_id: str = "",
                        auth: AuthContext = Depends(current_user)):
     """Redirect variant, for non-browser callers — see connector_google.google_install."""
     auth.assert_workspace(workspace_id)
-    return RedirectResponse(build_install_url(workspace_id, user_id))
+    if not bc.get_connection_for_workspace(connection_id, workspace_id):
+        raise HTTPException(status_code=404, detail="Connection not found.")
+    return RedirectResponse(build_install_url(workspace_id, user_id, connection_id))
 
 
 def _token_request(workspace_id: str, data: dict) -> dict:
@@ -125,19 +128,31 @@ def _token_request(workspace_id: str, data: dict) -> dict:
 
 @router.get("/zoom/oauth/callback")
 async def zoom_callback(code: str = "", state: str = "", error: str = ""):
-    """Exchanges the OAuth code for tokens, stores the connection, then kicks
-    off a best-effort initial backfill (see backfill_recent_recordings)."""
+    """Exchanges the OAuth code for tokens and finalizes the ONE pending
+    connection named in state (see connector_slack.slack_callback's
+    docstring — same UPDATE-by-connection_id pattern, not an upsert-by-
+    team-id guess), then kicks off a best-effort initial backfill."""
     from integrations import oauth_complete_html
     if error:
         return oauth_complete_html("zoom", "error")
     st = bc.decode_oauth_state(state)
     workspace_id, user_id = st["w"], st.get("u", "")
+    connection_id = st.get("connection_id")
+    if not connection_id:
+        print(f"[zoom] oauth callback missing connection_id in state for workspace={workspace_id}")
+        return oauth_complete_html("zoom", "error")
+    if not bc.get_connection_for_workspace(connection_id, workspace_id):
+        print(f"[zoom] oauth callback: connection {connection_id} not found/owned by workspace {workspace_id}")
+        return oauth_complete_html("zoom", "error")
 
     data = _token_request(workspace_id, {
         "grant_type": "authorization_code", "code": code, "redirect_uri": REDIRECT_URI,
     })
     if "access_token" not in data:
         print(f"[zoom] oauth exchange failed: {data}")
+        bc.supabase.table("connections").update(
+            {"status": "error", "error_detail": f"OAuth exchange failed: {data.get('error', 'unknown')}"}
+        ).eq("id", connection_id).execute()
         return oauth_complete_html("zoom", "error")
 
     userinfo = httpx.get("https://api.zoom.us/v2/users/me",
@@ -147,9 +162,7 @@ async def zoom_callback(code: str = "", state: str = "", error: str = ""):
 
     expires_at = (datetime.now(timezone.utc) + timedelta(seconds=data.get("expires_in", 3600))).isoformat()
 
-    row = {
-        "workspace_id":       workspace_id,
-        "provider":           "zoom",
+    update_row = {
         "external_team_id":   account_id,
         "external_team_name": account_email or account_id,
         "access_token_enc":   bc.encrypt_secret(data["access_token"]),
@@ -158,17 +171,25 @@ async def zoom_callback(code: str = "", state: str = "", error: str = ""):
         "scopes":             data.get("scope", ZOOM_SCOPES),
         "status":             "active",
         "connected_by":       user_id,
-        "config":             {},
     }
-    conn = bc.supabase.table("connections").upsert(
-        row, on_conflict="workspace_id,provider,external_team_id"
-    ).execute().data[0]
+    try:
+        bc.supabase.table("connections").update(update_row).eq("id", connection_id).execute()
+    except Exception as e:
+        # This exact Zoom account is already connected via a DIFFERENT
+        # connection row in this workspace (unique index on workspace_id+
+        # provider+external_team_id) -- fail visibly, leave the row
+        # disconnectable/retryable.
+        print(f"[zoom] failed to finalize connection {connection_id}: {e}")
+        bc.supabase.table("connections").update(
+            {"status": "error", "error_detail": f"Could not finish connecting: {e}"}
+        ).eq("id", connection_id).execute()
+        return oauth_complete_html("zoom", "error")
 
     # Best-effort initial backfill — Zoom is otherwise entirely webhook-driven
     # (recording.completed), so nothing depends on this succeeding. Wrapped
     # so an uncertain endpoint/scope assumption (see module docstring) can't
     # break the connection itself.
-    threading.Thread(target=_safe_backfill, args=(conn["id"],), daemon=True).start()
+    threading.Thread(target=_safe_backfill, args=(connection_id,), daemon=True).start()
 
     return oauth_complete_html("zoom", "connected")
 
@@ -387,11 +408,27 @@ async def zoom_events(request: Request):
 
     if payload.get("event") == "recording.completed":
         obj = payload.get("payload", {}).get("object", {})
-        conn = bc.supabase.table("connections").select("*") \
+        candidates = bc.supabase.table("connections").select("*") \
             .eq("provider", "zoom").eq("external_team_id", account_id) \
-            .eq("status", "active").execute().data
+            .eq("status", "active").execute().data or []
+        # Multi-integration management (2026-08-16): more than one Zoom
+        # connection can legitimately share the same account_id (the same
+        # Zoom account connected into two different KNOVA workspaces, or
+        # twice into one for different purposes -- unique index is
+        # workspace_id+provider+external_team_id, so within ONE workspace
+        # this can't collide, but across workspaces it genuinely can).
+        # Zoom's webhook payload carries no second identifier the way
+        # Slack's api_app_id sometimes helps disambiguate -- so ANY
+        # ambiguity here fails closed rather than guessing which
+        # workspace's brain this recording belongs to. Same contract as
+        # connector_slack._resolve_slack_connection.
+        conn = None
+        if len(candidates) == 1:
+            conn = candidates[0]
+        elif len(candidates) > 1:
+            print(f"[zoom] AMBIGUOUS recording.completed: account_id={account_id} matches "
+                  f"{len(candidates)} active connections — refusing to guess, discarding event.")
         if conn:
-            conn = conn[0]
             token = _valid_access_token(conn)
             if token:
                 try:
