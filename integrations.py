@@ -211,6 +211,11 @@ def _provider_public(pid: str, p: dict) -> dict:
         "setup_fields":   p.get("setup_fields", []),
         "redirect_uri":   f"{RAILWAY_BASE}{p['redirect_path']}" if p.get("redirect_path") else None,
         "webhook_url":    f"{RAILWAY_BASE}{p['webhook_path']}" if p.get("webhook_path") else None,
+        # Toggleable data-source surfaces on ONE connection (google_drive
+        # only, today) -- see connector_google.SURFACE_SCOPES. A registry
+        # entry with no "surfaces" key (every other provider) sends [],
+        # which the frontend treats as "no surface picker for this one."
+        "surfaces": p.get("surfaces", []),
     }
 
 
@@ -253,6 +258,11 @@ async def list_integrations(workspace_id: str,
                 # same thing (how many things this connection watches).
                 "resources_selected": len(cfg.get("channels", cfg.get("folders", []))),
                 "error": conn.get("error_detail"),
+                # google_drive only (see connector_google.py) -- lets the
+                # frontend seed a surface picker with what's already granted
+                # so re-consenting to add one never looks like it's asking
+                # to re-pick everything from scratch.
+                "enabled_surfaces": cfg.get("enabled_surfaces", []),
             }
         else:
             entry["connection"] = None
@@ -438,6 +448,16 @@ async def oauth_url(body: OAuthUrlRequest,
         url = connector_slack.build_install_url(body.workspace_id, body.user_id or "")
     elif body.provider == "google_drive":
         import connector_google
+        # Modifying an EXISTING connection's surfaces (re-consenting to add
+        # Meet/Chat/Calendar) is admin-gated, same bar as
+        # /integrations/credentials -- the first-ever connect for this
+        # workspace stays open to any member, matching every other
+        # provider's un-gated Connect button.
+        already_connected = bc.supabase.table("connections").select("id") \
+            .eq("workspace_id", body.workspace_id).eq("provider", "google_drive") \
+            .neq("status", "revoked").execute().data
+        if already_connected:
+            _require_admin(auth, body.workspace_id)
         url = connector_google.build_install_url(
             body.workspace_id, body.user_id or "", body.enabled_surfaces,
         )

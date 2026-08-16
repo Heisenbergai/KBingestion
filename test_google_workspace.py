@@ -22,6 +22,8 @@ import connector_google_meet as gmeet
 import connector_google_chat as gchat
 import worker
 import brain_connectors as bc
+import integrations
+from auth import AuthContext
 
 TEST_COMPANY_1_WS = "4053915c-044b-4bb5-b2d5-8db8750ed5fa"
 
@@ -60,6 +62,11 @@ def test_scopes_for_surfaces_ignores_unknown_surface_names():
     assert "not_a_real_surface" not in scope
 
 
+def test_scopes_for_surfaces_drive_only():
+    scope = google.scopes_for_surfaces(["drive"])
+    assert scope == "https://www.googleapis.com/auth/drive.readonly"
+
+
 # =====================================================================
 # Connection resolution / fail-closed checks — shared by all three pollers
 # =====================================================================
@@ -69,6 +76,8 @@ class _FakeQuery:
         self._data = data
     def select(self, *_a, **_kw): return self
     def eq(self, *_a, **_kw): return self
+    def neq(self, *_a, **_kw): return self
+    def upsert(self, *_a, **_kw): return self
     def execute(self): return SimpleNamespace(data=self._data)
 
 
@@ -130,6 +139,159 @@ def test_each_poller_rejects_inactive_connection(monkeypatch, surface, poll_fn):
     ]))
     with pytest.raises(Exception, match="not.*active"):
         poll_fn("conn-1", "ws-1")
+
+
+# =====================================================================
+# Surface selector: adding surfaces to an EXISTING connection must union
+# with what's already granted, never silently drop it. Also: OAuth
+# cancellation/failure must leave the existing connection's
+# enabled_surfaces completely untouched, and only ONE row ever exists.
+# =====================================================================
+
+def test_build_install_url_merges_existing_surfaces_with_newly_requested(monkeypatch):
+    """Requirement 4: existing Drive connection adds Meet -> Drive remains
+    enabled. build_install_url is what decides the scope string AND what
+    gets sealed into state for the callback to save."""
+    monkeypatch.setattr(google.bc, "supabase", _FakeConnectionsClient([
+        {"id": "conn-1", "workspace_id": "ws-1", "provider": "google_drive",
+         "status": "active", "config": {"enabled_surfaces": ["drive"]}},
+    ]))
+    monkeypatch.setattr(google, "_google_credentials", lambda ws: ("client-id", "secret"))
+    monkeypatch.setattr(bc, "encode_oauth_state", lambda ws, uid, extra=None: f"STATE:{extra}")
+
+    url = google.build_install_url("ws-1", "user-1", enabled_surfaces=["meet"])
+
+    assert "drive.readonly" in url, "existing Drive scope must be preserved on reconsent"
+    assert "meetings.space.readonly" in url, "newly requested Meet scope must be included"
+    assert "STATE:{'surfaces': " in url
+    assert "'drive'" in url and "'meet'" in url
+
+
+def test_build_install_url_first_time_connect_uses_only_requested_surfaces(monkeypatch):
+    monkeypatch.setattr(google.bc, "supabase", _FakeConnectionsClient([]))  # no existing connection
+    monkeypatch.setattr(google, "_google_credentials", lambda ws: ("client-id", "secret"))
+    monkeypatch.setattr(bc, "encode_oauth_state", lambda ws, uid, extra=None: f"STATE:{extra}")
+
+    url = google.build_install_url("ws-1", "user-1", enabled_surfaces=["chat"])
+
+    assert "chat.messages.readonly" in url
+    assert "drive.readonly" not in url, "first-ever connect must not silently add Drive"
+    assert "calendar.events.readonly" not in url
+
+
+def test_oauth_callback_error_leaves_existing_connection_untouched(monkeypatch):
+    """Requirement 5: OAuth cancellation -> previous enabled_surfaces unchanged."""
+    calls = {"upsert": 0}
+
+    class _SpyConnections(_FakeConnectionsClient):
+        def table(self, name):
+            if name == "connections":
+                class _T(_FakeQuery):
+                    def upsert(self, *_a, **_kw):
+                        calls["upsert"] += 1
+                        return self
+                return _T(self._rows)
+            return _FakeQuery([])
+
+    monkeypatch.setattr(google.bc, "supabase", _SpyConnections([
+        {"id": "conn-1", "workspace_id": "ws-1", "provider": "google_drive",
+         "status": "active", "config": {"enabled_surfaces": ["drive"]}},
+    ]))
+
+    import asyncio
+    result = asyncio.run(google.google_callback(code="", state="", error="access_denied"))
+
+    assert calls["upsert"] == 0, "a cancelled/errored OAuth flow must never touch the connections table"
+
+
+def test_google_connection_stays_one_row_across_reconnects(monkeypatch):
+    """Requirement 7/8: still exactly one connections row, provider still
+    google_drive, after a surface is added via re-consent -- verified at
+    the upsert on_conflict-key level (workspace_id, provider,
+    external_team_id all unchanged means the SAME row is updated)."""
+    captured_rows = []
+
+    class _SpyConnections(_FakeConnectionsClient):
+        def table(self, name):
+            if name == "connections":
+                class _T(_FakeQuery):
+                    def upsert(self, row, on_conflict=None):
+                        captured_rows.append((row, on_conflict))
+                        return self
+                return _T(self._rows)
+            return _FakeQuery([])
+
+    monkeypatch.setattr(google.bc, "supabase", _SpyConnections([
+        {"id": "conn-1", "workspace_id": "ws-1", "provider": "google_drive",
+         "status": "active", "config": {"enabled_surfaces": ["drive"]}},
+    ]))
+    monkeypatch.setattr(google, "_google_credentials", lambda ws: ("client-id", "secret"))
+    monkeypatch.setattr(bc, "decode_oauth_state", lambda state: {"w": "ws-1", "u": "user-1", "surfaces": ["meet"]})
+
+    import httpx as _httpx
+    monkeypatch.setattr(_httpx, "post", lambda *_a, **_kw: SimpleNamespace(
+        json=lambda: {"access_token": "tok", "refresh_token": "rt", "expires_in": 3600, "scope": "x"}))
+    monkeypatch.setattr(_httpx, "get", lambda *_a, **_kw: SimpleNamespace(json=lambda: {"email": "a@co.com"}))
+    monkeypatch.setattr(bc, "encrypt_secret", lambda v: f"enc:{v}")
+
+    import asyncio
+    asyncio.run(google.google_callback(code="abc", state="signed-state", error=""))
+
+    assert len(captured_rows) == 1
+    row, on_conflict = captured_rows[0]
+    assert row["provider"] == "google_drive"
+    assert on_conflict == "workspace_id,provider,external_team_id"
+    assert set(row["config"]["enabled_surfaces"]) == {"drive", "meet"}, "must union, not replace"
+
+
+def test_non_admin_cannot_modify_surfaces_on_existing_connection(monkeypatch):
+    """Requirement 6: a plain member (not owner/admin/super_admin) may not
+    re-consent to change an EXISTING connection's surfaces."""
+    monkeypatch.setattr(integrations.bc, "supabase", _FakeConnectionsClient([
+        {"id": "conn-1", "workspace_id": "ws-1", "provider": "google_drive",
+         "status": "active", "config": {"enabled_surfaces": ["drive"]}},
+    ]))
+    member_auth = AuthContext(user_id="u1", workspaces={"ws-1": "member"})
+    body = integrations.OAuthUrlRequest(
+        workspace_id="ws-1", provider="google_drive", enabled_surfaces=["meet"],
+    )
+
+    import asyncio
+    with pytest.raises(Exception) as exc:
+        asyncio.run(integrations.oauth_url(body, member_auth))
+    assert getattr(exc.value, "status_code", None) == 403
+
+
+def test_admin_can_modify_surfaces_on_existing_connection(monkeypatch):
+    monkeypatch.setattr(integrations.bc, "supabase", _FakeConnectionsClient([
+        {"id": "conn-1", "workspace_id": "ws-1", "provider": "google_drive",
+         "status": "active", "config": {"enabled_surfaces": ["drive"]}},
+    ]))
+    monkeypatch.setattr(google, "build_install_url", lambda *a, **kw: "https://accounts.google.com/fake")
+    admin_auth = AuthContext(user_id="u1", workspaces={"ws-1": "admin"})
+    body = integrations.OAuthUrlRequest(
+        workspace_id="ws-1", provider="google_drive", enabled_surfaces=["meet"],
+    )
+
+    import asyncio
+    result = asyncio.run(integrations.oauth_url(body, admin_auth))
+    assert result["url"] == "https://accounts.google.com/fake"
+
+
+def test_first_time_connect_does_not_require_admin(monkeypatch):
+    """A brand-new connection (no existing row) stays open to any workspace
+    member -- only MODIFYING an existing one is admin-gated, matching every
+    other provider's un-gated first Connect."""
+    monkeypatch.setattr(integrations.bc, "supabase", _FakeConnectionsClient([]))
+    monkeypatch.setattr(google, "build_install_url", lambda *a, **kw: "https://accounts.google.com/fake")
+    member_auth = AuthContext(user_id="u1", workspaces={"ws-1": "member"})
+    body = integrations.OAuthUrlRequest(
+        workspace_id="ws-1", provider="google_drive", enabled_surfaces=["drive"],
+    )
+
+    import asyncio
+    result = asyncio.run(integrations.oauth_url(body, member_auth))
+    assert result["url"] == "https://accounts.google.com/fake"
 
 
 # =====================================================================

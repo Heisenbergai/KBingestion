@@ -96,19 +96,44 @@ def _google_credentials(workspace_id: str) -> tuple[str, str]:
     return creds["client_id"], creds["client_secret"]
 
 
+def _existing_enabled_surfaces(workspace_id: str) -> list[str]:
+    """
+    The current connection's already-granted surfaces, if any -- ONE Google
+    connection per workspace (never a second row), so enabling a new surface
+    means RE-consenting on the same connection with a wider scope, never
+    silently assuming an old token already covers it. Looks at any
+    non-revoked row (matches list_integrations' own convention) so an
+    'error'-status connection (e.g. token needs a refresh) still counts as
+    "this workspace already has a Google connection" for merge purposes.
+    """
+    rows = bc.supabase.table("connections").select("config") \
+        .eq("workspace_id", workspace_id).eq("provider", "google_drive") \
+        .neq("status", "revoked").execute().data or []
+    if not rows:
+        return []
+    return [s for s in (rows[0].get("config") or {}).get("enabled_surfaces", []) if s in VALID_SURFACES]
+
+
 def build_install_url(workspace_id: str, user_id: str = "",
                       enabled_surfaces: Optional[list[str]] = None) -> str:
     """
     Mirrors connector_slack.build_install_url — see its docstring. Scope
-    string is built from enabled_surfaces (defaults to just "drive" if the
-    caller doesn't specify). The chosen surfaces are also sealed into the
-    Fernet-signed OAuth state (Google's redirect_uri is fixed and registered
-    with Google in advance, so it can't carry a dynamic query param the way
-    a plain link could) — google_callback() reads them back out of state,
-    not from any callback query param.
+    string is built from the UNION of already-granted surfaces (if a
+    connection already exists) and newly-requested ones — re-consenting
+    to add Meet must never silently drop Drive, and requesting a fresh
+    consent for the full union (rather than trusting the old token already
+    covers the new surface) is deliberate, not an oversight: Google doesn't
+    reliably let you widen an existing token's scope any other way. The
+    chosen surfaces are also sealed into the Fernet-signed OAuth state
+    (Google's redirect_uri is fixed and registered with Google in advance,
+    so it can't carry a dynamic query param the way a plain link could) —
+    google_callback() reads them back out of state, not from any callback
+    query param, and independently re-merges with whatever's currently
+    saved as a second safety net against a stale/raced client request.
     """
     client_id, _ = _google_credentials(workspace_id)
-    enabled = [s for s in (enabled_surfaces or ["drive"]) if s in VALID_SURFACES] or ["drive"]
+    requested = [s for s in (enabled_surfaces or ["drive"]) if s in VALID_SURFACES]
+    enabled = list(dict.fromkeys(_existing_enabled_surfaces(workspace_id) + requested)) or ["drive"]
     state = bc.encode_oauth_state(workspace_id, user_id, extra={"surfaces": enabled})
     scope = scopes_for_surfaces(enabled)
     return (
@@ -143,7 +168,12 @@ async def google_callback(code: str = "", state: str = "", error: str = ""):
         return oauth_complete_html("google_drive", "error")
     st = bc.decode_oauth_state(state)
     workspace_id, user_id = st["w"], st.get("u", "")
-    enabled = [s for s in st.get("surfaces", ["drive"]) if s in VALID_SURFACES] or ["drive"]
+    requested = [s for s in st.get("surfaces", ["drive"]) if s in VALID_SURFACES]
+    # Re-merge with whatever's currently saved -- covers the case where the
+    # existing connection changed between mint-URL and callback (a second
+    # safety net; build_install_url already merged once when the state was
+    # sealed, so in the normal case this is a no-op union with itself).
+    enabled = list(dict.fromkeys(_existing_enabled_surfaces(workspace_id) + requested)) or ["drive"]
     client_id, client_secret = _google_credentials(workspace_id)
 
     res = httpx.post("https://oauth2.googleapis.com/token", data={
