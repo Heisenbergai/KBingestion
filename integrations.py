@@ -59,19 +59,44 @@ PROVIDERS: dict[str, dict] = {
             {"key": "webhook_secret", "label": "Signing Secret", "secret": True},
         ],
     },
+    # ONE Google connection per workspace covers all four surfaces below
+    # (Google Workspace scope lock, 2026-08-15) — the provider KEY stays
+    # "google_drive" deliberately (not renamed to "google_workspace") to
+    # avoid an unnecessary migration/regression risk across every existing
+    # provider check, even though the connection now covers more than Drive.
+    # config.enabled_surfaces (set at connect time) controls which of the
+    # four this connection actually polls/resolves — see connector_google.py.
+    #
+    # Google Drive itself is REFERENCE ONLY: it does NOT bulk-ingest folders
+    # or create Library documents automatically. It resolves a specific file
+    # by ID only when a Meet transcript or Chat message explicitly mentions
+    # it. An earlier version of this integration DID auto-ingest whole
+    # folders — that behavior was neutralized per the scope-lock decision.
     "google_drive": {
-        "name": "Google Drive", "category": "Documents", "auth_method": "oauth",
+        "name": "Google Workspace", "category": "Documents", "auth_method": "oauth",
         "status": "available", "icon": "google-drive", "accent": "#1FA463",
-        "description": "Auto-ingest documents from selected Drive folders.",
-        "captures": "Docs, Sheets, Slides, PDFs in chosen folders",
-        "install_path": "/google/install", "needs_folder_selection": True,
-        "setup_hint": "If Meet recordings are enabled for your Google Workspace, they "
-                      "save transcripts into a \"Meet Recordings\" folder automatically — "
-                      "add that folder here too and Meet transcripts are covered for free.",
+        "description": "Company context from Calendar, Meet transcripts, Chat and "
+                       "referenced Drive files — not a Drive mirror.",
+        "captures": "Calendar events, Meet transcripts, filtered Chat messages, "
+                    "and Drive file references when explicitly relevant",
+        "install_path": "/google/install",
+        "setup_hint": "One Google connection covers every surface below — pick which "
+                      "ones to enable when connecting. Drive itself is never bulk-"
+                      "ingested: a specific file is only referenced when a captured "
+                      "Meet transcript or Chat message explicitly mentions it.",
+        # Toggleable at connect time (see connector_google.SURFACE_SCOPES) —
+        # additive field for a future surface-picker UI; a frontend that
+        # doesn't render it yet is unaffected.
+        "surfaces": [
+            {"id": "calendar", "label": "Calendar", "description": "Event metadata only — no file downloads."},
+            {"id": "meet", "label": "Meet", "description": "Transcript captured as durable KNOVA knowledge."},
+            {"id": "chat", "label": "Chat", "description": "Filtered through the same pipeline as Slack."},
+            {"id": "drive", "label": "Drive (reference only)", "description": "Resolves a specific file by ID when explicitly relevant — never bulk-ingested."},
+        ],
         # Single-tenant model: this workspace's OWN Google Cloud OAuth client.
-        # No webhook_secret needed (unlike Slack) — this polls on a schedule
-        # rather than receiving push events, so there is no shared inbound
-        # endpoint whose signature needs per-customer verification.
+        # No webhook_secret needed (unlike Slack) — every surface here polls
+        # on a schedule rather than receiving push events, so there is no
+        # shared inbound endpoint whose signature needs per-customer verification.
         "needs_own_app": True,
         "redirect_path": "/google/oauth/callback",
         "setup_fields": [
@@ -82,8 +107,26 @@ PROVIDERS: dict[str, dict] = {
     "google_calendar": {
         "name": "Google Calendar", "category": "Meetings", "auth_method": "oauth",
         "status": "coming_soon", "icon": "google-calendar", "accent": "#4285F4",
-        "description": "Add meeting context (titles, attendees) to notes.",
+        "description": "Superseded by the \"calendar\" surface on the Google Workspace "
+                       "connection above — kept here only as a legacy registry entry, "
+                       "not a separate connection.",
         "captures": "Event titles & attendees", "install_path": "/google/install",
+    },
+    "google_meet": {
+        "name": "Google Meet", "category": "Meetings", "auth_method": "oauth",
+        "status": "coming_soon", "icon": "google-meet", "accent": "#00897B",
+        "description": "Superseded by the \"meet\" surface on the Google Workspace "
+                       "connection above — kept here only as a legacy registry entry, "
+                       "not a separate connection.",
+        "captures": "Meeting transcripts", "install_path": "/google/install",
+    },
+    "google_chat": {
+        "name": "Google Chat", "category": "Communication", "auth_method": "oauth",
+        "status": "coming_soon", "icon": "google-chat", "accent": "#00AC47",
+        "description": "Superseded by the \"chat\" surface on the Google Workspace "
+                       "connection above — kept here only as a legacy registry entry, "
+                       "not a separate connection.",
+        "captures": "Filtered space messages", "install_path": "/google/install",
     },
     "zoom": {
         "name": "Zoom", "category": "Meetings", "auth_method": "oauth",
@@ -315,6 +358,34 @@ async def save_credentials(body: SaveCredentialsRequest,
     return {"success": True, "provider": body.provider}
 
 
+@router.delete("/integrations/credentials")
+async def delete_credentials(workspace_id: str, provider: str,
+                             auth: AuthContext = Depends(current_user)):
+    """
+    Clears a workspace's saved app credentials for a provider (client_id/
+    secret/webhook_secret) -- the reset path for a stuck setup: credentials
+    saved wrong (typo'd secret, mismatched redirect URI in the Google Cloud
+    project, etc) previously had NO way back to the setup form once
+    credentials_configured flipped true, since the frontend's "Set up"
+    button only shows when it's still false. This is the fix -- an explicit
+    way to clear and start over, alongside DELETE /connections/{id} for an
+    already-succeeded connection. Only removes the credential row; any
+    already-active connection is untouched (disconnect that separately).
+    """
+    auth.assert_workspace(workspace_id)
+    _require_admin(auth, workspace_id)
+
+    p = PROVIDERS.get(provider)
+    if not p:
+        raise HTTPException(status_code=404, detail=f"Unknown provider '{provider}'.")
+    if not p.get("needs_own_app"):
+        raise HTTPException(status_code=400, detail=f"{p['name']} does not use per-workspace app credentials.")
+
+    bc.supabase.table("provider_credentials").delete() \
+        .eq("workspace_id", workspace_id).eq("provider", provider).execute()
+    return {"success": True, "provider": provider}
+
+
 @router.get("/integrations/credentials")
 async def get_credentials_status(workspace_id: str, provider: str,
                                  auth: AuthContext = Depends(current_user)):
@@ -332,6 +403,11 @@ class OAuthUrlRequest(BaseModel):
     workspace_id: str
     provider:     str
     user_id:      Optional[str] = ""
+    # google_drive only (see connector_google.SURFACE_SCOPES / VALID_SURFACES):
+    # which of calendar/meet/chat/drive the admin picked when connecting.
+    # Ignored by every other provider. Defaults to ["drive"] (the pre-scope-
+    # lock behavior) if omitted, so an unmodified frontend keeps working.
+    enabled_surfaces: Optional[list[str]] = None
 
 
 @router.post("/integrations/oauth-url")
@@ -362,7 +438,9 @@ async def oauth_url(body: OAuthUrlRequest,
         url = connector_slack.build_install_url(body.workspace_id, body.user_id or "")
     elif body.provider == "google_drive":
         import connector_google
-        url = connector_google.build_install_url(body.workspace_id, body.user_id or "")
+        url = connector_google.build_install_url(
+            body.workspace_id, body.user_id or "", body.enabled_surfaces,
+        )
     elif body.provider == "zoom":
         import connector_zoom
         url = connector_zoom.build_install_url(body.workspace_id, body.user_id or "")

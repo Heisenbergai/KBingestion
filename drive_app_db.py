@@ -1,18 +1,27 @@
 """
 Narrow app-DB write path for Google Drive canonical ingestion.
 
-WHY THIS EXISTS
-----------------
+CURRENT STATUS (Google Workspace scope lock, 2026-08-15): the bulk Drive
+ingestion flow that used to call this module (connector_google.sync_connection
+et al.) has been NEUTRALIZED per a locked product decision -- KNOVA must not
+become a mirror of Google Drive. Nothing in this codebase currently calls
+upsert_knowledge_item/soft_delete_knowledge_item/upload_original_file. This
+module and its two SECURITY DEFINER RPCs are left in place, fully tested and
+live-verified, in case a future explicit product decision authorizes
+importing an individual Drive file as a real KNOVA document (as opposed to
+the reference-only model connector_google.resolve_drive_reference() now
+implements, which never creates a knowledge_items row or Storage copy).
+
+WHY THIS EXISTS (historical, still accurate for if/when it's reused again)
+----------------------------------------------------------------------------
 knowledge_items lives in the APP database project (a different Supabase
 project from SUPABASE_URL/SUPABASE_SERVICE_KEY, which point at the vector DB
 -- see auth.py's docstring). Every other write this service makes to the app
 DB has always gone through the frontend instead, because this service never
-held an app-DB credential capable of writing there.
-
-Google Drive sync is the first exception: it runs unattended on a Railway
-schedule with no frontend session to create/update knowledge_items the way a
-manual upload does. To make that possible, Railway is given a NEW secret,
-APP_SUPABASE_SERVICE_KEY, scoped to the app DB project.
+held an app-DB credential capable of writing there. Railway holds a NEW
+secret, APP_SUPABASE_SERVICE_KEY, scoped to the app DB project, specifically
+so a caller like this (had bulk Drive ingestion remained active) could create/
+update knowledge_items without a frontend session in the loop.
 
 THIS MODULE IS THE ONLY PLACE THAT SECRET IS USED. It calls exactly two
 SECURITY DEFINER Postgres RPCs (drive_sync_upsert_knowledge_item,
@@ -26,11 +35,10 @@ SECURITY NOTE ON CONNECTION OWNERSHIP: `connections` (the table that maps a
 Drive connection to its owning workspace) lives in the VECTOR DB project, not
 this one -- confirmed live, cross-project Postgres joins are not possible.
 So these RPCs take workspace_id directly rather than connection_id, already
-resolved by the caller's existing, unchanged connection lookup (see
-connector_google.sync_connection, which has always fetched conn["workspace_id"]
-this way). The RPCs cannot independently re-verify that resolution -- the
-trust anchor is this service's own connection lookup, same as it already is
-for workspace_id on every document_chunks write today.
+resolved by the caller's own connection lookup (whatever that caller turns
+out to be, if this is ever reused). The RPCs cannot independently re-verify
+that resolution -- the trust anchor is the caller's own connection lookup,
+same as it already is for workspace_id on every document_chunks write today.
 """
 import os
 import httpx

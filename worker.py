@@ -26,22 +26,28 @@ WHAT IT DOES, IN ORDER
 -----------------------
 1. run_pending_filtration() — for every active connection with pending
    ingest_items, runs the existing filtration pipeline (brain_connectors.
-   run_filtration). Slack-shaped (chat → keep/discard → notes).
-2. run_google_drive_polling() — for every active google_drive connection,
-   runs connector_google.sync_connection(): lists each selected folder,
-   embeds new/changed files via the existing document pipeline. This is
-   Drive's equivalent of step 1 — different shape (documents, not chat
-   needing filtration) but the same "continuous without a human clicking
-   Sync" purpose.
+   run_filtration). Slack-shaped (chat → keep/discard → notes). Google Chat
+   connections reach this too — see connector_google_chat.py, which calls
+   run_filtration() itself rather than going through this generic path,
+   since it also needs to normalize+store items first.
+2. run_google_calendar_polling() / run_google_meet_polling() /
+   run_google_chat_polling() — the three Google Workspace surfaces that DO
+   run on a schedule (see 09_company_brain_roadmap.md's Google Workspace
+   scope-lock decision). Google Drive does NOT get a scheduled poll step —
+   Drive is reference-only now (connector_google.resolve_drive_reference),
+   triggered reactively by Meet/Chat note creation, never on a timer. An
+   earlier version of this file DID poll Drive folders on a schedule; that
+   step was removed, not just disabled, when bulk Drive ingestion was
+   neutralized per the scope lock.
 3. refresh_expiring_tokens() — connections whose token_expires_at is
    approaching get a REAL refresh for providers that implement one
    (connector_google.refresh_access_token, the first real implementation —
    Slack bot tokens never expire so never reach this path). A provider with
    no refresh function yet gets a warning log instead of a fake refresh.
 4. flag_expiring_webhooks() — same log-only treatment for webhook_subscriptions.
-   Not used by Slack (Events API has no expiry) or Drive (polling, not
-   push); will matter for Microsoft Graph (~3 days) and Google Drive watch
-   channels (~7 days), IF Drive ever moves off polling.
+   Not used by Slack (Events API has no expiry) or Google (polling, not
+   push, for every surface); will matter for Microsoft Graph (~3 days) if
+   that connector is ever built.
 
 Every step is wrapped so one bad connection can't stop the run; every
 outcome is written to sync_runs for later inspection.
@@ -52,6 +58,9 @@ from datetime import datetime, timezone, timedelta
 
 import brain_connectors as bc
 import connector_google
+import connector_google_calendar
+import connector_google_meet
+import connector_google_chat
 import connector_slack
 import connector_zoom
 
@@ -82,12 +91,22 @@ def run_pending_filtration() -> dict:
     The main job. Every active connection with pending ingest_items gets a
     filtration pass, same pipeline POST /connectors/sync already triggers
     on demand — this is what makes it run without a human clicking it.
+
+    Excludes provider='google_drive' connections: those now cover Calendar/
+    Meet/Chat/Drive-reference (see connections.config.enabled_surfaces), and
+    Chat is the only one of the four that produces 'pending' ingest_items --
+    it fully owns its own filtration cycle inside
+    connector_google_chat.poll_connection() (which knows to call
+    run_filtration with provider="google_chat", not the connection's own
+    provider column). Letting THIS generic loop also pick up a google_drive
+    connection would call run_filtration(..., "google_drive", ...) on
+    Chat-sourced items, mislabelling every resulting note's provider.
     """
     # access_token_enc is needed here (not just id/workspace_id/provider) so
     # a Slack connection can resolve real chat.getPermalink calls for its
     # kept messages -- see connector_slack.build_permalink_resolver.
     connections = bc.supabase.table("connections").select("id, workspace_id, provider, access_token_enc") \
-        .eq("status", "active").execute().data or []
+        .eq("status", "active").neq("provider", "google_drive").execute().data or []
 
     processed, failed = 0, 0
     for conn in connections:
@@ -113,30 +132,55 @@ def run_pending_filtration() -> dict:
     return {"connections_checked": len(connections), "processed": processed, "failed": failed}
 
 
-def run_google_drive_polling() -> dict:
-    """
-    The Drive equivalent of run_pending_filtration(): every active Drive
-    connection gets its selected folders checked for new/changed files,
-    without anyone clicking Sync. See connector_google.sync_connection().
-    """
-    connections = bc.supabase.table("connections").select("id, workspace_id") \
+def _connections_with_surface(surface: str) -> list[dict]:
+    """Every active google_drive-provider connection with `surface` in its
+    config.enabled_surfaces -- the shared selection logic all three Google
+    Workspace pollers below use, mirroring connector_google.get_active_connection
+    but returning the full list rather than one connection."""
+    connections = bc.supabase.table("connections").select("id, workspace_id, config") \
         .eq("provider", "google_drive").eq("status", "active").execute().data or []
+    return [c for c in connections if surface in (c.get("config") or {}).get("enabled_surfaces", [])]
 
+
+def _run_surface_poll(kind: str, surface: str, poll_fn) -> dict:
+    """Shared runner for the three Google Workspace poll steps below --
+    same _start_run/_finish_run/per-connection-isolation shape as every
+    other poller in this file."""
+    connections = _connections_with_surface(surface)
     processed = failed = 0
     for conn in connections:
-        run_id = _start_run("drive_poll", conn["id"], conn["workspace_id"])
+        run_id = _start_run(kind, conn["id"], conn["workspace_id"])
         try:
-            result = connector_google.sync_connection(conn["id"])
+            result = poll_fn(conn["id"], conn["workspace_id"])
             _finish_run(run_id, "completed", stats=result)
             processed += 1
-            print(f"[worker] drive poll OK connection={conn['id']} {result}")
+            print(f"[worker] {kind} OK connection={conn['id']} {result}")
         except Exception as e:
             _finish_run(run_id, "failed", error=str(e))
             failed += 1
-            print(f"[worker] drive poll FAILED connection={conn['id']}: {e}")
+            print(f"[worker] {kind} FAILED connection={conn['id']}: {e}")
             print(traceback.format_exc())
 
     return {"connections_checked": len(connections), "processed": processed, "failed": failed}
+
+
+def run_google_calendar_polling() -> dict:
+    """Every active Calendar-enabled connection gets its recent/upcoming
+    events synced as structured metadata. See connector_google_calendar.py."""
+    return _run_surface_poll("calendar_poll", "calendar", connector_google_calendar.poll_connection)
+
+
+def run_google_meet_polling() -> dict:
+    """Every active Meet-enabled connection gets its recent conferences'
+    transcripts captured as durable knowledge. See connector_google_meet.py."""
+    return _run_surface_poll("meet_poll", "meet", connector_google_meet.poll_connection)
+
+
+def run_google_chat_polling() -> dict:
+    """Every active Chat-enabled connection gets its recent messages fetched,
+    normalized, and run through the existing Slack-shaped filtration
+    pipeline. See connector_google_chat.py."""
+    return _run_surface_poll("chat_poll", "chat", connector_google_chat.poll_connection)
 
 
 # Provider -> real refresh function, for providers that have one implemented.
@@ -207,7 +251,9 @@ def main() -> int:
 
     for name, fn in (
         ("filtration", run_pending_filtration),
-        ("drive_poll", run_google_drive_polling),
+        ("calendar_poll", run_google_calendar_polling),
+        ("meet_poll", run_google_meet_polling),
+        ("chat_poll", run_google_chat_polling),
         ("token_refresh", refresh_expiring_tokens),
         ("webhook_check", flag_expiring_webhooks),
     ):

@@ -130,8 +130,17 @@ def has_provider_credentials(workspace_id: str, provider: str) -> bool:
 # Shared by every OAuth connector (connector_slack.py, connector_google.py, …) —
 # the shape (which workspace + which user started the flow, plus a timestamp)
 # is identical regardless of provider.
-def encode_oauth_state(workspace_id: str, user_id: str) -> str:
-    return encrypt_secret(json.dumps({"w": workspace_id, "u": user_id, "t": int(time.time())}))
+def encode_oauth_state(workspace_id: str, user_id: str, extra: Optional[dict] = None) -> str:
+    """extra: optional additive fields merged into the signed state -- e.g.
+    connector_google uses {"surfaces": [...]} to carry which Google Workspace
+    surfaces were requested through to the callback, since Google's redirect
+    URI is fixed and can't carry a custom query param of its own. Backward
+    compatible: every existing caller (Slack, Zoom) omits it and gets exactly
+    the previous {"w", "u", "t"} shape."""
+    payload = {"w": workspace_id, "u": user_id, "t": int(time.time())}
+    if extra:
+        payload.update(extra)
+    return encrypt_secret(json.dumps(payload))
 
 
 def decode_oauth_state(state: str) -> dict:

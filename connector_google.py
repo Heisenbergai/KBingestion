@@ -1,56 +1,42 @@
 """
-Google Drive connector (Phase 3 — first non-Slack, non-chat connector).
+Google connector — shared OAuth/token plumbing for the four Google Workspace
+surfaces (Calendar, Meet, Chat, Drive), plus Drive's own reference-only
+resolution.
 
-Shape is deliberately different from Slack's: Drive files ARE documents, not
-chat that needs a keep/discard filtration pass. So this feeds the EXISTING
-document ingestion pipeline (ingest.process_document_bytes — tier 1, same
-quality as a manual upload) rather than brain_connectors' note-distillation
-engine. Google Docs/Sheets/Slides are exported to .docx/.xlsx/.pptx before
-extraction, reusing the already-well-tested extractors instead of writing new
-ones for Google's native formats.
+LOCKED PRODUCT RULE (Google Workspace scope lock, 2026-08-15): KNOVA captures
+evidence/context from Google Workspace; it must NOT become a mirror of
+Google Drive. Calendar/Meet/Chat feed durable knowledge directly (see
+connector_google_calendar.py, connector_google_meet.py, connector_google_chat.py).
+Drive is REFERENCE ONLY here — no folder polling, no bulk knowledge_items
+creation, no Storage copies, ever. A Drive file is only ever looked up one at
+a time, by ID, when something else (a Meet transcript, a Chat message)
+already mentions it. See resolve_drive_reference() below.
 
-Flow:
-  1. POST /integrations/oauth-url → mint the consent URL (popup). GET /google/install
-     does the same as a redirect, for non-browser callers.
-  2. GET  /google/oauth/callback  → exchange code, store encrypted tokens + expiry
-  3. GET  /google/folders         → list this connection's selected folders
-  4. POST /google/folders/select  → add a folder (pasted Drive link or bare ID) + sync
-  5. sync_connection()            → called on-select AND by worker.py on a schedule;
-                                    this is what makes it "continuous" rather than a
-                                    one-time import
+An earlier version of this module DID bulk-poll selected Drive folders and
+create a real knowledge_items row per file (see git history / the Phase 2
+Google Drive Canonical Ingestion work) — that behavior has been neutralized
+per the scope-lock decision, not because it was broken (it was fully tested
+and live-verified), but because product decided Drive must not become a
+second file repository. drive_app_db.py's RPCs and Storage-upload function
+are left in place, unused by this module for now, in case a future explicit
+product decision authorizes individual-file import — see that module's
+docstring.
 
-Steps 1, 3 and 4 require the caller's Supabase token and check membership of the
-owning workspace (see auth.py). Step 2 is authenticated by the Fernet-signed state
-minted in step 1.
+ONE CONNECTION PER WORKSPACE covers all four surfaces (Correction 1 of the
+scope lock: provider stays "google_drive", not renamed to "google_workspace").
+`connections.config.enabled_surfaces` (a list of "calendar"|"meet"|"chat"|
+"drive") controls which OAuth scopes get requested and which pollers treat
+this connection as theirs — see SURFACE_SCOPES / scopes_for_surfaces() below.
 
 CREDENTIAL MODEL (single-tenant, same as Slack — see 09_company_brain_roadmap.md):
 Each CUSTOMER creates their own project in Google Cloud Console and pastes its
-client_id / client_secret into the Integrations panel. No env-var fallback exists
-here (unlike Slack) — there is no pre-existing Google connection to keep alive.
-One-time setup per customer (console.cloud.google.com):
-  - Create/select a project, enable the "Google Drive API"
-  - OAuth consent screen: type "External", publishing status "Testing" is enough
-    for single-workspace use (no Google verification needed — verification is
-    only required for apps requesting sensitive scopes AND going to production
-    with real (non-test) users beyond the ~100 test-user cap)
-  - Credentials → Create OAuth client ID → type "Web application"
-  - Authorized redirect URI: https://kbingestion-production.up.railway.app/google/oauth/callback
-    (fixed — same for every customer, it's Railway's URL, not theirs)
-
-No shared webhook exists for Drive (polling, not push notifications — Google's
-watch channels need a separately-verified domain per project and add real
-complexity for no benefit at pilot scale), so there is no per-customer signing
-secret to manage, unlike Slack.
+client_id / client_secret into the Integrations panel.
 """
 import os
-import io
-import json
-import time
-import uuid
-import threading
+import re
 import httpx
 from datetime import datetime, timezone, timedelta
-from fastapi import APIRouter, HTTPException, Request, Depends
+from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from typing import Optional
@@ -58,8 +44,6 @@ from dotenv import load_dotenv
 
 from auth import AuthContext, current_user
 import brain_connectors as bc
-import drive_app_db
-import ingest
 
 load_dotenv()
 
@@ -70,57 +54,35 @@ if not RAILWAY_BASE.startswith("http"):
     RAILWAY_BASE = f"https://{RAILWAY_BASE}"
 REDIRECT_URI = f"{RAILWAY_BASE}/google/oauth/callback"
 
-# drive.readonly (not the narrower drive.file) because the admin picks a whole
-# folder by pasting its link/ID rather than through Google's Picker widget —
-# drive.file would only grant access to files the user explicitly selects via
-# that widget, which this simpler paste-a-link flow doesn't use. The trade-off:
-# Google's consent screen will show a broad "See all your Google Drive files"
-# permission. Documented here deliberately so it isn't a silent surprise —
-# each customer is consenting to THEIR OWN app reading THEIR OWN Drive, not a
-# third party's, which is what single-tenant is for.
-GOOGLE_SCOPES = "https://www.googleapis.com/auth/drive.readonly"
-POLL_MAX_FILES_PER_FOLDER = 500  # safety cap per sync pass, not per folder ever
-
-# Google-native files must be EXPORTED, not downloaded directly. Exporting to
-# docx/xlsx/pptx reuses ingest.py's existing, already-tested extractors
-# (tables, shapes, etc.) instead of writing new ones for Google's own formats.
-_EXPORT_MIME = {
-    "application/vnd.google-apps.document":
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "application/vnd.google-apps.spreadsheet":
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "application/vnd.google-apps.presentation":
-        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+# Verified against current Google API documentation (not invented) during the
+# Google Workspace scope-lock design pass. Each surface requests only the
+# narrowest read-only scope that covers what KNOVA actually captures for it —
+# see the per-surface product-behavior sections in 09_company_brain_roadmap.md.
+SURFACE_SCOPES: dict[str, list[str]] = {
+    "calendar": ["https://www.googleapis.com/auth/calendar.events.readonly"],
+    "meet":     ["https://www.googleapis.com/auth/meetings.space.readonly"],
+    "chat":     ["https://www.googleapis.com/auth/chat.messages.readonly",
+                 "https://www.googleapis.com/auth/chat.spaces.readonly"],
+    # drive.readonly (not the narrower drive.file) because reference resolution
+    # looks up an arbitrary file by ID that the connecting account can read,
+    # not just files explicitly picked through Google's Picker widget.
+    "drive":    ["https://www.googleapis.com/auth/drive.readonly"],
 }
-_EXPORT_EXT = {
-    "application/vnd.google-apps.document": ".docx",
-    "application/vnd.google-apps.spreadsheet": ".xlsx",
-    "application/vnd.google-apps.presentation": ".pptx",
-}
-# Regular (non-Google-native) files ingest.extract_text already understands.
-_SUPPORTED_DIRECT_MIME = {
-    "application/pdf",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "application/vnd.ms-excel",
-    "text/csv",
-    "text/plain",
-}
+VALID_SURFACES = set(SURFACE_SCOPES.keys())
 
 
-def _knowledge_file_type(mime_type: str) -> str:
-    """Maps a mime type onto knowledge_items.file_type's enum (knowledge_file_type),
-    same categories the manual-upload dialog's own detectFileType() uses."""
-    if mime_type == "application/pdf":
-        return "pdf"
-    if "wordprocessingml" in mime_type:
-        return "word"
-    if "spreadsheetml" in mime_type or mime_type == "application/vnd.ms-excel":
-        return "excel"
-    if "presentationml" in mime_type:
-        return "powerpoint"
-    return "other"
+def scopes_for_surfaces(enabled_surfaces: list[str]) -> str:
+    """
+    Builds the OAuth scope string from ONLY the enabled surfaces — a disabled
+    surface's scope is never requested, so Google's consent screen only ever
+    shows what this workspace actually turned on. Unknown surface names are
+    silently ignored rather than raising, since this is called from user-
+    supplied input at connect time and a typo shouldn't crash the flow.
+    """
+    scopes: list[str] = []
+    for surface in enabled_surfaces:
+        scopes.extend(SURFACE_SCOPES.get(surface, []))
+    return " ".join(dict.fromkeys(scopes))  # de-duped, order-stable
 
 
 def _google_credentials(workspace_id: str) -> tuple[str, str]:
@@ -129,19 +91,30 @@ def _google_credentials(workspace_id: str) -> tuple[str, str]:
         raise HTTPException(
             status_code=400,
             detail="This workspace hasn't set up its Google app credentials yet. "
-                   "Go to Integrations → Google Drive → Set up to add them.",
+                   "Go to Integrations → Google Workspace → Set up to add them.",
         )
     return creds["client_id"], creds["client_secret"]
 
 
-def build_install_url(workspace_id: str, user_id: str = "") -> str:
-    """Mirrors connector_slack.build_install_url — see its docstring."""
+def build_install_url(workspace_id: str, user_id: str = "",
+                      enabled_surfaces: Optional[list[str]] = None) -> str:
+    """
+    Mirrors connector_slack.build_install_url — see its docstring. Scope
+    string is built from enabled_surfaces (defaults to just "drive" if the
+    caller doesn't specify). The chosen surfaces are also sealed into the
+    Fernet-signed OAuth state (Google's redirect_uri is fixed and registered
+    with Google in advance, so it can't carry a dynamic query param the way
+    a plain link could) — google_callback() reads them back out of state,
+    not from any callback query param.
+    """
     client_id, _ = _google_credentials(workspace_id)
-    state = bc.encode_oauth_state(workspace_id, user_id)
+    enabled = [s for s in (enabled_surfaces or ["drive"]) if s in VALID_SURFACES] or ["drive"]
+    state = bc.encode_oauth_state(workspace_id, user_id, extra={"surfaces": enabled})
+    scope = scopes_for_surfaces(enabled)
     return (
         "https://accounts.google.com/o/oauth2/v2/auth"
         f"?client_id={client_id}&redirect_uri={REDIRECT_URI}"
-        f"&response_type=code&scope={GOOGLE_SCOPES}"
+        f"&response_type=code&scope={scope}"
         "&access_type=offline&prompt=consent"  # force a refresh_token every time,
         # not just on first-ever consent — needed since worker.py's token refresh
         # (see below) depends on always having one.
@@ -150,23 +123,27 @@ def build_install_url(workspace_id: str, user_id: str = "") -> str:
 
 
 @router.get("/google/install")
-async def google_install(workspace_id: str, user_id: str = "",
+async def google_install(workspace_id: str, user_id: str = "", surfaces: str = "drive",
                          auth: AuthContext = Depends(current_user)):
-    """Redirect variant of the install URL, for non-browser callers. See
-    connector_slack.slack_install — identical reasoning: browser popups should
-    use POST /integrations/oauth-url instead, since it can carry the auth header."""
+    """Redirect variant of the install URL, for non-browser callers. `surfaces`
+    is a comma-separated list, e.g. "calendar,meet,chat,drive"."""
     auth.assert_workspace(workspace_id)
-    return RedirectResponse(build_install_url(workspace_id, user_id))
+    enabled = [s.strip() for s in surfaces.split(",") if s.strip() in VALID_SURFACES]
+    return RedirectResponse(build_install_url(workspace_id, user_id, enabled or ["drive"]))
 
 
 @router.get("/google/oauth/callback")
 async def google_callback(code: str = "", state: str = "", error: str = ""):
-    """Exchanges the OAuth code for tokens and stores the connection."""
+    """Exchanges the OAuth code for tokens and stores the connection, with
+    enabled_surfaces (read back from the signed state — see build_install_url)
+    persisted into config so every poller/resolver knows which surfaces this
+    connection actually consented to."""
     from integrations import oauth_complete_html
     if error:
         return oauth_complete_html("google_drive", "error")
     st = bc.decode_oauth_state(state)
     workspace_id, user_id = st["w"], st.get("u", "")
+    enabled = [s for s in st.get("surfaces", ["drive"]) if s in VALID_SURFACES] or ["drive"]
     client_id, client_secret = _google_credentials(workspace_id)
 
     res = httpx.post("https://oauth2.googleapis.com/token", data={
@@ -179,12 +156,8 @@ async def google_callback(code: str = "", state: str = "", error: str = ""):
         return oauth_complete_html("google_drive", "error")
 
     if not data.get("refresh_token"):
-        # Shouldn't happen with access_type=offline&prompt=consent, but if Google
-        # ever omits it, the connection would silently die in ~1 hour with no way
-        # to recover without reconnecting — fail loudly now instead.
         print(f"[google] WARNING: no refresh_token in response for workspace={workspace_id}")
 
-    # Who is this (for external_team_name / dedup on reconnect)?
     userinfo = httpx.get(
         "https://www.googleapis.com/oauth2/v2/userinfo",
         headers={"Authorization": f"Bearer {data['access_token']}"}, timeout=15,
@@ -201,10 +174,10 @@ async def google_callback(code: str = "", state: str = "", error: str = ""):
         "access_token_enc":   bc.encrypt_secret(data["access_token"]),
         "refresh_token_enc":  bc.encrypt_secret(data["refresh_token"]) if data.get("refresh_token") else None,
         "token_expires_at":   expires_at,
-        "scopes":             data.get("scope", GOOGLE_SCOPES),
+        "scopes":             data.get("scope", ""),
         "status":             "active",
         "connected_by":       user_id,
-        "config":             {},
+        "config":             {"enabled_surfaces": enabled},
     }
     bc.supabase.table("connections").upsert(
         row, on_conflict="workspace_id,provider,external_team_id"
@@ -215,15 +188,14 @@ async def google_callback(code: str = "", state: str = "", error: str = ""):
 
 def refresh_access_token(conn: dict) -> Optional[str]:
     """
-    Real token refresh — the first provider in this codebase where it's
-    actually implemented rather than flagged (see worker.py). Returns the new
-    access token, or None if refresh failed (connection marked 'error' so the
-    admin sees it needs reconnecting rather than failing silently forever).
+    Real token refresh. Returns the new access token, or None if refresh
+    failed (connection marked 'error' so the admin sees it needs
+    reconnecting rather than failing silently forever).
     """
     if not conn.get("refresh_token_enc"):
         print(f"[google] connection {conn['id']} has no refresh_token — cannot refresh, marking error")
         bc.supabase.table("connections").update(
-            {"status": "error", "error_detail": "No refresh token stored. Reconnect Google Drive."}
+            {"status": "error", "error_detail": "No refresh token stored. Reconnect Google Workspace."}
         ).eq("id", conn["id"]).execute()
         return None
 
@@ -263,7 +235,32 @@ def _valid_access_token(conn: dict) -> Optional[str]:
     return refresh_access_token(conn)
 
 
-# ── Drive API helpers ────────────────────────────────────────────────────────────
+def get_active_connection(workspace_id: str, required_surface: str) -> Optional[dict]:
+    """
+    Shared fail-closed lookup used by every Google Workspace poller
+    (Calendar/Meet/Chat) and by resolve_drive_reference(): a connection is
+    only usable for a given surface if it's a real google_drive-provider
+    connection, active, belonging to the right workspace, AND has that
+    surface explicitly enabled in config.enabled_surfaces. This is the
+    security-boundary lookup — see 09_company_brain_roadmap.md's Google
+    Workspace scope-lock notes on why this check cannot be pushed down into
+    any RPC (connections lives in a different Supabase project from
+    knowledge_items/app-DB tables).
+    """
+    if required_surface not in VALID_SURFACES:
+        return None
+    conns = bc.supabase.table("connections").select("*") \
+        .eq("workspace_id", workspace_id).eq("provider", "google_drive") \
+        .eq("status", "active").execute().data or []
+    for conn in conns:
+        enabled = (conn.get("config") or {}).get("enabled_surfaces", [])
+        if required_surface in enabled:
+            return conn
+    return None
+
+
+# ── Drive API helpers (retained — reference resolution needs single-file
+#    lookups even though bulk folder polling is neutralized) ───────────────────
 
 def _drive_get(path: str, token: str, params: dict = None) -> dict:
     res = httpx.get(f"https://www.googleapis.com/drive/v3/{path}",
@@ -274,330 +271,74 @@ def _drive_get(path: str, token: str, params: dict = None) -> dict:
     return res.json()
 
 
-def _extract_folder_id(id_or_url: str) -> str:
-    """Accepts either a bare folder id or a full Drive folder URL."""
-    id_or_url = id_or_url.strip()
-    if "/folders/" in id_or_url:
-        return id_or_url.split("/folders/")[1].split("?")[0].split("/")[0]
-    return id_or_url
+# Matches drive.google.com/file/d/{id}, docs.google.com/document|spreadsheets|
+# presentation/d/{id}, and a bare drive.google.com/open?id={id} form.
+_DRIVE_LINK_RE = re.compile(
+    r"https?://(?:drive|docs)\.google\.com/(?:file/d/|document/d/|spreadsheets/d/"
+    r"|presentation/d/|open\?id=)([a-zA-Z0-9_-]{10,})"
+)
 
 
-def _list_folder_files(token: str, folder_id: str) -> list[dict]:
-    files, page_token, pages = [], None, 0
-    while pages < (POLL_MAX_FILES_PER_FOLDER // 100 + 1):
-        params = {
-            "q": f"'{folder_id}' in parents and trashed=false",
-            "fields": "nextPageToken,files(id,name,mimeType,modifiedTime,size)",
-            "pageSize": 100,
-        }
-        if page_token:
-            params["pageToken"] = page_token
-        data = _drive_get("files", token, params)
-        files.extend(data.get("files", []))
-        page_token = data.get("nextPageToken")
-        pages += 1
-        if not page_token or len(files) >= POLL_MAX_FILES_PER_FOLDER:
-            break
-    return files
+def extract_drive_file_ids(text: str) -> list[str]:
+    """De-duped Drive file IDs found in arbitrary text (a Meet transcript or
+    Chat message body) — the trigger for reference resolution. Order-stable,
+    no dedup-losing set() so a caller can log "found N links" meaningfully."""
+    return list(dict.fromkeys(_DRIVE_LINK_RE.findall(text)))
 
 
-def _fetch_file_bytes(token: str, file_id: str, mime_type: str) -> tuple[bytes, str, str]:
-    """Returns (bytes, effective_mime_type, extension_hint) — exporting Google-
-    native files, downloading everything else directly."""
-    if mime_type in _EXPORT_MIME:
-        export_mime = _EXPORT_MIME[mime_type]
-        res = httpx.get(
-            f"https://www.googleapis.com/drive/v3/files/{file_id}/export",
-            headers={"Authorization": f"Bearer {token}"},
-            params={"mimeType": export_mime}, timeout=120,
-        )
-        res.raise_for_status()
-        return res.content, export_mime, _EXPORT_EXT[mime_type]
-
-    res = httpx.get(
-        f"https://www.googleapis.com/drive/v3/files/{file_id}",
-        headers={"Authorization": f"Bearer {token}"},
-        params={"alt": "media"}, timeout=120,
-    )
-    res.raise_for_status()
-    return res.content, mime_type, ""
-
-
-# ── Routes ──────────────────────────────────────────────────────────────────────
-
-@router.get("/google/folders")
-async def google_folders(connection_id: str, auth: AuthContext = Depends(current_user)):
-    """Folders currently selected for this connection."""
-    conn = bc.supabase.table("connections").select("*").eq("id", connection_id).execute().data
-    if not conn:
-        raise HTTPException(status_code=404, detail="Connection not found.")
-    conn = conn[0]
-    auth.assert_workspace(conn["workspace_id"])
-    return {"folders": (conn.get("config") or {}).get("folders", [])}
-
-
-class AddFolderRequest(BaseModel):
-    connection_id: str
-    folder_id_or_url: str
-
-
-@router.post("/google/folders/select")
-async def google_add_folder(body: AddFolderRequest, auth: AuthContext = Depends(current_user)):
+def resolve_drive_reference(workspace_id: str, file_id: str,
+                            linked_object_type: str, linked_object_id: str) -> Optional[dict]:
     """
-    Adds one folder (by pasted link or bare ID) to this connection's watch
-    list, validates it's actually reachable, and kicks off an immediate
-    background sync — same "select then backfill in a thread" shape as
-    Slack's channel selection.
-    """
-    conn = bc.supabase.table("connections").select("*").eq("id", body.connection_id).execute().data
-    if not conn:
-        raise HTTPException(status_code=404, detail="Connection not found.")
-    conn = conn[0]
-    auth.assert_workspace(conn["workspace_id"])
+    THE ONLY Drive read path left in this codebase that touches a file's
+    content-adjacent metadata, and even this never reads the file's bytes —
+    single-file GET by ID, title/URL/modifiedTime only. Creates (or, on a
+    repeat resolution of the same file for the same linked object, reuses —
+    see the UNIQUE constraint on external_references) exactly one reference
+    row. No knowledge_items row, no Storage write, ever.
 
-    folder_id = _extract_folder_id(body.folder_id_or_url)
+    Returns the reference dict, or None if no active Drive-enabled
+    connection exists for this workspace, or the file isn't reachable
+    (deleted, no permission) — logged, never raised, since a broken Drive
+    link inside an otherwise-good Meet/Chat note must not cost the note.
+    """
+    conn = get_active_connection(workspace_id, "drive")
+    if not conn:
+        print(f"[google] no active Drive-enabled connection for workspace {workspace_id}, skipping reference")
+        return None
     token = _valid_access_token(conn)
     if not token:
-        raise HTTPException(status_code=400, detail="Google connection needs to be reconnected.")
-
-    meta = _drive_get(f"files/{folder_id}", token, {"fields": "id,name,mimeType"})
-    if meta.get("mimeType") != "application/vnd.google-apps.folder":
-        raise HTTPException(status_code=400, detail="That link/ID is not a Google Drive folder.")
-
-    folders = (conn.get("config") or {}).get("folders", [])
-    if not any(f["id"] == folder_id for f in folders):
-        folders.append({"id": folder_id, "name": meta.get("name", folder_id)})
-        bc.supabase.table("connections").update(
-            {"config": {**(conn.get("config") or {}), "folders": folders}}
-        ).eq("id", body.connection_id).execute()
-
-    import uuid as _uuid
-    job_id = str(_uuid.uuid4())
-    bc.SYNC_JOBS[job_id] = {"job_id": job_id, "connection_id": body.connection_id,
-                            "status": "processing", "stage": "syncing", "files_processed": 0}
-
-    def _run():
-        try:
-            result = sync_connection(body.connection_id, job=bc.SYNC_JOBS[job_id])
-            bc.SYNC_JOBS[job_id].update({"status": "completed", "stage": "completed", **result})
-        except Exception as e:
-            import traceback; print(f"[google] sync failed: {e}"); print(traceback.format_exc())
-            bc.SYNC_JOBS[job_id].update({"status": "failed", "error": str(e)})
-
-    threading.Thread(target=_run, daemon=True).start()
-    return {"success": True, "job_id": job_id, "folder": {"id": folder_id, "name": meta.get("name")}}
-
-
-def sync_connection(connection_id: str, job: Optional[dict] = None) -> dict:
-    """
-    The main job. Lists every selected folder, fetches new/changed files, and
-    embeds them via the EXISTING document pipeline (tier 1 — same as a manual
-    upload). Called on-select (background thread above) AND on a schedule by
-    worker.py — that second call site is what makes this "continuous" instead
-    of a one-time import: a file added to the folder next week gets picked up
-    on the next scheduled pass with no one touching the UI.
-
-    Dedup/change-detection reuses ingest_items (unique on connection_id +
-    external_id=file_id) as a processed-files ledger — status='embedded' means
-    done, and re-processing only happens if modifiedTime advanced since the
-    stored raw.modified_time. This is a different usage of that table than
-    Slack's (messages are immutable and never revisited; Drive files are
-    edited in place), so it's handled here directly rather than through
-    brain_connectors.save_ingest_items, which assumes immutability.
-
-    Since Google Drive Canonical Ingestion (see 09_company_brain_roadmap.md):
-    each processed file also gets a real knowledge_items row (via the
-    drive_sync_* SECURITY DEFINER RPCs in drive_app_db.py — the ONLY place
-    those RPCs / APP_SUPABASE_SERVICE_KEY are used), a persisted copy in
-    Supabase Storage, and automated raise-only classification — the same
-    canonical document model manual uploads use, so Drive files get a real
-    Library entry instead of being orphaned vector-DB-only chunks. A file no
-    longer present in any selected folder (removed/unshared) is soft-deleted
-    the same way, at the end of this function.
-    """
-    conn = bc.supabase.table("connections").select("*").eq("id", connection_id).execute().data
-    if not conn:
-        raise HTTPException(status_code=404, detail="Connection not found.")
-    conn = conn[0]
-
-    # Explicit, fail-closed checks -- worth stating plainly: since `connections`
-    # and `knowledge_items` live in different Supabase projects, the
-    # drive_sync_* RPCs structurally cannot verify connection provider/status
-    # themselves (they only ever see the workspace_id this function already
-    # resolved and passes them). THIS function's own connection lookup is
-    # therefore part of the security boundary, not just a convenience check --
-    # it is the only place in the whole call chain that can reject "wrong
-    # provider" or "inactive connection" before a workspace_id is ever handed
-    # to the RPC layer.
-    if conn.get("provider") != "google_drive":
-        raise HTTPException(status_code=400, detail="Connection is not a Google Drive connection.")
-    if conn.get("status") != "active":
-        raise HTTPException(status_code=400, detail="Connection is not active.")
-
-    token = _valid_access_token(conn)
-    if not token:
-        raise HTTPException(status_code=400, detail="Google connection needs to be reconnected.")
-
-    folders = (conn.get("config") or {}).get("folders", [])
-    processed = skipped = failed = 0
-    seen_external_ids: set[str] = set()
-
-    for folder in folders:
-        files = _list_folder_files(token, folder["id"])
-        for f in files:
-            seen_external_ids.add(f["id"])
-            if job is not None:
-                job["files_processed"] = processed
-
-            existing = bc.supabase.table("ingest_items").select("id, raw, status") \
-                .eq("connection_id", connection_id).eq("external_id", f["id"]).execute().data
-            already = existing[0] if existing else None
-            if already and already["status"] == "embedded" \
-               and already.get("raw", {}).get("modified_time") == f.get("modifiedTime"):
-                continue  # unchanged since last sync
-
-            mime = f.get("mimeType", "")
-            if mime not in _EXPORT_MIME and mime not in _SUPPORTED_DIRECT_MIME:
-                skipped += 1
-                continue
-
-            if _sync_one_file(conn, connection_id, folder, f, already, token, mime):
-                processed += 1
-            else:
-                failed += 1
-
-    deleted = _reconcile_deleted_files(connection_id, conn["workspace_id"], seen_external_ids)
-
-    return {"folders_checked": len(folders), "processed": processed, "skipped": skipped,
-            "failed": failed, "deleted": deleted}
-
-
-def _sync_one_file(conn: dict, connection_id: str, folder: dict, f: dict,
-                   already: Optional[dict], token: str, mime: str) -> bool:
-    """
-    One file's worth of sync_connection()'s try/except body, factored out so
-    it's independently testable (in particular: that a Storage failure
-    aborts before any knowledge_items row or chunk is created -- see the
-    REQUIRED, not best-effort docstring on drive_app_db.upload_original_file).
-    Returns True on success, False on any failure (already logged here).
-    """
+        return None
     try:
-        file_bytes, effective_mime, ext = _fetch_file_bytes(token, f["id"], mime)
-        # Stable across resyncs, restarts and retries: reused from
-        # ingest_items.raw.document_id when this file has been seen before,
-        # so re-processing a changed file replaces the SAME knowledge_items
-        # row / document_chunks set rather than creating a duplicate.
-        document_id = (already.get("raw", {}).get("document_id") if already else None) or str(uuid.uuid4())
-        file_name = f["name"] + (ext if ext and not f["name"].endswith(ext) else "")
-        file_type = _knowledge_file_type(effective_mime)
-
-        # REQUIRED, not best-effort (see drive_app_db.upload_original_file's
-        # docstring): raises on failure, which this try/except turns into a
-        # clean "failed, retry next sync pass" outcome -- BEFORE any
-        # knowledge_items row or chunk exists for this file, so there is
-        # nothing to roll back and ingest_items is never touched (the file
-        # keeps whatever state it had, so the next scheduled pass retries it
-        # exactly as if this pass never ran).
-        storage_path = drive_app_db.upload_original_file(
-            conn["workspace_id"], document_id, file_name, file_bytes, effective_mime,
-        )
-
-        # Pass 1: ensure the canonical row exists and read back its CURRENT
-        # effective sensitivity (for a brand-new document_id this is just
-        # the safe baseline, 'internal'; for a resync it's whatever a prior
-        # classification pass already raised it to — never lowered by this
-        # call, GREATEST() is monotonic on the SQL side).
-        baseline = drive_app_db.upsert_knowledge_item(
-            workspace_id=conn["workspace_id"], document_id=document_id,
-            title=file_name, file_name=file_name, file_size=len(file_bytes),
-            mime_type=effective_mime, file_type=file_type, storage_path=storage_path,
-        )
-        baseline_sensitivity = baseline.get("sensitivity") or "internal"
-
-        # Pass 2 (inside process_document_bytes): extract, classify
-        # (raise-only against baseline_sensitivity), chunk, embed, store —
-        # auto_classify=True is what makes this call apply the classifier's
-        # verdict instead of just reporting it.
-        result = ingest.process_document_bytes(
-            file_bytes, document_id=document_id, asset_id=document_id,
-            workspace_id=conn["workspace_id"], mime_type=effective_mime,
-            file_name=file_name, source_type="document", source_tier=1,
-            doc_date=f.get("modifiedTime"),
-            sensitivity=baseline_sensitivity, authority="working",
-            doc_class=None, lifecycle_status="active",
-            auto_classify=True,
-        )
-
-        # Pass 3: write the EFFECTIVE post-classification values back onto
-        # knowledge_items so it and document_chunks agree — this call's
-        # GREATEST() is a no-op versus pass 1 since pass 2 already
-        # raise-only'd against the same baseline.
-        drive_app_db.upsert_knowledge_item(
-            workspace_id=conn["workspace_id"], document_id=document_id,
-            title=file_name, file_name=file_name, file_size=len(file_bytes),
-            mime_type=effective_mime, file_type=file_type, storage_path=storage_path,
-            sensitivity=result.get("effective_sensitivity"),
-            authority=result.get("effective_authority"),
-            doc_class=result.get("effective_doc_class"),
-            lifecycle_status=result.get("effective_lifecycle_status"),
-        )
-
-        row = {
-            "workspace_id": conn["workspace_id"], "connection_id": connection_id,
-            "provider": "google_drive", "external_id": f["id"], "kind": "drive_file",
-            "status": "embedded",
-            "raw": {"name": f["name"], "mime_type": mime, "modified_time": f.get("modifiedTime"),
-                   "folder_id": folder["id"], "document_id": document_id},
-        }
-        bc.supabase.table("ingest_items").upsert(
-            row, on_conflict="connection_id,external_id"
-        ).execute()
-        return True
+        meta = _drive_get(f"files/{file_id}", token,
+                          {"fields": "id,name,webViewLink,modifiedTime"})
     except Exception as e:
-        print(f"[google] failed to process file {f.get('id')} ({f.get('name')}): {e}")
-        return False
+        print(f"[google] could not resolve Drive reference {file_id}: {e}")
+        return None
+
+    row = {
+        "workspace_id":       workspace_id,
+        "provider":           "google_drive",
+        "external_file_id":   file_id,
+        "title":              meta.get("name"),
+        "url":                meta.get("webViewLink"),
+        "modified_time":      meta.get("modifiedTime"),
+        "linked_object_type": linked_object_type,
+        "linked_object_id":   linked_object_id,
+    }
+    res = bc.supabase.table("external_references").upsert(
+        row, on_conflict="linked_object_type,linked_object_id,provider,external_file_id"
+    ).execute()
+    return res.data[0] if res.data else row
 
 
-def _reconcile_deleted_files(connection_id: str, workspace_id: str, seen_external_ids: set[str]) -> int:
-    """
-    A file removed from Drive (deleted, unshared, or moved out of every
-    selected folder) simply stops appearing in _list_folder_files — there is
-    no Drive-side deletion event to react to (polling, no webhooks, same as
-    the rest of this connector). So each sync pass compares what it just saw
-    against every previously-embedded file for this connection and soft-
-    deletes whatever's missing, mirroring the deletion the same way a
-    manually-deleted document already is via /document-deleted: knowledge_items
-    marked, then chunks/tables synced to match.
-
-    Safe by construction against a partial folder-listing failure: this is
-    only ever called from the end of sync_connection(), and _list_folder_files
-    is NOT wrapped in a try/except in that loop — an API error partway
-    through raises out of sync_connection() entirely, so this function is
-    simply never reached with an incomplete seen_external_ids set.
-    """
-    previously_embedded = bc.supabase.table("ingest_items") \
-        .select("id, external_id, raw") \
-        .eq("connection_id", connection_id).eq("provider", "google_drive") \
-        .eq("status", "embedded").execute().data or []
-
-    deleted = 0
-    for item in previously_embedded:
-        if item["external_id"] in seen_external_ids:
-            continue
-        document_id = (item.get("raw") or {}).get("document_id")
-        if not document_id:
-            continue
-        try:
-            drive_app_db.soft_delete_knowledge_item(workspace_id, document_id)
-            now = datetime.now(timezone.utc).isoformat()
-            ingest.supabase.table("document_chunks").update({"deleted_at": now}) \
-                .eq("document_id", document_id).eq("workspace_id", workspace_id).execute()
-            ingest.supabase.table("document_tables").update({"deleted_at": now}) \
-                .eq("document_id", document_id).eq("workspace_id", workspace_id).execute()
-            bc.supabase.table("ingest_items").update({"status": "deleted"}) \
-                .eq("id", item["id"]).execute()
-            deleted += 1
-        except Exception as e:
-            print(f"[google] failed to reconcile deletion for ingest_item {item['id']}: {e}")
-
-    return deleted
+def resolve_drive_references_in_text(workspace_id: str, text: str,
+                                     linked_object_type: str, linked_object_id: str) -> list[dict]:
+    """Convenience wrapper: scans text for Drive links and resolves each one
+    found. Used by connector_google_meet.py / connector_google_chat.py right
+    after a note is created, on the note's own body/transcript text."""
+    refs = []
+    for file_id in extract_drive_file_ids(text):
+        ref = resolve_drive_reference(workspace_id, file_id, linked_object_type, linked_object_id)
+        if ref:
+            refs.append(ref)
+    return refs
