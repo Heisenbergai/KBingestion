@@ -735,7 +735,8 @@ def create_note_and_embed(workspace_id: str, connection_id: Optional[str], provi
 
 def run_filtration(workspace_id: str, connection_id: str, provider: str,
                    job: Optional[dict] = None,
-                   resolve_permalink: Optional[Callable[[dict], Optional[str]]] = None) -> dict:
+                   resolve_permalink: Optional[Callable[[dict], Optional[str]]] = None,
+                   on_note_created: Optional[Callable[[str, list[dict]], None]] = None) -> dict:
     """
     Processes all pending ingest_items for a connection:
     batch → classify (possibly multiple items per batch) → distill each
@@ -761,6 +762,20 @@ def run_filtration(workspace_id: str, connection_id: str, provider: str,
     provider-agnostic and must not import a specific connector module.
     A None return (lookup failed, or no resolver given) is stored as-is --
     never fabricated into a guessed URL, and never blocks note creation.
+
+    on_note_created(note_id, contributing_items) -> None, if given, fires
+    right after a note is created, with the exact list of raw ingest_item
+    dicts that contributed to it (the same `contributing` list used to
+    build `sources` above -- each still carries its own untouched `.raw`).
+    This is the hook Google Chat uses for Drive-reference resolution
+    (2026-08-16 fix): it must scan the ORIGINAL raw message text, not the
+    distilled note body, since the classifier may paraphrase a Drive URL
+    out of the note entirely -- see connector_google.py's
+    resolve_drive_references_in_text(). Optional and additive: omitted (the
+    Slack/default path), behavior is byte-for-byte unchanged from before
+    this parameter existed. A hook failure is caught and logged, never
+    allowed to cost the note itself -- same non-fatal contract as
+    resolve_permalink above.
     """
     pending = supabase.table("ingest_items").select("*") \
         .eq("connection_id", connection_id).eq("status", "pending") \
@@ -820,6 +835,15 @@ def run_filtration(workspace_id: str, connection_id: str, provider: str,
             ).in_("id", item_ids).execute()
             attributed_ids.update(item_ids)
             notes_created += 1
+
+            if on_note_created is not None:
+                try:
+                    on_note_created(note_id, contributing)
+                except Exception as e:
+                    # Same non-fatal contract as resolve_permalink above -- a
+                    # broken hook (e.g. Drive-reference resolution) must never
+                    # cost the note that was just correctly created.
+                    print(f"[connectors] on_note_created hook failed (non-fatal): {e}")
 
         unattributed_ids = [it["id"] for it in batch if it["id"] not in attributed_ids]
         if unattributed_ids:

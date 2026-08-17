@@ -13,6 +13,7 @@ Run with: python -m pytest test_google_workspace.py -v
 """
 import uuid
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 
@@ -513,7 +514,8 @@ def test_chat_poll_reuses_run_filtration_not_a_new_engine(monkeypatch):
         return len(items)
     monkeypatch.setattr(bc, "save_ingest_items", _fake_save)
 
-    def _fake_filtration(workspace_id, connection_id, provider, resolve_permalink=None):
+    def _fake_filtration(workspace_id, connection_id, provider, resolve_permalink=None,
+                         on_note_created=None):
         calls["run_filtration"] += 1
         calls["run_filtration_provider"] = provider
         return {"kept": 1, "discarded": 0}
@@ -595,7 +597,7 @@ def test_drive_negative_reference_resolution_never_calls_knowledge_items_write(m
     monkeypatch.setattr(google, "get_active_connection", lambda ws, surface, connection_id=None: {"id": "conn-1"})
     monkeypatch.setattr(google, "_valid_access_token", lambda conn: "fake-token")
     monkeypatch.setattr(google, "_drive_get", lambda path, token, params=None: {
-        "id": "file123", "name": "x.docx", "webViewLink": "url", "modifiedTime": "t",
+        "id": "file123", "name": "x.docx", "webViewLink": "url", "modifiedTime": "2026-08-01T00:00:00Z",
     })
 
     class _SpyRefs(_FakeQuery):
@@ -608,3 +610,403 @@ def test_drive_negative_reference_resolution_never_calls_knowledge_items_write(m
 
     assert calls["upsert_knowledge_item"] == 0
     assert calls["upload_original_file"] == 0
+
+
+# =====================================================================
+# Chat -> Drive-reference resolution fix (2026-08-16): a real Chat KEEP
+# message containing a real Drive link exposed the gap live -- Chat never
+# called resolve_drive_references_in_text() at all (only Meet did).
+# run_filtration() now takes an optional on_note_created(note_id,
+# contributing_items) hook; connector_google_chat.poll_connection() wires
+# it to scan the RAW message text of exactly the items that contributed to
+# each note (never the distilled note body -- the classifier may paraphrase
+# the URL out of it). These tests exercise that wiring end-to-end against
+# the real vector DB (same pattern test_phase1_retrieval.py's provenance
+# tests already use for Slack), with only the Drive metadata GET and the
+# LLM/embedding calls mocked.
+# =====================================================================
+
+from test_phase1_retrieval import _stand_in_vector
+
+
+def _make_test_chat_connection(workspace_id: str = TEST_COMPANY_1_WS) -> str:
+    row = bc.supabase.table("connections").insert({
+        "workspace_id": workspace_id,
+        "provider": "google_drive",
+        "external_team_id": f"TEST-CHAT-DRIVE-{_new_id()}",
+        "external_team_name": "Chat Drive-Ref Test Connection",
+        "access_token_enc": "not-a-real-token-never-decrypted-in-these-tests",
+        "refresh_token_enc": "not-a-real-token-never-decrypted-in-these-tests",
+        "status": "inactive",  # never picked up by the real scheduled worker
+        "config": {"enabled_surfaces": ["chat"]},
+    }).execute().data
+    return row[0]["id"]
+
+
+def _delete_test_chat_connection(connection_id: str) -> None:
+    bc.supabase.table("connections").delete().eq("id", connection_id).execute()
+
+
+def _insert_chat_ingest_items(connection_id: str, workspace_id: str, texts: list[str]) -> list[dict]:
+    rows = [{
+        "workspace_id":  workspace_id,
+        "connection_id": connection_id,
+        "provider":      "google_chat",
+        "external_id":   f"spaces/test-{connection_id}/messages/{i}",
+        "kind":          "message",
+        "raw": {
+            "channel": "spaces/test", "channel_name": "#test",
+            "user": "users/u1", "user_name": "Alice",
+            "text": text, "ts": f"2026-08-16T20:{40 + i:02d}:00Z",
+            "thread_ts": None,
+        },
+        "status": "pending",
+    } for i, text in enumerate(texts)]
+    return bc.supabase.table("ingest_items").insert(rows).execute().data
+
+
+def _run_chat_filtration_with_drive_hook(connection_id: str, workspace_id: str, monkeypatch,
+                                         classify_response: dict) -> dict:
+    """Mirrors exactly what connector_google_chat.poll_connection wires up,
+    without the Google Chat API fetch itself (ingest_items are inserted
+    directly, matching test_phase1_retrieval.py's Slack pattern)."""
+    monkeypatch.setattr(bc.ai, "chat_json", lambda **k: classify_response)
+    monkeypatch.setattr(bc, "embed_chunks", lambda chunks, **k: [_stand_in_vector()] * len(chunks))
+
+    def _on_note_created(note_id, contributing):
+        raw_text = "\n".join((it.get("raw", {}).get("text") or "") for it in contributing)
+        if raw_text.strip():
+            google.resolve_drive_references_in_text(
+                workspace_id, raw_text, "knowledge_note", note_id, connection_id=connection_id,
+            )
+
+    return bc.run_filtration(workspace_id, connection_id, "google_chat",
+                             on_note_created=_on_note_created)
+
+
+def _mock_drive_metadata_lookup(monkeypatch, files: dict, calls: Optional[dict] = None):
+    """files: {file_id: {"name":..., "webViewLink":..., "modifiedTime":...}}.
+    Mocks exactly the two things resolve_drive_reference touches (the
+    connection lookup and the single-file metadata GET) -- never a real
+    Google API call, and calls['drive_get_paths'] records every path/params
+    passed so tests can assert no byte-download endpoint was ever hit."""
+    monkeypatch.setattr(google, "get_active_connection",
+                        lambda ws, surface, connection_id=None: {"id": connection_id or "conn-1"})
+    monkeypatch.setattr(google, "_valid_access_token", lambda conn: "fake-token")
+
+    def _fake_drive_get(path, token, params=None):
+        if calls is not None:
+            calls.setdefault("drive_get_calls", []).append({"path": path, "params": params or {}})
+        file_id = path.split("/")[-1]
+        if file_id not in files:
+            raise Exception("404 not found")
+        meta = files[file_id]
+        return {"id": file_id, "name": meta["name"], "webViewLink": meta["webViewLink"],
+                "modifiedTime": meta["modifiedTime"]}
+    monkeypatch.setattr(google, "_drive_get", _fake_drive_get)
+
+
+def _refs_for(linked_id: str) -> list[dict]:
+    return bc.supabase.table("external_references").select("*") \
+        .eq("linked_object_id", linked_id).eq("linked_object_type", "knowledge_note").execute().data
+
+
+def _cleanup_refs(*linked_ids):
+    for lid in linked_ids:
+        if lid:
+            bc.supabase.table("external_references").delete().eq("linked_object_id", lid).execute()
+
+
+def test_chat_keep_with_drive_url_creates_external_reference(monkeypatch):
+    """Test 1: Chat KEEP + Drive URL -> external reference created."""
+    conn_id = _make_test_chat_connection()
+    note_id = None
+    try:
+        _mock_drive_metadata_lookup(monkeypatch, {
+            "1bdzBnUwqBT2WBXfgWelMgMDdU0l3": {
+                "name": "Q4 Deck.pptx",
+                "webViewLink": "https://docs.google.com/presentation/d/1bdzBnUwqBT2WBXfgWelMgMDdU0l3/edit",
+                "modifiedTime": "2026-08-01T00:00:00Z",
+            },
+        })
+        items = _insert_chat_ingest_items(conn_id, TEST_COMPANY_1_WS, [
+            "Starting Sept 15 the launch needs QA sign-off: "
+            "https://docs.google.com/presentation/d/1bdzBnUwqBT2WBXfgWelMgMDdU0l3/edit?usp=drive_link",
+        ])
+        result = _run_chat_filtration_with_drive_hook(conn_id, TEST_COMPANY_1_WS, monkeypatch, {
+            "items": [{"title": "Launch QA gate", "note": "Launch requires QA sign-off starting Sept 15.",
+                       "category": "process", "participants": [], "source_message_indices": [0]}]
+        })
+        assert result["notes_created"] == 1
+        note_id = bc.supabase.table("ingest_items").select("note_id").eq("id", items[0]["id"]) \
+            .execute().data[0]["note_id"]
+        assert note_id
+
+        refs = _refs_for(note_id)
+        assert len(refs) == 1
+        assert refs[0]["external_file_id"] == "1bdzBnUwqBT2WBXfgWelMgMDdU0l3"
+        assert refs[0]["title"] == "Q4 Deck.pptx"
+        assert refs[0]["workspace_id"] == TEST_COMPANY_1_WS
+        assert refs[0]["provider"] == "google_drive"
+        assert refs[0]["linked_object_type"] == "knowledge_note"
+        assert refs[0]["linked_object_id"] == note_id
+
+        # Repeat poll: no more pending items, hook never fires again, no duplicate.
+        result2 = _run_chat_filtration_with_drive_hook(conn_id, TEST_COMPANY_1_WS, monkeypatch, {"items": []})
+        assert result2["notes_created"] == 0
+        assert len(_refs_for(note_id)) == 1
+    finally:
+        _cleanup_refs(note_id)
+        bc.delete_note(note_id) if note_id else None
+        _delete_test_chat_connection(conn_id)
+
+
+def test_chat_keep_without_drive_url_creates_no_reference(monkeypatch):
+    """Test 2: Chat KEEP without a Drive URL -> no external reference."""
+    conn_id = _make_test_chat_connection()
+    note_id = None
+    try:
+        calls = {}
+        _mock_drive_metadata_lookup(monkeypatch, {}, calls)
+        _insert_chat_ingest_items(conn_id, TEST_COMPANY_1_WS, [
+            "Starting Sept 15 the launch needs QA sign-off, no link this time.",
+        ])
+        result = _run_chat_filtration_with_drive_hook(conn_id, TEST_COMPANY_1_WS, monkeypatch, {
+            "items": [{"title": "Launch QA gate", "note": "Launch requires QA sign-off starting Sept 15.",
+                       "category": "process", "participants": [], "source_message_indices": [0]}]
+        })
+        assert result["notes_created"] == 1
+        note_id = bc.supabase.table("knowledge_notes").select("id").eq("connection_id", conn_id) \
+            .execute().data[0]["id"]
+        assert _refs_for(note_id) == []
+        assert calls.get("drive_get_calls", []) == [], "no Drive link in text -> Drive API must never be called"
+    finally:
+        _cleanup_refs(note_id)
+        bc.delete_note(note_id) if note_id else None
+        _delete_test_chat_connection(conn_id)
+
+
+def test_chat_discard_with_drive_url_creates_no_reference(monkeypatch):
+    """Test 3: Chat DISCARD + Drive URL -> no external reference (hook only
+    fires for items that actually became a KEEP note)."""
+    conn_id = _make_test_chat_connection()
+    try:
+        calls = {}
+        _mock_drive_metadata_lookup(monkeypatch, {"fileABC1234567890": {
+            "name": "x", "webViewLink": "url", "modifiedTime": "2026-08-01T00:00:00Z"}}, calls)
+        items = _insert_chat_ingest_items(conn_id, TEST_COMPANY_1_WS, [
+            "lol check this out https://drive.google.com/file/d/fileABC1234567890/view",
+        ])
+        result = _run_chat_filtration_with_drive_hook(conn_id, TEST_COMPANY_1_WS, monkeypatch,
+                                                      {"items": []})  # pure noise, nothing kept
+        assert result["notes_created"] == 0
+        status = bc.supabase.table("ingest_items").select("status").eq("id", items[0]["id"]) \
+            .execute().data[0]["status"]
+        assert status == "discarded"
+        assert calls.get("drive_get_calls", []) == [], "a discarded message must never trigger Drive resolution"
+    finally:
+        _delete_test_chat_connection(conn_id)
+
+
+def test_chat_drive_url_dropped_from_distilled_note_still_creates_reference(monkeypatch):
+    """Test 4 (THE regression this whole fix targets): the LLM's distilled
+    note.body omits the Drive URL entirely, but the reference must still be
+    created because resolution scans the ORIGINAL raw message text, not the
+    distilled body."""
+    conn_id = _make_test_chat_connection()
+    note_id = None
+    try:
+        _mock_drive_metadata_lookup(monkeypatch, {"1bdzBnUwqBT2WBXfgWelMgMDdU0l3": {
+            "name": "Q4 Deck.pptx",
+            "webViewLink": "https://docs.google.com/presentation/d/1bdzBnUwqBT2WBXfgWelMgMDdU0l3/edit",
+            "modifiedTime": "2026-08-01T00:00:00Z",
+        }})
+        _insert_chat_ingest_items(conn_id, TEST_COMPANY_1_WS, [
+            "Starting Sept 15 the launch needs QA sign-off: "
+            "https://docs.google.com/presentation/d/1bdzBnUwqBT2WBXfgWelMgMDdU0l3/edit?usp=drive_link",
+        ])
+        # Distilled note body deliberately has NO URL in it -- exactly what
+        # the live incident showed the real classifier produces.
+        result = _run_chat_filtration_with_drive_hook(conn_id, TEST_COMPANY_1_WS, monkeypatch, {
+            "items": [{"title": "Launch QA gate",
+                       "note": "Launch requires QA sign-off from Product and QA starting Sept 15.",
+                       "category": "process", "participants": [], "source_message_indices": [0]}]
+        })
+        assert result["notes_created"] == 1
+        note_row = bc.supabase.table("knowledge_notes").select("id,body").eq("connection_id", conn_id) \
+            .execute().data[0]
+        note_id = note_row["id"]
+        assert "docs.google.com" not in note_row["body"], "fixture sanity check: body really has no URL"
+
+        refs = _refs_for(note_id)
+        assert len(refs) == 1
+        assert refs[0]["external_file_id"] == "1bdzBnUwqBT2WBXfgWelMgMDdU0l3"
+    finally:
+        _cleanup_refs(note_id)
+        bc.delete_note(note_id) if note_id else None
+        _delete_test_chat_connection(conn_id)
+
+
+def test_chat_multiple_drive_urls_one_message_creates_one_reference_per_file(monkeypatch):
+    """Test 5: multiple distinct Drive URLs in one raw message -> one
+    external_references row per distinct file."""
+    conn_id = _make_test_chat_connection()
+    note_id = None
+    try:
+        _mock_drive_metadata_lookup(monkeypatch, {
+            "fileAAAAAAAAAAAAAAAAA": {"name": "A", "webViewLink": "urlA", "modifiedTime": "2026-08-01T00:00:00Z"},
+            "fileBBBBBBBBBBBBBBBBB": {"name": "B", "webViewLink": "urlB", "modifiedTime": "2026-08-01T00:00:00Z"},
+        })
+        _insert_chat_ingest_items(conn_id, TEST_COMPANY_1_WS, [
+            "Spec: https://drive.google.com/file/d/fileAAAAAAAAAAAAAAAAA/view "
+            "and data: https://drive.google.com/file/d/fileBBBBBBBBBBBBBBBBB/view",
+        ])
+        result = _run_chat_filtration_with_drive_hook(conn_id, TEST_COMPANY_1_WS, monkeypatch, {
+            "items": [{"title": "Spec + data", "note": "Team reviewed the spec and data files.",
+                       "category": "fact", "participants": [], "source_message_indices": [0]}]
+        })
+        assert result["notes_created"] == 1
+        note_id = bc.supabase.table("knowledge_notes").select("id").eq("connection_id", conn_id) \
+            .execute().data[0]["id"]
+
+        refs = _refs_for(note_id)
+        assert len(refs) == 2
+        assert {r["external_file_id"] for r in refs} == {"fileAAAAAAAAAAAAAAAAA", "fileBBBBBBBBBBBBBBBBB"}
+    finally:
+        _cleanup_refs(note_id)
+        bc.delete_note(note_id) if note_id else None
+        _delete_test_chat_connection(conn_id)
+
+
+def test_chat_drive_reference_repeat_resolution_does_not_duplicate(monkeypatch):
+    """Test 6: calling resolution twice for the same (note, file) pair --
+    e.g. a hook misfire or manual replay -- must not create a second row."""
+    conn_id = _make_test_chat_connection()
+    try:
+        _mock_drive_metadata_lookup(monkeypatch, {"fileCCCCCCCCCCCCCCCCC": {
+            "name": "C", "webViewLink": "urlC", "modifiedTime": "2026-08-01T00:00:00Z"}})
+        note_id = str(uuid.uuid4())
+        text = "doc: https://drive.google.com/file/d/fileCCCCCCCCCCCCCCCCC/view"
+        google.resolve_drive_references_in_text(TEST_COMPANY_1_WS, text, "knowledge_note", note_id,
+                                                 connection_id=conn_id)
+        google.resolve_drive_references_in_text(TEST_COMPANY_1_WS, text, "knowledge_note", note_id,
+                                                 connection_id=conn_id)
+        refs = _refs_for(note_id)
+        assert len(refs) == 1
+    finally:
+        _cleanup_refs(note_id)
+        _delete_test_chat_connection(conn_id)
+
+
+def test_chat_drive_reference_wrong_workspace_rejected(monkeypatch):
+    """Test 7: resolving through a connection that doesn't belong to the
+    claimed workspace must fail closed -- zero rows, no exception."""
+    conn_id = _make_test_chat_connection(workspace_id=TEST_COMPANY_1_WS)
+    try:
+        monkeypatch.setattr(google, "get_active_connection",
+                            lambda ws, surface, connection_id=None: None)  # simulates workspace mismatch
+        note_id = str(uuid.uuid4())
+        refs = google.resolve_drive_references_in_text(
+            "some-other-workspace-id", "doc: https://drive.google.com/file/d/fileDDDDDDDDDDDDDDDDD/view",
+            "knowledge_note", note_id, connection_id=conn_id,
+        )
+        assert refs == []
+        assert _refs_for(note_id) == []
+    finally:
+        _delete_test_chat_connection(conn_id)
+
+
+def test_chat_drive_reference_inactive_connection_rejected(monkeypatch):
+    """Test 8: an inactive/wrong connection_id must fail closed -- this is
+    exactly what get_active_connection already enforces (see
+    test_get_active_connection_rejects_inactive_or_wrong_provider); here we
+    confirm Chat's hook surfaces that as zero references, not an exception."""
+    monkeypatch.setattr(google.bc, "supabase", _FakeConnectionsClient([]))  # no matching active row
+    note_id = str(uuid.uuid4())
+    refs = google.resolve_drive_references_in_text(
+        "ws-1", "doc: https://drive.google.com/file/d/fileEEEEEEEEEEEEEEEEE/view",
+        "knowledge_note", note_id, connection_id="conn-does-not-exist-or-inactive",
+    )
+    assert refs == []
+
+
+def test_chat_drive_reference_surface_disabled_ignored_safely(monkeypatch):
+    """Test 9: a real, active Chat connection that never had 'drive' added
+    to enabled_surfaces must not resolve references -- ignored safely, no
+    exception, no row."""
+    monkeypatch.setattr(google.bc, "supabase", _FakeConnectionsClient([
+        {"id": "conn-1", "workspace_id": "ws-1", "provider": "google_drive",
+         "status": "active", "config": {"enabled_surfaces": ["chat"]}},  # drive NOT enabled
+    ]))
+    note_id = str(uuid.uuid4())
+    refs = google.resolve_drive_references_in_text(
+        "ws-1", "doc: https://drive.google.com/file/d/fileFFFFFFFFFFFFFFFFF/view",
+        "knowledge_note", note_id, connection_id="conn-1",
+    )
+    assert refs == []
+
+
+def test_chat_drive_reference_never_downloads_file_bytes(monkeypatch):
+    """Test 10: the metadata GET must only ever request id/name/webViewLink/
+    modifiedTime fields -- never alt=media (the byte-download form)."""
+    conn_id = _make_test_chat_connection()
+    note_id = None
+    try:
+        calls = {}
+        _mock_drive_metadata_lookup(monkeypatch, {"fileGGGGGGGGGGGGGGGGG": {
+            "name": "G", "webViewLink": "urlG", "modifiedTime": "2026-08-01T00:00:00Z"}}, calls)
+        _insert_chat_ingest_items(conn_id, TEST_COMPANY_1_WS, [
+            "doc: https://drive.google.com/file/d/fileGGGGGGGGGGGGGGGGG/view",
+        ])
+        _run_chat_filtration_with_drive_hook(conn_id, TEST_COMPANY_1_WS, monkeypatch, {
+            "items": [{"title": "Doc", "note": "A doc was shared.", "category": "fact",
+                       "participants": [], "source_message_indices": [0]}]
+        })
+        note_id = bc.supabase.table("knowledge_notes").select("id").eq("connection_id", conn_id) \
+            .execute().data[0]["id"]
+
+        drive_calls = calls.get("drive_get_calls", [])
+        assert len(drive_calls) == 1
+        assert drive_calls[0]["path"] == "files/fileGGGGGGGGGGGGGGGGG"
+        assert drive_calls[0]["params"].get("fields") == "id,name,webViewLink,modifiedTime"
+        assert "alt" not in drive_calls[0]["params"], "must never request file content (alt=media)"
+    finally:
+        _cleanup_refs(note_id)
+        bc.delete_note(note_id) if note_id else None
+        _delete_test_chat_connection(conn_id)
+
+
+def test_chat_drive_reference_creates_no_knowledge_items_or_storage_writes(monkeypatch):
+    """Tests 11 + 12: even when a real reference IS created from a real
+    Chat KEEP note, no knowledge_items row and no Storage write ever
+    happens -- Drive stays reference-only end to end through this new
+    code path, not just in resolve_drive_reference() in isolation."""
+    import drive_app_db
+    calls = {"upsert_knowledge_item": 0, "upload_original_file": 0}
+    monkeypatch.setattr(drive_app_db, "upsert_knowledge_item",
+                        lambda *_a, **_kw: calls.__setitem__("upsert_knowledge_item", calls["upsert_knowledge_item"] + 1))
+    monkeypatch.setattr(drive_app_db, "upload_original_file",
+                        lambda *_a, **_kw: calls.__setitem__("upload_original_file", calls["upload_original_file"] + 1))
+
+    conn_id = _make_test_chat_connection()
+    note_id = None
+    try:
+        _mock_drive_metadata_lookup(monkeypatch, {"fileHHHHHHHHHHHHHHHHH": {
+            "name": "H", "webViewLink": "urlH", "modifiedTime": "2026-08-01T00:00:00Z"}})
+        _insert_chat_ingest_items(conn_id, TEST_COMPANY_1_WS, [
+            "doc: https://drive.google.com/file/d/fileHHHHHHHHHHHHHHHHH/view",
+        ])
+        _run_chat_filtration_with_drive_hook(conn_id, TEST_COMPANY_1_WS, monkeypatch, {
+            "items": [{"title": "Doc", "note": "A doc was shared.", "category": "fact",
+                       "participants": [], "source_message_indices": [0]}]
+        })
+        note_id = bc.supabase.table("knowledge_notes").select("id").eq("connection_id", conn_id) \
+            .execute().data[0]["id"]
+        assert len(_refs_for(note_id)) == 1, "fixture sanity check: a reference really was created"
+
+        assert calls["upsert_knowledge_item"] == 0
+        assert calls["upload_original_file"] == 0
+    finally:
+        _cleanup_refs(note_id)
+        bc.delete_note(note_id) if note_id else None
+        _delete_test_chat_connection(conn_id)

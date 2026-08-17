@@ -12,9 +12,17 @@ Flow: poll_connection() (worker.py, scheduled, per Chat-enabled connection)
     thread_ts) so brain_connectors.batch_conversations()/_format_batch()/
     classify_batch() work completely unmodified
   → save_ingest_items() (existing, provider-parameterized)
-  → run_filtration(..., provider="google_chat", resolve_permalink=...)
-    (existing, provider-parameterized) — same KEEP/DISCARD → knowledge_notes
-    → knowledge_note_sources → embeddings pipeline Slack already uses.
+  → run_filtration(..., provider="google_chat", resolve_permalink=...,
+    on_note_created=...) (existing, provider-parameterized) — same
+    KEEP/DISCARD → knowledge_notes → knowledge_note_sources → embeddings
+    pipeline Slack already uses.
+  → on_note_created hook (2026-08-16 fix): for each note actually created,
+    scans the RAW text of the exact messages that contributed to it for
+    Drive links and resolves each into external_references. Scans the raw
+    message text, never the distilled note body -- the classifier may
+    paraphrase a Drive URL out of the note entirely, which would otherwise
+    silently lose the reference. See run_filtration's on_note_created
+    docstring and connector_google.resolve_drive_references_in_text().
 
 Permalink note: Google Chat has no single documented "get permalink" RPC the
 way Slack's chat.getPermalink is — the resolver below constructs a deep link
@@ -146,8 +154,30 @@ def poll_connection(connection_id: str, workspace_id: str) -> dict:
     stored = bc.save_ingest_items(workspace_id, connection_id, "google_chat", all_items)
 
     resolver = build_permalink_resolver(conn)
+
+    def _resolve_drive_references(note_id: str, contributing: list[dict]) -> None:
+        """run_filtration's on_note_created hook -- fires once per note,
+        with exactly the raw ingest_items that contributed to it. Scans
+        their ORIGINAL raw['text'] (never note['body']/knowledge_notes.body
+        -- see module docstring) for Drive links and resolves each through
+        THIS Chat connection, so the reference is looked up via the same
+        Google account that actually saw the message. Concatenating every
+        contributing message's raw text into one scan naturally covers both
+        "multiple Drive links in one message" and "different contributing
+        messages each linking a different file" -- extract_drive_file_ids()
+        de-dupes by file id either way."""
+        raw_text = "\n".join(
+            (it.get("raw", {}).get("text") or "") for it in contributing
+        )
+        if raw_text.strip():
+            google.resolve_drive_references_in_text(
+                workspace_id, raw_text, "knowledge_note", note_id,
+                connection_id=connection_id,
+            )
+
     filtration_result = bc.run_filtration(workspace_id, connection_id, "google_chat",
-                                          resolve_permalink=resolver)
+                                          resolve_permalink=resolver,
+                                          on_note_created=_resolve_drive_references)
 
     return {"spaces_checked": len(spaces), "messages_seen": len(all_items),
             "new_items_stored": stored, **filtration_result}
