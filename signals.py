@@ -28,6 +28,7 @@ nobody can read it via PostgREST today regardless; that is a byproduct of the
 same posture every sibling telemetry table uses, not itself the R1 guarantee.
 Whoever builds the read endpoint must add that check explicitly.
 """
+import re
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -38,6 +39,10 @@ import os
 from auth import AuthContext, current_user
 
 router = APIRouter()
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE,
+)
 
 supabase = create_client(
     os.getenv("SUPABASE_URL"),
@@ -83,9 +88,20 @@ def log_scope_used(workspace_id: str, user_id: Optional[str], feature: str,
 
 def log_sources_cited(workspace_id: str, user_id: Optional[str], feature: str,
                       question: str, document_ids: list[str], confidence: str) -> None:
-    """AI Search's model chose to attribute a claim to these documents."""
+    """AI Search's model chose to attribute a claim to these documents.
+
+    Phase 5J/5K: a graph_retrieval-produced candidate carries a pseudo id
+    like "graph_relationship:<uuid>" in its document_id field (it isn't a
+    real document -- it's a relationship, deliberately namespaced so it can
+    never collide with a real document_id, see graph_retrieval.py). This
+    table's document_id column is a real uuid-typed column, so passing that
+    string through used to fail on every write (found live via the Phase
+    5K benchmark) -- silently, since log_signal is fail-safe by design.
+    Skipped here rather than logged wrong or crashing: a graph relationship
+    isn't a document, so "not logged as a cited document" is the honest
+    behavior, not a bug to paper over with a schema change."""
     for doc_id in dict.fromkeys(document_ids):  # de-dupe, preserve order
-        if doc_id:
+        if doc_id and _UUID_RE.match(doc_id):
             log_signal(workspace_id, user_id, feature, "source_cited", question=question,
                        document_id=doc_id, metadata={"confidence": confidence})
 
@@ -96,9 +112,12 @@ def log_sources_used_in_context(workspace_id: str, user_id: Optional[str], featu
     A bot's context included these documents' chunks — weaker than a citation
     (see the module docstring). Never call this the same signal_type as
     log_sources_cited.
+
+    Same non-UUID skip as log_sources_cited above, same reason (graph
+    candidates are not documents).
     """
     for doc_id in dict.fromkeys(document_ids):
-        if doc_id:
+        if doc_id and _UUID_RE.match(doc_id):
             log_signal(workspace_id, user_id, feature, "source_used_in_context",
                        question=question, document_id=doc_id, metadata={"confidence": confidence})
 

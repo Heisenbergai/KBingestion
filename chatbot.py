@@ -7,6 +7,8 @@ import escalation_triage
 import query_reasoning
 import grounding
 import signals
+import source_labels
+import graph_retrieval
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Request, Depends, Header
 from auth import AuthContext, current_user
@@ -67,6 +69,12 @@ class WidgetQueryRequest(BaseModel):
     # client-side; Lovable keeps them in bot_messages. Without this the bot
     # has no memory and every follow-up question falls flat.
     conversation_history: Optional[list[ChatMessage]] = []
+    # Phase 5K.1 Part 5 -- optional ISO-8601 point-in-time, same field name/
+    # shape/default as query.py's QueryRequest.as_of. Omitted means current.
+    # A temporal relevance parameter, not a security one (see run_rag_query's
+    # own docstring) -- safe to accept from a public widget caller the same
+    # way filter_document_ids already is.
+    as_of:                Optional[str] = None
 
 
 class InternalQueryRequest(BaseModel):
@@ -75,6 +83,7 @@ class InternalQueryRequest(BaseModel):
     user_id:              str
     conversation_id:      Optional[str] = None
     conversation_history: Optional[list[ChatMessage]] = []
+    as_of:                Optional[str] = None
 
 
 def _clean_history(history: Optional[list[ChatMessage]]) -> list[dict]:
@@ -122,10 +131,22 @@ def run_rag_query(
     feature: str = "chatbot_internal",
     filter_sensitivities: Optional[list[str]] = None,
     filter_restricted_grant_ids: Optional[list[str]] = None,
+    as_of: Optional[str] = None,
 ) -> tuple[str, list[str], str]:
     """
     Searches ONLY document chunks belonging to the bot's workspace.
     workspace_id in bot_config is the single source of truth for isolation.
+
+    as_of (Phase 5K.1 Part 5): optional ISO-8601 point-in-time, propagated
+    from the caller's own request body all the way to graph_retrieval.
+    build_graph_context() -> graph_query's temporal semantics, IDENTICAL to
+    how query.py's /query already handles its own QueryRequest.as_of field
+    (same parsing: fromisoformat with a trailing "Z" normalized to
+    "+00:00", same silent-ignore-and-log on a malformed value, same
+    "omitted means current" default). Reaches the real temporal/status
+    filter in graph_query._fetch_relationships_for_endpoint unchanged --
+    no new date parser, no new temporal logic, just the existing contract
+    made reachable from one more caller.
 
     Phase E: folder scoping (bot.linked_folder_ids) and sensitivity filtering
     both happen INSIDE match_chunks_hybrid's SQL now, not as a Python
@@ -198,6 +219,16 @@ def run_rag_query(
     # Search ONLY this workspace's chunks
     chunks = []
     context_block = ""
+    # Defined before the try block for the same reason chunks/context_block
+    # are: confidence computation below needs it even if retrieval raised
+    # partway through.
+    graph_context = None
+    as_of_parsed = None
+    if as_of:
+        try:
+            as_of_parsed = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+        except ValueError:
+            print(f"[graph_retrieval] ignoring unparseable as_of={as_of!r}")
 
     # Lightweight step-by-step timing, logged (not stored) at the end of this
     # function -- "bot response-speed profiling" from the feature-request
@@ -301,13 +332,39 @@ def run_rag_query(
                 chunks = query_reasoning.deduplicate_chunks(chunks)
             t_reformulation_ms = (time.perf_counter() - t_step) * 1000
 
+        # Phase 5K Part 1 / 5K.1 Part 5 -- the SAME graph_retrieval adapter
+        # query.py's /query already uses, applied with identical semantics:
+        # detect -> resolve entities -> traverse -> merge/dedup against
+        # `chunks`. There is exactly one graph retrieval implementation in
+        # this codebase; this is not a second one. `search_text` is the
+        # same retrieval-purposed, follow-up-aware text already used for
+        # embedding above -- the natural chatbot equivalent of query.py's
+        # `search_question`. as_of_parsed (parsed above, before the try
+        # block) now reaches this call exactly like query.py's own
+        # QueryRequest.as_of does -- omitted/unparseable means "current".
+        t_step = time.perf_counter()
+        graph_context = graph_retrieval.build_graph_context(
+            search_text, bot.workspace_id, filter_sensitivities or ["public", "internal"],
+            as_of=as_of_parsed,
+        )
+        chunks, graph_metrics = graph_retrieval.merge_graph_context_into_chunks(chunks, graph_context)
+        t_graph_ms = (time.perf_counter() - t_step) * 1000
+        print(
+            f"[graph_retrieval][chatbot] bot={bot.name!r} invoked={graph_metrics['graph_queries_invoked']} "
+            f"entities_resolved={graph_metrics['graph_entities_resolved']} "
+            f"relationships_found={graph_metrics['graph_relationships_found']} "
+            f"candidates_added={graph_metrics['graph_candidates_added']} "
+            f"candidates_deduplicated={graph_metrics['graph_candidates_deduplicated']} "
+            f"graph_only={graph_metrics['graph_only']} "
+            f"latency_ms={t_graph_ms:.0f}"
+        )
+
         if chunks:
             context_parts = []
             for chunk in chunks:
                 file_name = chunk.get("metadata", {}).get("file_name", "Company document")
                 stype = chunk.get("source_type") or chunk.get("metadata", {}).get("source_type") or "document"
-                label = {"document": "official document", "meeting": "meeting note",
-                         "slack": "team chat", "note": "curated note"}.get(stype, stype)
+                label = source_labels.source_type_label(stype)
                 context_parts.append(f"[{file_name} — {label}]\n{chunk['content']}")
             context_block = "\n\n---\n\n".join(context_parts)
 
@@ -316,18 +373,24 @@ def run_rag_query(
     except Exception as e:
         print(f"[chatbot] RAG search error: {str(e)}")
 
-    # Confidence mirrors query.py's exact thresholds (query.py:158-160) — reused
-    # rather than reinvented, so "answered well" means the same thing across AI
-    # Search and chatbots. Computed from whatever `chunks` ended up as (original
-    # or reformulation-merged) — `_top_sim`/`_safe_similarity` are defined above
-    # the try block specifically so they are always callable here.
+    # VECTOR CONFIDENCE -- mirrors query.py's exact thresholds, reused rather
+    # than reinvented so "answered well" means the same thing across AI
+    # Search and chatbots. Computed from whatever `chunks` ended up as
+    # (original or reformulation-merged) — `_top_sim`/`_safe_similarity` are
+    # defined above the try block specifically so they are always callable
+    # here. A graph candidate's similarity is honestly None (Phase 5K.1), so
+    # it cannot inflate this number.
     top_sim = _top_sim(chunks)
-    confidence = (
+    vector_confidence = (
         "none" if not chunks else
         "high" if top_sim >= 0.45 else
         "medium" if top_sim >= 0.3 else
         "low"
     )
+    # ANSWER CONFIDENCE -- same combine_confidence query.py now uses, same
+    # reasoning: fold in GRAPH CONFIDENCE without ever lowering what vector
+    # retrieval already earned.
+    confidence = graph_retrieval.combine_confidence(vector_confidence, graph_context)
 
     if context_block:
         system_content = f"""{base_personality}
@@ -754,6 +817,7 @@ async def widget_query(request: Request, body: WidgetQueryRequest):
             history=body.conversation_history,
             feature="chatbot_external",
             filter_sensitivities=["public"],
+            as_of=body.as_of,
         )
         origin = request.headers.get("origin") or request.headers.get("referer") or ""
         domain = origin.split("//")[-1].split("/")[0] if origin else None
@@ -810,6 +874,7 @@ async def internal_query(body: InternalQueryRequest,
             user_id=body.user_id, feature="chatbot_internal",
             filter_sensitivities=filter_sensitivities,
             filter_restricted_grant_ids=filter_restricted_grant_ids,
+            as_of=body.as_of,
         )
         # asker_role feeds priority scoring — a question the owner or an admin
         # couldn't get answered is escalated to P1. `role` is already resolved

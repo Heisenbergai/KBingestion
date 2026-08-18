@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import ai
 import httpx
 import auth as auth_mod
@@ -7,6 +8,9 @@ import query_reasoning
 import query_routing
 import grounding
 import signals
+import source_labels
+import graph_retrieval
+from datetime import datetime
 from fastapi import APIRouter, HTTPException, Depends, Header
 from auth import AuthContext, current_user
 from pydantic import BaseModel
@@ -45,6 +49,12 @@ class QueryRequest(BaseModel):
     # always had. Capped hard server-side below, never trusting the caller's
     # own length.
     history: Optional[list[dict]] = None
+    # Phase 5J Part 8 -- optional explicit point-in-time for graph relevance.
+    # ISO-8601. Omitted (the default, matching every caller before this
+    # field existed) means "current" -- graph_query.get_entity_graph's own
+    # default. This does NOT affect chunk/vector retrieval at all, only
+    # which graph relationships are considered temporally valid.
+    as_of: Optional[str] = None
 
 _MAX_HISTORY_TURNS = 6  # hard cap regardless of what the caller sends
 
@@ -170,8 +180,7 @@ def build_context_and_citations(chunks: list[dict]) -> tuple[str, list[dict]]:
         meta = ch.get("metadata") or {}
         file_name = meta.get("file_name", "Unknown document")
         stype = ch.get("source_type") or meta.get("source_type") or "document"
-        label = {"document": "company document", "meeting": "meeting note",
-                 "slack": "team chat", "note": "curated note"}.get(stype, stype)
+        label = source_labels.source_type_label(stype)
         context_parts.append(f"[{i}] {file_name} ({label}):\n{ch['content']}")
         citations.append({
             "index":       i,
@@ -530,6 +539,37 @@ async def query_documents(request: QueryRequest,
                 # catches duplicates introduced by combining batches.
                 chunks = query_reasoning.deduplicate_chunks(chunks)
 
+        # Phase 5J -- graph context, additive only. Runs AFTER chunk
+        # retrieval (including any reformulation retry) is fully settled, so
+        # dedup against `chunks` sees the final candidate set, not an
+        # intermediate one. Placed BEFORE the "no chunks" early-return below
+        # deliberately: a purely graph-answerable question (e.g. "who
+        # organized X") can have weak/zero vector similarity even though the
+        # graph has a real, deterministic answer -- this insertion point is
+        # what lets that case still produce an answer instead of a false
+        # "nothing found".
+        t_graph_step = time.perf_counter()
+        as_of_parsed = None
+        if request.as_of:
+            try:
+                as_of_parsed = datetime.fromisoformat(request.as_of.replace("Z", "+00:00"))
+            except ValueError:
+                print(f"[graph_retrieval] ignoring unparseable as_of={request.as_of!r}")
+        graph_context = graph_retrieval.build_graph_context(
+            search_question, request.workspace_id, filter_sensitivities, as_of=as_of_parsed,
+        )
+        chunks, graph_metrics = graph_retrieval.merge_graph_context_into_chunks(chunks, graph_context)
+        t_graph_ms = (time.perf_counter() - t_graph_step) * 1000
+        print(
+            f"[graph_retrieval][query] invoked={graph_metrics['graph_queries_invoked']} "
+            f"entities_resolved={graph_metrics['graph_entities_resolved']} "
+            f"relationships_found={graph_metrics['graph_relationships_found']} "
+            f"candidates_added={graph_metrics['graph_candidates_added']} "
+            f"candidates_deduplicated={graph_metrics['graph_candidates_deduplicated']} "
+            f"graph_only={graph_metrics['graph_only']} "
+            f"latency_ms={t_graph_ms:.0f}"
+        )
+
         if not chunks:
             return {
                 "answer":  "I couldn't find anything about this in your knowledge base.",
@@ -626,9 +666,16 @@ Formatting:
             print(f"[gap_validation] original_question={request.question!r} "
                   f"original_gap={original_gap!r} final_gaps={gaps!r}")
 
-        # Confidence from the best chunk's semantic similarity
+        # VECTOR CONFIDENCE -- unchanged: from the best chunk's real semantic
+        # similarity only. A graph candidate's similarity is honestly None
+        # (Phase 5K.1), so it can no longer inflate top_sim at all.
         top_sim = max((c.get("similarity") or 0) for c in chunks)
-        confidence = "high" if top_sim >= 0.45 else "medium" if top_sim >= 0.3 else "low"
+        vector_confidence = "high" if top_sim >= 0.45 else "medium" if top_sim >= 0.3 else "low"
+        # ANSWER CONFIDENCE -- folds in GRAPH CONFIDENCE (graph-native
+        # signals: relationship presence + evidence_strength, never a fake
+        # similarity) without ever lowering what vector retrieval already
+        # earned. See graph_retrieval.combine_confidence's own docstring.
+        confidence = graph_retrieval.combine_confidence(vector_confidence, graph_context)
         # A gap-only completion (answer is empty, the whole response was under
         # GAP_MARKER) means the model found NOTHING it could answer with --
         # top_sim-based confidence describes how close the RETRIEVED chunks
