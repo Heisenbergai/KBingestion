@@ -10,6 +10,7 @@ import grounding
 import signals
 import source_labels
 import graph_retrieval
+import memory_retrieval
 from datetime import datetime
 from fastapi import APIRouter, HTTPException, Depends, Header
 from auth import AuthContext, current_user
@@ -570,6 +571,31 @@ async def query_documents(request: QueryRequest,
             f"latency_ms={t_graph_ms:.0f}"
         )
 
+        # Phase 6D -- durable memory context, additive only, same insertion
+        # point as graph (after chunk retrieval settles, before the "no
+        # chunks" early return) and the same reasoning: a purely
+        # memory-answerable question ("what does KNOVA remember about
+        # credentials?") can have weak/zero vector similarity even though a
+        # real durable memory exists. graph_context is passed through so
+        # memory candidates already covered by an already-added graph
+        # candidate are deduped, never presented twice (Part 9).
+        t_memory_step = time.perf_counter()
+        memory_context = memory_retrieval.build_memory_context(
+            search_question, request.workspace_id, filter_sensitivities,
+            as_of=as_of_parsed, graph_context=graph_context,
+        )
+        chunks, memory_metrics = memory_retrieval.merge_memory_context_into_chunks(
+            chunks, memory_context, graph_context=graph_context,
+        )
+        t_memory_ms = (time.perf_counter() - t_memory_step) * 1000
+        print(
+            f"[memory_retrieval][query] found={memory_metrics['memory_candidates_found']} "
+            f"added={memory_metrics['memory_candidates_added']} "
+            f"deduplicated={memory_metrics['memory_candidates_deduplicated']} "
+            f"memory_only={memory_metrics['memory_only']} "
+            f"latency_ms={t_memory_ms:.0f}"
+        )
+
         if not chunks:
             return {
                 "answer":  "I couldn't find anything about this in your knowledge base.",
@@ -673,9 +699,17 @@ Formatting:
         vector_confidence = "high" if top_sim >= 0.45 else "medium" if top_sim >= 0.3 else "low"
         # ANSWER CONFIDENCE -- folds in GRAPH CONFIDENCE (graph-native
         # signals: relationship presence + evidence_strength, never a fake
-        # similarity) without ever lowering what vector retrieval already
-        # earned. See graph_retrieval.combine_confidence's own docstring.
-        confidence = graph_retrieval.combine_confidence(vector_confidence, graph_context)
+        # similarity) then MEMORY CONFIDENCE (Phase 6D -- a resolved,
+        # VISIBLE primary artifact under a relevant memory, never memory
+        # existence alone) without ever lowering what came before. See
+        # graph_retrieval.combine_confidence's / memory_retrieval.
+        # combine_confidence's own docstrings -- same "take the strongest
+        # honestly-earned signal" rule, applied twice, never a third
+        # competing confidence system.
+        confidence = memory_retrieval.combine_confidence(
+            graph_retrieval.combine_confidence(vector_confidence, graph_context),
+            memory_context,
+        )
         # A gap-only completion (answer is empty, the whole response was under
         # GAP_MARKER) means the model found NOTHING it could answer with --
         # top_sim-based confidence describes how close the RETRIEVED chunks

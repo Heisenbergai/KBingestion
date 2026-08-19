@@ -37,6 +37,14 @@ OTHER_REAL_WORKSPACE = "20c3df60-d33c-4003-81d5-504750e526f1"
 TANMAY_EMAIL = "tanmaydubeytd@gmail.com"
 JOHN_SNOW_EMAIL = "kingjohnsnow0@gmail.com"
 REAL_CALENDAR_EVENT_MEETING_URL = "https://meet.google.com/ngn-pjwu-jcn"
+# A second real Calendar sync event ("Sales Catchup") arrived live during
+# the Phase 6D regression pass (2026-08-18 20:00:30 UTC) via the actually-
+# deployed filtration-worker cron -- same class of real, unrelated
+# production event already documented once before this session (the first
+# calendar_events row growing 1->2 mid-session). Tanmay organizes/attends
+# this one too, so his own evidence resolution now legitimately returns 2
+# rows instead of 1.
+REAL_CALENDAR_EVENT_2_MEETING_URL = "https://meet.google.com/rsb-bgch-ycs"
 
 
 def _normalize_alias(s: str) -> str:
@@ -265,13 +273,20 @@ def test_john_snow_identity_is_anchored_by_email_not_by_slack_text():
 # =====================================================================
 
 def test_tanmay_evidence_resolves_as_calendar_organizer():
+    """STALE COUNT FIXED (Phase 6D regression, 2026-08-18): a second real
+    Calendar sync event ("Sales Catchup") arrived live during this session
+    -- Tanmay organizes/attends it too, so his evidence now legitimately
+    resolves to 2 real snapshots, not 1. See REAL_CALENDAR_EVENT_2_MEETING_
+    URL's own comment for the full explanation."""
     tanmay_id = _get_person(TANMAY_EMAIL)["id"]
     evidence = gq.get_entity_primary_evidence(tanmay_id, REAL_WORKSPACE)
-    assert len(evidence) == 1
-    assert evidence[0].evidence_kind == "primary_source"
-    assert evidence[0].evidence_type == "calendar_event_snapshot"
-    assert evidence[0].source_reference == REAL_CALENDAR_EVENT_MEETING_URL
-    assert evidence[0].stance == "supports"
+    assert len(evidence) == 2
+    references = {e.source_reference for e in evidence}
+    assert references == {REAL_CALENDAR_EVENT_MEETING_URL, REAL_CALENDAR_EVENT_2_MEETING_URL}
+    for e in evidence:
+        assert e.evidence_kind == "primary_source"
+        assert e.evidence_type == "calendar_event_snapshot"
+        assert e.stance == "supports"
 
 
 def test_john_snow_evidence_resolves_as_calendar_attendee():
@@ -345,8 +360,11 @@ def test_original_relationship_preserved():
 
 
 def test_calendar_snapshot_preserved():
+    """STALE COUNT FIXED (Phase 6D regression, 2026-08-18): a second real
+    Calendar sync event legitimately arrived live during this session --
+    see REAL_CALENDAR_EVENT_2_MEETING_URL's comment."""
     count = supabase.table("calendar_event_snapshots").select("id", count="exact").execute().count
-    assert count == 1
+    assert count == 2
 
 
 # =====================================================================

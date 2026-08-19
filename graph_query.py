@@ -187,7 +187,13 @@ def _build_visible_evidence(relationship_id: str, allowed_sensitivities: list[st
     """Fetches every non-revoked evidence row for a relationship, resolves
     each one's real source, and returns ONLY the ones this caller may see --
     an invisible record is omitted entirely, never shown as a stub. Ordered
-    deterministically by evidence id."""
+    deterministically by evidence id.
+
+    Single-relationship form, kept unchanged for get_relationship()/
+    explain_relationship() (low-volume, one-off lookups). The multi-
+    relationship traversal path (_fetch_relationships_for_endpoint) uses
+    _build_visible_evidence_batch below instead -- see that function's own
+    docstring for why."""
     rows = bc.supabase.table("knowledge_relationship_evidence") \
         .select("*").eq("relationship_id", relationship_id) \
         .is_("revoked_at", "null").order("id").execute().data or []
@@ -211,11 +217,113 @@ def _build_visible_evidence(relationship_id: str, allowed_sensitivities: list[st
     return visible
 
 
+def _resolve_evidence_sources_batch(ev_rows: list[dict]) -> dict:
+    """Phase 6H.1 performance pass -- batched form of _resolve_evidence_source,
+    one query per real evidence_type PRESENT across all of `ev_rows` (never
+    one query per evidence row). Same per-type field selection and the same
+    two-hop knowledge_note_source->knowledge_notes resolution, just fetched
+    for every id of that type at once via .in_(). Returns
+    {(evidence_type, evidence_id): {'sensitivity', 'reference'} | absent} --
+    a missing key means "row no longer exists", exactly matching the
+    single-lookup function's own None-on-missing behavior (checked with
+    .get(key) by the caller, never assumed present)."""
+    ids_by_type: dict[str, set] = {}
+    for row in ev_rows:
+        ids_by_type.setdefault(row["evidence_type"], set()).add(row["evidence_id"])
+
+    out: dict = {}
+
+    sk_ids = ids_by_type.get("structured_knowledge")
+    if sk_ids:
+        rows = bc.supabase.table("structured_knowledge").select("id,sensitivity,statement") \
+            .in_("id", list(sk_ids)).execute().data or []
+        for r in rows:
+            out[("structured_knowledge", r["id"])] = {"sensitivity": r["sensitivity"], "reference": r["statement"]}
+
+    note_source_ids = ids_by_type.get("knowledge_note_source")
+    if note_source_ids:
+        ns_rows = bc.supabase.table("knowledge_note_sources").select("id,note_id,source_ref") \
+            .in_("id", list(note_source_ids)).execute().data or []
+        note_ids = {r["note_id"] for r in ns_rows}
+        notes_by_id = {}
+        if note_ids:
+            notes = bc.supabase.table("knowledge_notes").select("id,sensitivity,source_ref") \
+                .in_("id", list(note_ids)).execute().data or []
+            notes_by_id = {n["id"]: n for n in notes}
+        for r in ns_rows:
+            note = notes_by_id.get(r["note_id"])
+            sensitivity = note["sensitivity"] if note else None
+            reference = r["source_ref"] or (note["source_ref"] if note else None)
+            out[("knowledge_note_source", r["id"])] = {"sensitivity": sensitivity, "reference": reference}
+
+    ext_ref_ids = ids_by_type.get("external_reference")
+    if ext_ref_ids:
+        rows = bc.supabase.table("external_references").select("id,external_file_id,linked_object_type") \
+            .in_("id", list(ext_ref_ids)).execute().data or []
+        for r in rows:
+            out[("external_reference", r["id"])] = {"sensitivity": None, "reference": r.get("external_file_id")}
+
+    cal_ids = ids_by_type.get("calendar_event_snapshot")
+    if cal_ids:
+        rows = bc.supabase.table("calendar_event_snapshots").select("id,title,meeting_url") \
+            .in_("id", list(cal_ids)).execute().data or []
+        for r in rows:
+            out[("calendar_event_snapshot", r["id"])] = {"sensitivity": None, "reference": r.get("meeting_url") or r.get("title")}
+
+    return out
+
+
+def _build_visible_evidence_batch(relationship_ids: list[str], allowed_sensitivities: list[str]) -> dict:
+    """Phase 6H.1 performance pass -- batched form of _build_visible_evidence
+    for the multi-relationship traversal path ONLY (_fetch_relationships_for_
+    endpoint). Fetches every relationship's non-revoked evidence rows in ONE
+    query (.in_("relationship_id", ...)) instead of one query per
+    relationship, then resolves all real sources via
+    _resolve_evidence_sources_batch instead of one query per evidence row.
+    Same visibility filter, same per-relationship id ordering (the
+    underlying query is still ordered by evidence id) -- output is
+    byte-identical to calling _build_visible_evidence once per id in
+    `relationship_ids`, just fetched more cheaply. Returns
+    {relationship_id: [GraphEvidence, ...]}; a relationship_id with no
+    visible evidence is simply absent (caller uses .get(id, [])), matching
+    the single-relationship function's own empty-list result."""
+    if not relationship_ids:
+        return {}
+    ev_rows = bc.supabase.table("knowledge_relationship_evidence").select("*") \
+        .in_("relationship_id", relationship_ids).is_("revoked_at", "null") \
+        .order("id").execute().data or []
+    if not ev_rows:
+        return {}
+
+    sources = _resolve_evidence_sources_batch(ev_rows)
+
+    by_rel: dict = {}
+    for row in ev_rows:
+        source = sources.get((row["evidence_type"], row["evidence_id"]))
+        if source is None:
+            continue
+        if not _is_visible(source["sensitivity"], allowed_sensitivities):
+            continue
+        by_rel.setdefault(row["relationship_id"], []).append(GraphEvidence(
+            evidence_kind=_evidence_kind(row["evidence_type"]),
+            evidence_type=row["evidence_type"],
+            evidence_id=row["evidence_id"],
+            stance=row["stance"],
+            source_reference=source["reference"],
+            captured_at=row["captured_at"],
+            evidence_role="relationship",
+        ))
+    return by_rel
+
+
 # =====================================================================
 # Endpoint label resolution -- one hop out, for the depth-2 traversal view.
 # =====================================================================
 
 def _resolve_endpoint_label(object_type: str, object_id: str) -> Optional[str]:
+    """Single-endpoint form, kept unchanged for get_relationship() (a
+    one-off, low-volume lookup). The multi-relationship traversal path uses
+    _resolve_endpoint_labels_batch below instead."""
     if object_type == "entity":
         rows = bc.supabase.table("knowledge_entities").select("canonical_label").eq("id", object_id).execute().data
         return rows[0]["canonical_label"] if rows else None
@@ -223,6 +331,42 @@ def _resolve_endpoint_label(object_type: str, object_id: str) -> Optional[str]:
         rows = bc.supabase.table("structured_knowledge").select("statement").eq("id", object_id).execute().data
         return rows[0]["statement"] if rows else None
     return None
+
+
+def _resolve_endpoint_labels_batch(rows: list[dict]) -> dict:
+    """Phase 6H.1 performance pass -- batched form of _resolve_endpoint_label
+    for the multi-relationship traversal path ONLY. `rows` are real
+    knowledge_relationships rows; collects every distinct (object_type,
+    object_id) referenced as EITHER a source or a target across all of them,
+    then resolves all entity labels in one query and all structured_
+    knowledge statements in one query (at most 2 queries total, regardless
+    of how many relationships or endpoints are involved) instead of one
+    query per endpoint per relationship. Returns
+    {(object_type, object_id): label|None} -- a caller does
+    .get((object_type, object_id)), which returns None for a missing key,
+    matching _resolve_endpoint_label's own None-if-not-found behavior
+    exactly (never KeyError, never assumed present)."""
+    entity_ids, sk_ids = set(), set()
+    for row in rows:
+        for otype, oid in ((row["source_object_type"], row["source_object_id"]),
+                           (row["target_object_type"], row["target_object_id"])):
+            if otype == "entity":
+                entity_ids.add(oid)
+            elif otype == "structured_knowledge":
+                sk_ids.add(oid)
+
+    labels: dict = {}
+    if entity_ids:
+        rows_ = bc.supabase.table("knowledge_entities").select("id,canonical_label") \
+            .in_("id", list(entity_ids)).execute().data or []
+        for r in rows_:
+            labels[("entity", r["id"])] = r["canonical_label"]
+    if sk_ids:
+        rows_ = bc.supabase.table("structured_knowledge").select("id,statement") \
+            .in_("id", list(sk_ids)).execute().data or []
+        for r in rows_:
+            labels[("structured_knowledge", r["id"])] = r["statement"]
+    return labels
 
 
 # =====================================================================
@@ -315,6 +459,19 @@ def get_entity_graph(entity_id: str, workspace_id: str, allowed_sensitivities: l
     is_historical = as_of is not None
     as_of = as_of or datetime.now(timezone.utc)
 
+    # Phase 6H.1 performance pass -- a thread-pooled parallel version of
+    # these 4 independent fetches was implemented and empirically tested
+    # here (5 concurrent trials against this real database returned
+    # correct, uncorrupted results with no cross-contamination). It was
+    # REVERTED after a real, reproducible httpcore.ReadError ("WinError
+    # 10035: a non-blocking socket operation could not be completed
+    # immediately") surfaced under sustained repeated load -- a Windows-
+    # specific HTTP/2 connection-pool race the smaller isolated test didn't
+    # trigger. This is exactly the "cannot be achieved safely without a
+    # larger architectural redesign" case this phase's own instructions
+    # anticipated: do not invent dangerous optimizations. Sequential calls
+    # only, matching the pre-6H.1 behavior exactly -- see the Phase 6H.1
+    # report's Performance section for the full writeup and numbers.
     rows = bc.supabase.table("knowledge_entities").select("*") \
         .eq("id", entity_id).eq("workspace_id", workspace_id).execute().data
     if not rows:
@@ -392,7 +549,18 @@ def _fetch_relationships_for_endpoint(object_type: str, object_id: str, workspac
     include_non_active=True (only ever set by an explicit historical/as-of
     caller): status is not filtered here at all -- the temporal predicate
     alone decides visibility, matching "historical reads may retrieve
-    non-active relationships when they were valid at the requested time"."""
+    non-active relationships when they were valid at the requested time".
+
+    Phase 6H.1 performance pass: endpoint-label resolution and evidence
+    resolution are now BATCHED across every candidate relationship (one
+    query each, at most, instead of one query per relationship per
+    endpoint/evidence-row) -- see _resolve_endpoint_labels_batch and
+    _build_visible_evidence_batch. The status/temporal filter runs FIRST,
+    before either batch fetch, so a relationship that would be excluded
+    anyway never contributes its endpoints/evidence to what gets batched --
+    same selectivity as before, just resolved for the survivors all at
+    once. Output is byte-identical to the original per-relationship loop;
+    only the number of real network calls changed."""
     col_type = "target_object_type" if as_target else "source_object_type"
     col_id = "target_object_id" if as_target else "source_object_id"
 
@@ -401,13 +569,17 @@ def _fetch_relationships_for_endpoint(object_type: str, object_id: str, workspac
         .eq("workspace_id", workspace_id) \
         .order("valid_from").order("id").execute().data or []
 
+    candidate_rows = [row for row in rows
+                       if (include_non_active or row["status"] == "active") and _temporally_valid(row, as_of)]
+    if not candidate_rows:
+        return []
+
+    evidence_by_rel = _build_visible_evidence_batch([r["id"] for r in candidate_rows], allowed_sensitivities)
+    label_by_endpoint = _resolve_endpoint_labels_batch(candidate_rows)
+
     result = []
-    for row in rows:
-        if not include_non_active and row["status"] != "active":
-            continue
-        if not _temporally_valid(row, as_of):
-            continue
-        evidence = _build_visible_evidence(row["id"], allowed_sensitivities)
+    for row in candidate_rows:
+        evidence = evidence_by_rel.get(row["id"], [])
         if not evidence:
             continue
         result.append(GraphRelationship(
@@ -419,9 +591,9 @@ def _fetch_relationships_for_endpoint(object_type: str, object_id: str, workspac
             valid_until=row["valid_until"],
             rationale=row["rationale"],
             source=GraphEndpoint(row["source_object_type"], row["source_object_id"],
-                                 _resolve_endpoint_label(row["source_object_type"], row["source_object_id"])),
+                                 label_by_endpoint.get((row["source_object_type"], row["source_object_id"]))),
             target=GraphEndpoint(row["target_object_type"], row["target_object_id"],
-                                 _resolve_endpoint_label(row["target_object_type"], row["target_object_id"])),
+                                 label_by_endpoint.get((row["target_object_type"], row["target_object_id"]))),
             evidence=evidence,
         ))
     return result

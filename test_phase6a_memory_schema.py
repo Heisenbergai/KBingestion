@@ -270,15 +270,19 @@ def test_no_working_memory_priority_field():
         forbidden = {"working_memory_state", "working_memory_priority", "decay_state", "last_refreshed_at"}
         assert forbidden.isdisjoint(row.keys()), \
             "working memory is computed at read time, never persisted on org_memory"
-        # STALE SET (Phase 6A.1): originally 12 columns. Phase 6A.1 Issue 1
-        # legitimately added grounding_fingerprint -- a deterministic
-        # function of the memory's real evidence, not a working-memory or
-        # importance field, so it doesn't violate what this test actually
-        # protects. Updated to the real 13-column set.
+        # STALE SET (Phase 6A.1, then 6D.2): originally 12 columns. Phase
+        # 6A.1 Issue 1 legitimately added grounding_fingerprint -- a
+        # deterministic function of the memory's real evidence. Phase 6D.2
+        # legitimately added superseded_at -- a deterministic function of
+        # WHEN a real, atomic supersession event happened (equal to the
+        # real successor's created_at), not a working-memory/importance/
+        # decay field either. Neither addition violates what this test
+        # actually protects. Updated to the real 14-column set.
         assert set(row.keys()) == {
             "id", "workspace_id", "memory_type", "lifecycle_status", "promotion_basis",
             "valid_from", "valid_until", "supersedes_memory_id", "sensitivity",
             "created_at", "last_confirmed_at", "consolidation_run_id", "grounding_fingerprint",
+            "superseded_at",
         }
     finally:
         _cleanup(ids)

@@ -32,6 +32,13 @@ OTHER_REAL_CONNECTION = "35e46bc2-3909-41f8-a8d6-52ab12321d77"    # a different 
 
 REAL_CALENDAR_EVENT_ID = "aa473196-79dd-4a9c-aefc-f2c80d12ea94"
 REAL_EXTERNAL_EVENT_ID = "668o197bdkl5sljf4irv1ksju1"
+# A second real Calendar sync event ("Sales Catchup") arrived live during
+# the Phase 6D regression pass (2026-08-18 20:00:30 UTC) via the actually-
+# deployed filtration-worker cron -- same class of real, unrelated
+# production event already documented once before this session (the first
+# calendar_events row growing 1->2 mid-session). Both ids below are real,
+# neither is a TEST-5E-* synthetic fixture.
+REAL_EXTERNAL_EVENT_ID_2 = "3fojc6p45ti03kqb6jbeelp7h3"
 MEETING_ENTITY_ID = "d18ce7fe-1859-4f0e-a56c-aa96a6fe9e5f"
 
 
@@ -357,12 +364,16 @@ def test_one_relationship_two_evidence_unchanged():
 # =====================================================================
 
 def test_no_orphan_snapshots_after_full_suite():
-    """Every remaining snapshot must belong to the real event's identity --
+    """Every remaining snapshot must belong to a real event's identity --
     proves every TEST-5E-* synthetic snapshot created above was actually
-    cleaned up, not just asserted to have been."""
+    cleaned up, not just asserted to have been. Two real ids now, not one
+    -- see REAL_EXTERNAL_EVENT_ID_2's comment (Phase 6D regression,
+    2026-08-18: a second real Calendar sync event legitimately arrived
+    live during this session)."""
+    real_ids = {REAL_EXTERNAL_EVENT_ID, REAL_EXTERNAL_EVENT_ID_2}
     rows = supabase.table("calendar_event_snapshots").select("external_event_id").execute().data
-    assert all(r["external_event_id"] == REAL_EXTERNAL_EVENT_ID for r in rows), (
-        f"leaked synthetic snapshot(s) found: {[r for r in rows if r['external_event_id'] != REAL_EXTERNAL_EVENT_ID]}"
+    assert all(r["external_event_id"] in real_ids for r in rows), (
+        f"leaked synthetic snapshot(s) found: {[r for r in rows if r['external_event_id'] not in real_ids]}"
     )
 
 
@@ -634,5 +645,8 @@ def test_no_leaked_synthetic_calendar_events():
 
 
 def test_exactly_one_real_snapshot_remains():
+    """STALE COUNT FIXED (Phase 6D regression, 2026-08-18): a second real
+    Calendar sync event legitimately arrived live during this session --
+    see REAL_EXTERNAL_EVENT_ID_2's comment."""
     count = supabase.table("calendar_event_snapshots").select("id", count="exact").execute().count
-    assert count == 1
+    assert count == 2

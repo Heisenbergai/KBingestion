@@ -373,6 +373,10 @@ def test_full_known_state_after_phase_5k1():
         .eq("workspace_id", REAL_WORKSPACE).execute().count == 5
     assert supabase.table("knowledge_relationships").select("id", count="exact") \
         .eq("workspace_id", REAL_WORKSPACE).execute().count == 3
-    assert supabase.table("calendar_event_snapshots").select("id", count="exact").execute().count == 1
+    # STALE COUNT FIXED (Phase 6D regression, 2026-08-18): a second real
+    # Calendar sync event legitimately arrived live during this session via
+    # the deployed filtration-worker cron -- see test_phase5f_person_
+    # identity.py's REAL_CALENDAR_EVENT_2_MEETING_URL comment.
+    assert supabase.table("calendar_event_snapshots").select("id", count="exact").execute().count == 2
     assert supabase.table("structured_knowledge").select("id", count="exact") \
         .eq("workspace_id", REAL_WORKSPACE).execute().count == 14

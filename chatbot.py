@@ -9,6 +9,7 @@ import grounding
 import signals
 import source_labels
 import graph_retrieval
+import memory_retrieval
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Request, Depends, Header
 from auth import AuthContext, current_user
@@ -223,6 +224,7 @@ def run_rag_query(
     # are: confidence computation below needs it even if retrieval raised
     # partway through.
     graph_context = None
+    memory_context = None
     as_of_parsed = None
     if as_of:
         try:
@@ -359,6 +361,27 @@ def run_rag_query(
             f"latency_ms={t_graph_ms:.0f}"
         )
 
+        # Phase 6D -- durable memory context, same insertion point and
+        # reasoning as graph_retrieval above: additive, deduped against both
+        # `chunks` and graph_context's own evidence (Part 9), never a second
+        # retrieval pipeline.
+        t_step = time.perf_counter()
+        memory_context = memory_retrieval.build_memory_context(
+            search_text, bot.workspace_id, filter_sensitivities or ["public", "internal"],
+            as_of=as_of_parsed, graph_context=graph_context,
+        )
+        chunks, memory_metrics = memory_retrieval.merge_memory_context_into_chunks(
+            chunks, memory_context, graph_context=graph_context,
+        )
+        t_memory_ms = (time.perf_counter() - t_step) * 1000
+        print(
+            f"[memory_retrieval][chatbot] bot={bot.name!r} found={memory_metrics['memory_candidates_found']} "
+            f"added={memory_metrics['memory_candidates_added']} "
+            f"deduplicated={memory_metrics['memory_candidates_deduplicated']} "
+            f"memory_only={memory_metrics['memory_only']} "
+            f"latency_ms={t_memory_ms:.0f}"
+        )
+
         if chunks:
             context_parts = []
             for chunk in chunks:
@@ -388,9 +411,12 @@ def run_rag_query(
         "low"
     )
     # ANSWER CONFIDENCE -- same combine_confidence query.py now uses, same
-    # reasoning: fold in GRAPH CONFIDENCE without ever lowering what vector
-    # retrieval already earned.
-    confidence = graph_retrieval.combine_confidence(vector_confidence, graph_context)
+    # reasoning: fold in GRAPH CONFIDENCE then MEMORY CONFIDENCE (Phase 6D)
+    # without ever lowering what came before.
+    confidence = memory_retrieval.combine_confidence(
+        graph_retrieval.combine_confidence(vector_confidence, graph_context),
+        memory_context,
+    )
 
     if context_block:
         system_content = f"""{base_personality}

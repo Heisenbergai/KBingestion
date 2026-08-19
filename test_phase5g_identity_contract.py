@@ -355,10 +355,16 @@ def test_person_evidence_role_is_activity_not_identity():
     'identity' would let a caller wrongly treat meeting attendance as proof
     of who someone is, which could misread mere participation as
     membership/employment."""
+    # STALE COUNT FIXED (Phase 6D regression, 2026-08-18): a second real
+    # Calendar sync event ("Sales Catchup") legitimately arrived live during
+    # this session -- Tanmay organizes/attends it too, so his evidence now
+    # resolves to 2 real snapshots. The actual assertion under test
+    # (evidence_role='activity', never 'identity') applies to every row, not
+    # just one, so it is now checked across all of them.
     tanmay_id = _get_person(TANMAY_EMAIL)["id"]
     evidence = gq.get_entity_primary_evidence(tanmay_id, REAL_WORKSPACE)
-    assert len(evidence) == 1
-    assert evidence[0].evidence_role == "activity"
+    assert len(evidence) == 2
+    assert all(e.evidence_role == "activity" for e in evidence)
 
     john_snow_id = _get_person(JOHN_SNOW_EMAIL)["id"]
     js_evidence = gq.get_entity_primary_evidence(john_snow_id, REAL_WORKSPACE)

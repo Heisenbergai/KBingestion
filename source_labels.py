@@ -30,6 +30,14 @@ SOURCE_TYPE_LABELS: dict[str, str] = {
     # so a citation is honest about where it came from (Part 9: "the graph is
     # never the final source authority").
     "graph_relationship": "Knowledge graph",
+    # Phase 6D: a memory_retrieval-produced candidate -- a durable
+    # organizational memory plus its real grounding evidence, never a
+    # document of its own (org_memory stores no statement, see
+    # memory_retrieval.py's module docstring). Labeled distinctly so a
+    # citation is honest that this is KNOVA's own durable interpretation,
+    # not a fresh document -- the underlying evidence remains the source
+    # of truth, cited inside the candidate's own content.
+    "org_memory": "Durable memory",
 }
 
 

@@ -348,8 +348,13 @@ def test_original_five_entities_preserved():
 # =====================================================================
 
 def test_calendar_snapshot_unchanged():
+    """STALE COUNT FIXED (Phase 6D regression, 2026-08-18): a second real
+    Calendar sync event ("Sales Catchup") legitimately arrived live during
+    this session via the deployed filtration-worker cron -- the actual
+    invariant this test protects (THIS specific snapshot's own content is
+    untouched by anything in this pass) is unaffected and still checked by id."""
     count = supabase.table("calendar_event_snapshots").select("id", count="exact").execute().count
-    assert count == 1
+    assert count == 2
     snap = supabase.table("calendar_event_snapshots").select("*").eq("id", REAL_SNAPSHOT_ID).execute().data[0]
     assert snap["organizer"] == "tanmaydubeytd@gmail.com"
     assert snap["title"] == "Knova Test Meeting 1"
@@ -388,5 +393,8 @@ def test_full_known_state_after_phase_5h():
     assert supabase.table("knowledge_entity_identifiers").select("id", count="exact").execute().count == 5
     assert supabase.table("knowledge_relationships").select("id", count="exact").execute().count == 3
     assert supabase.table("knowledge_relationship_evidence").select("id", count="exact").execute().count == 4
-    assert supabase.table("calendar_event_snapshots").select("id", count="exact").execute().count == 1
+    # STALE COUNT FIXED (Phase 6D regression, 2026-08-18): a second real
+    # Calendar sync event legitimately arrived live during this session --
+    # see test_calendar_snapshot_unchanged's docstring above.
+    assert supabase.table("calendar_event_snapshots").select("id", count="exact").execute().count == 2
     assert supabase.table("structured_knowledge").select("id", count="exact").execute().count == 15
