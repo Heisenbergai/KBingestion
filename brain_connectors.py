@@ -912,16 +912,43 @@ async def disconnect(connection_id: str, delete_notes: bool = False,
     return {"success": True, "notes_deleted": delete_notes}
 
 
+def _resolve_allowed_sensitivities(role: Optional[str], is_super_admin: bool) -> list[str]:
+    """Same ladder as query.py's/chatbot.py's identical helper -- kept as a
+    small local duplicate rather than a cross-module import, matching this
+    codebase's existing convention of small per-file helpers over shared
+    coupling (see query.py's own docstring on this exact point)."""
+    if is_super_admin or role == "owner":
+        return ["public", "internal", "confidential", "restricted"]
+    if role == "admin":
+        return ["public", "internal", "confidential"]
+    return ["public", "internal"]
+
+
 @router.get("/knowledge-notes")
 async def list_knowledge_notes(workspace_id: str, limit: int = 100,
                                auth: AuthContext = Depends(current_user)):
-    """Distilled notes captured from integrations — shown in Library."""
+    """Distilled notes captured from integrations — shown in Library.
+
+    SECURITY FIX (2026-08-17): this route previously applied zero
+    sensitivity filtering -- any workspace member could see every note
+    regardless of its real classified sensitivity, unlike /document-tables
+    which already resolves the caller's real role server-side. The ladder
+    is resolved here from the caller's own role/is_super_admin (never from
+    anything the client sends -- there is no client-supplied sensitivity
+    parameter on this route at all) and applied as a server-side filter,
+    identical in shape to /document-tables' existing mechanism.
+    """
     if not workspace_id:
         raise HTTPException(status_code=400, detail="workspace_id is required.")
     auth.assert_workspace(workspace_id)
+
+    role = auth.role_in(workspace_id)
+    allowed = _resolve_allowed_sensitivities(role, auth.is_super_admin)
+
     rows = supabase.table("knowledge_notes").select(
         "id, provider, source_type, category, title, body, participants, source_ref, occurred_at, created_at"
     ).eq("workspace_id", workspace_id).eq("status", "active") \
+        .in_("sensitivity", allowed) \
         .order("created_at", desc=True).limit(limit).execute().data or []
     return {"notes": rows}
 
