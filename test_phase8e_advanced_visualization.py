@@ -10,6 +10,7 @@ not widen the data.
 Run with: python -m pytest test_phase8e_advanced_visualization.py -v
 """
 import asyncio
+import inspect
 import uuid
 
 import pytest
@@ -20,6 +21,20 @@ from auth import AuthContext
 import graph_query as gq
 import semantic_datasets as sd
 import dashboard_brain_api as api
+
+def _call(result):
+    """Invokes a route handler and returns its result, whether the handler is
+    declared `def` or `async def`.
+
+    The dashboard handlers are plain `def` now: they only ever did blocking
+    Supabase I/O, and declaring that `async` made FastAPI run it ON the event
+    loop, which serialised every concurrent request in the process. The
+    calling convention was never the contract these tests assert, so the
+    helper accepts both rather than pinning one.
+    """
+    if inspect.isawaitable(result):
+        return asyncio.run(result)
+    return result
 
 REAL_WORKSPACE = "f7aab311-c7b5-49c8-a8e4-36c89fa0b25d"
 OWNER = gq.resolve_allowed_sensitivities("owner", False)
@@ -36,7 +51,7 @@ def _api(**kw):
     kw.setdefault("workspace_id", REAL_WORKSPACE)
     auth = AuthContext(user_id="u", workspaces={REAL_WORKSPACE: "owner"},
                        enforced=True, caller="pytest")
-    return asyncio.run(api.query_dataset(api.DatasetQueryRequest(**kw), auth, None))
+    return _call(api.query_dataset(api.DatasetQueryRequest(**kw), auth, None))
 
 
 def _now_iso():

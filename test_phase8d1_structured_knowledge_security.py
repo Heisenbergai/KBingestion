@@ -35,6 +35,20 @@ LOW = gq.resolve_allowed_sensitivities(None, False)          # public + internal
 ADMIN = gq.resolve_allowed_sensitivities("admin", False)     # + confidential
 OWNER = gq.resolve_allowed_sensitivities("owner", False)     # + restricted
 
+def _call(result):
+    """Invokes a route handler and returns its result, whether the handler is
+    declared `def` or `async def`.
+
+    The dashboard handlers are plain `def` now: they only ever did blocking
+    Supabase I/O, and declaring that `async` made FastAPI run it ON the event
+    loop, which serialised every concurrent request in the process. The
+    calling convention was never the contract these tests assert, so the
+    helper accepts both rather than pinning one.
+    """
+    if inspect.isawaitable(result):
+        return asyncio.run(result)
+    return result
+
 REAL_WORKSPACE = "f7aab311-c7b5-49c8-a8e4-36c89fa0b25d"
 
 
@@ -238,7 +252,7 @@ def test_dashboard_drilldown_still_resolves_visible_evidence():
         .eq("workspace_id", REAL_WORKSPACE).limit(1).execute().data[0]["id"]
     auth = AuthContext(user_id="u", workspaces={REAL_WORKSPACE: "owner"},
                        enforced=True, caller="pytest")
-    d = asyncio.run(api.drilldown(api.DrillRequest(
+    d = _call(api.drilldown(api.DrillRequest(
         workspace_id=REAL_WORKSPACE, dataset="evidence",
         object_kind="structured_knowledge", object_id=sk), auth))
     assert d["header"]["label"]
@@ -259,7 +273,7 @@ def test_no_authorization_bypass_through_the_primitive(fx):
     auth = AuthContext(user_id="u", workspaces={fx.ws: "member"},
                        enforced=True, caller="pytest")
     with pytest.raises(HTTPException) as e:
-        asyncio.run(api.drilldown(api.DrillRequest(
+        _call(api.drilldown(api.DrillRequest(
             workspace_id=fx.ws, dataset="evidence",
             object_kind="structured_knowledge", object_id=sk), auth))
     assert e.value.status_code == 404

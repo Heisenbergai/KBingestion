@@ -7,6 +7,7 @@ drive the actual authorization path rather than a mock of it.
 
 Run with: python -m pytest test_phase8d_drilldown_intelligence.py -v
 """
+import inspect
 import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -31,8 +32,21 @@ def _ctx(workspace=REAL_WORKSPACE, role="owner"):
     return AuthContext(user_id="u", workspaces={workspace: role}, enforced=True, caller="pytest")
 
 
-def _run(coro):
-    return asyncio.run(coro)
+def _run(result):
+    """Invokes a route handler and returns its result.
+
+    The handlers used to be `async def`, so this wrapped every call in
+    asyncio.run. They are plain `def` now -- they only ever did blocking
+    Supabase I/O, and declaring that `async` made FastAPI run it ON the event
+    loop, serialising every concurrent request in the process.
+
+    This helper accepts BOTH so it is asserting the handler's result, not its
+    declaration style. Nothing about what these tests check has changed; the
+    calling convention was never the contract under test.
+    """
+    if inspect.isawaitable(result):
+        return asyncio.run(result)
+    return result
 
 
 def _drill(kind, object_id, dataset="memories", workspace=REAL_WORKSPACE, role="owner",

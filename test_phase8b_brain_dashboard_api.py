@@ -39,8 +39,21 @@ def _ctx(workspace=REAL_WORKSPACE, role="owner", super_admin=False, enforced=Tru
                        is_super_admin=super_admin, enforced=enforced, caller="pytest")
 
 
-def _run(coro):
-    return asyncio.run(coro)
+def _run(result):
+    """Invokes a route handler and returns its result.
+
+    The handlers used to be `async def`, so this wrapped every call in
+    asyncio.run. They are plain `def` now -- they only ever did blocking
+    Supabase I/O, and declaring that `async` made FastAPI run it ON the event
+    loop, serialising every concurrent request in the process.
+
+    This helper accepts BOTH so it is asserting the handler's result, not its
+    declaration style. Nothing about what these tests check has changed; the
+    calling convention was never the contract under test.
+    """
+    if inspect.isawaitable(result):
+        return asyncio.run(result)
+    return result
 
 
 def _query(**kw):

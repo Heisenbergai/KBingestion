@@ -12,6 +12,7 @@ against the same configuration, which is exactly what a shared dashboard does.
 
 Run with: python -m pytest test_phase8f_dashboard_sharing.py -v
 """
+import inspect
 import asyncio
 import uuid
 
@@ -28,6 +29,20 @@ import dashboard_detail as dd
 OWNER = gq.resolve_allowed_sensitivities("owner", False)
 LOW = gq.resolve_allowed_sensitivities(None, False)
 
+
+def _call(result):
+    """Invokes a route handler and returns its result, whether the handler is
+    declared `def` or `async def`.
+
+    The dashboard handlers are plain `def` now: they only ever did blocking
+    Supabase I/O, and declaring that `async` made FastAPI run it ON the event
+    loop, which serialised every concurrent request in the process. The
+    calling convention was never the contract these tests assert, so the
+    helper accepts both rather than pinning one.
+    """
+    if inspect.isawaitable(result):
+        return asyncio.run(result)
+    return result
 
 class SharedBoard:
     """A workspace holding a mix of sensitivities, standing in for a dashboard
@@ -55,7 +70,7 @@ class SharedBoard:
 
     def run(self, role, **cfg):
         """The SAME configuration, executed as a given role."""
-        return asyncio.run(api.query_dataset(
+        return _call(api.query_dataset(
             api.DatasetQueryRequest(workspace_id=self.ws, **cfg), self.as_role(role), None))
 
     def cleanup(self):
@@ -161,13 +176,13 @@ def test_drilldown_uses_the_viewers_own_authorization(board):
     must re-authorize -- never inherit the owner's ceiling."""
     restricted_id = board.sk[2]
     with pytest.raises(HTTPException) as e:
-        asyncio.run(api.drilldown(api.DrillRequest(
+        _call(api.drilldown(api.DrillRequest(
             workspace_id=board.ws, dataset="evidence",
             object_kind="structured_knowledge", object_id=restricted_id),
             board.as_role("member")))
     assert e.value.status_code == 404
 
-    owner_view = asyncio.run(api.drilldown(api.DrillRequest(
+    owner_view = _call(api.drilldown(api.DrillRequest(
         workspace_id=board.ws, dataset="evidence",
         object_kind="structured_knowledge", object_id=restricted_id),
         board.as_role("owner")))
@@ -182,7 +197,7 @@ def test_drilldown_object_ids_from_the_frontend_are_untrusted(board):
     codes = []
     for oid in (real_hidden, fabricated):
         with pytest.raises(HTTPException) as e:
-            asyncio.run(api.drilldown(api.DrillRequest(
+            _call(api.drilldown(api.DrillRequest(
                 workspace_id=board.ws, dataset="evidence",
                 object_kind="structured_knowledge", object_id=oid),
                 board.as_role("member")))
@@ -208,7 +223,7 @@ def test_a_viewer_of_another_workspace_is_refused(board):
     other = AuthContext(user_id="stranger", workspaces={str(uuid.uuid4()): "owner"},
                         enforced=True, caller="pytest")
     with pytest.raises(HTTPException) as e:
-        asyncio.run(api.query_dataset(
+        _call(api.query_dataset(
             api.DatasetQueryRequest(workspace_id=board.ws, dataset="evidence"), other, None))
     assert e.value.status_code == 403
 
@@ -218,7 +233,7 @@ def test_membership_elsewhere_grants_nothing_here(board):
     elsewhere = AuthContext(user_id="u", workspaces={str(uuid.uuid4()): "owner"},
                             enforced=True, caller="pytest")
     with pytest.raises(HTTPException):
-        asyncio.run(api.drilldown(api.DrillRequest(
+        _call(api.drilldown(api.DrillRequest(
             workspace_id=board.ws, dataset="evidence",
             object_kind="structured_knowledge", object_id=board.sk[0]), elsewhere))
 

@@ -197,8 +197,28 @@ class DrillRequest(BaseModel):
     max_hops: int = 1
 
 
+# ── Why these handlers are `def` and not `async def` ─────────────────────────
+#
+# Every route below does BLOCKING I/O: the Supabase client is synchronous, and
+# a single dashboard query makes several round trips through it.
+#
+# FastAPI treats the two declarations completely differently. A `def` handler is
+# run in the anyio threadpool, so concurrent requests genuinely overlap. An
+# `async def` handler is run ON the event loop, and blocking inside it stalls
+# that loop -- which means it stalls every other request in the process too.
+#
+# These were `async def` while doing blocking work, and the cost was measured on
+# production, not guessed: one query alone took ~0.9s, but six issued together
+# took 10.9s wall-clock, arriving at 1.4s, 2.1s, 4.6s, 7.7s, 9.5s, 10.9s. That
+# ladder is not contention, it is a queue -- each request waiting for the one
+# before it. A dashboard is the worst possible shape for that, because a board
+# of N widgets fires N queries at once by design.
+#
+# Nothing else changes: no handler here contains a single `await`, so none of
+# them was ever actually asynchronous. `Depends`, the request models and the
+# responses are all identical.
 @router.get("/dashboard/datasets")
-async def list_datasets(auth: AuthContext = Depends(current_user)):
+def list_datasets(auth: AuthContext = Depends(current_user)):
     """The registry itself -- what a widget builder may offer. Contains only
     schema, no workspace data, so it needs authentication but no workspace
     authorization."""
@@ -210,7 +230,7 @@ async def list_datasets(auth: AuthContext = Depends(current_user)):
 
 
 @router.post("/dashboard/query")
-async def query_dataset(body: DatasetQueryRequest,
+def query_dataset(body: DatasetQueryRequest,
                         auth: AuthContext = Depends(current_user),
                         authorization: Optional[str] = Header(None)):
     if not body.workspace_id:
@@ -269,7 +289,7 @@ async def query_dataset(body: DatasetQueryRequest,
 
 
 @router.post("/dashboard/drilldown")
-async def drilldown(body: DrillRequest, auth: AuthContext = Depends(current_user)):
+def drilldown(body: DrillRequest, auth: AuthContext = Depends(current_user)):
     """The one drill-down endpoint. Phase 8D moved the per-object-type
     resolution into dashboard_detail.build_detail so this stays a thin,
     auditable authorization wrapper: authenticate, authorize the workspace,
@@ -357,7 +377,7 @@ class AIExplainRequest(BaseModel):
 
 
 @router.post("/dashboard/ai/build")
-async def ai_build(body: AIGenerateRequest, auth: AuthContext = Depends(current_user)):
+def ai_build(body: AIGenerateRequest, auth: AuthContext = Depends(current_user)):
     """Natural language -> a validated DRAFT. Creates nothing.
 
     The response is a proposal for a human to review and apply. It writes no
@@ -380,7 +400,7 @@ async def ai_build(body: AIGenerateRequest, auth: AuthContext = Depends(current_
 
 
 @router.post("/dashboard/ai/explain")
-async def ai_explain(body: AIExplainRequest, auth: AuthContext = Depends(current_user),
+def ai_explain(body: AIExplainRequest, auth: AuthContext = Depends(current_user),
                      authorization: Optional[str] = Header(None)):
     if not body.workspace_id:
         raise HTTPException(status_code=400, detail="workspace_id is required.")
