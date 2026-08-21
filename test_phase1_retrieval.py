@@ -1677,3 +1677,132 @@ def test_slack_real_ambiguous_connections_cannot_be_resolved_live():
     assert connector_slack._resolve_slack_connection(real_team_id, api_app_id=real_app_id) is None, (
         "real connections share the same app_id -- must still fail closed, not guess"
     )
+
+
+# =====================================================================
+# Architecture V2 Correction Pass -- Correction A: temporal validity filter
+# =====================================================================
+# effective_from/valid_until were already real, populated-at-classification
+# columns before this pass (0/1823 live rows had either set at the time of
+# the correction), but match_chunks_hybrid/match_chunks_workspace never
+# looked at them. This is a CORRECTNESS filter (hard exclude), mirroring the
+# existing deleted_at pattern exactly -- not a ranking signal like
+# authority/lifecycle_status, which were already wired as boosts before this
+# pass and are untouched here. Uses EMPTY_WORKSPACE_WS (real, isolated,
+# 0 pre-existing chunks) so synthetic fixtures can never collide with real
+# content, and cleans up every row it creates.
+
+_TEMPORAL_TEST_MARKER = "PHASE0-CORRECTION-A-TEMPORAL-TEST"
+
+
+def _insert_temporal_test_chunk(embedding: list[float], content: str, **overrides) -> str:
+    import uuid as _uuid
+    row = {
+        "document_id":  str(_uuid.uuid4()),
+        "workspace_id": EMPTY_WORKSPACE_WS,
+        "content":      content,
+        "embedding":    embedding,
+        "chunk_index":  0,
+        "source_type":  "document",
+        "source_tier":  3,
+        "sensitivity":  "internal",
+        "authority":    "working",
+        "lifecycle_status": "active",
+        "metadata":     {"file_name": "phase0-correction-a-fixture.txt"},
+    }
+    row.update(overrides)
+    res = supabase.table("document_chunks").insert(row).execute()
+    return res.data[0]["id"]
+
+
+def test_temporal_validity_filter_excludes_expired_and_not_yet_effective():
+    """
+    Architecture V2 Correction Pass, Correction A. Four synthetic rows in a
+    real, empty, isolated workspace: expired (valid_until in the past),
+    not-yet-effective (effective_from in the future), a control with both
+    dates set but currently valid, and a control with both dates NULL
+    (must behave exactly as before this pass -- NULL means "no temporal
+    constraint", not "never valid"). Checked against BOTH match_chunks_hybrid
+    and its match_chunks_workspace fallback, since the correction was
+    applied to both to keep them in the same "ranking may diverge, access/
+    correctness must not" relationship already established for sensitivity
+    and deleted_at (see F-64 in 15_flags_and_open_items.md).
+    """
+    embedding = _embedding_of(ENG003_SLIDE3_CHUNK)
+    expired_id = not_yet_id = control_id = null_dates_id = None
+    try:
+        expired_id = _insert_temporal_test_chunk(
+            embedding, f"{_TEMPORAL_TEST_MARKER} expired",
+            valid_until="2020-01-01T00:00:00+00:00",
+        )
+        not_yet_id = _insert_temporal_test_chunk(
+            embedding, f"{_TEMPORAL_TEST_MARKER} not yet effective",
+            effective_from="2099-01-01T00:00:00+00:00",
+        )
+        control_id = _insert_temporal_test_chunk(
+            embedding, f"{_TEMPORAL_TEST_MARKER} control currently valid",
+            effective_from="2020-01-01T00:00:00+00:00",
+            valid_until="2099-01-01T00:00:00+00:00",
+        )
+        null_dates_id = _insert_temporal_test_chunk(
+            embedding, f"{_TEMPORAL_TEST_MARKER} control null dates",
+        )
+
+        hybrid_rows = supabase.rpc("match_chunks_hybrid", {
+            "query_text": _TEMPORAL_TEST_MARKER,
+            "query_embedding": embedding,
+            "match_count": 20,
+            "filter_workspace_id": EMPTY_WORKSPACE_WS,
+        }).execute().data or []
+        hybrid_ids = {r["id"] for r in hybrid_rows}
+
+        assert expired_id not in hybrid_ids, "expired row leaked through match_chunks_hybrid"
+        assert not_yet_id not in hybrid_ids, "not-yet-effective row leaked through match_chunks_hybrid"
+        assert control_id in hybrid_ids, "a currently-valid dated row was wrongly excluded from match_chunks_hybrid"
+        assert null_dates_id in hybrid_ids, "a NULL-dates row was wrongly excluded from match_chunks_hybrid"
+
+        vector_only_rows = supabase.rpc("match_chunks_workspace", {
+            "query_embedding": embedding,
+            "match_count": 20,
+            "filter_workspace_id": EMPTY_WORKSPACE_WS,
+        }).execute().data or []
+        vector_only_ids = {r["id"] for r in vector_only_rows}
+
+        assert expired_id not in vector_only_ids, "expired row leaked through match_chunks_workspace fallback"
+        assert not_yet_id not in vector_only_ids, "not-yet-effective row leaked through match_chunks_workspace fallback"
+        assert control_id in vector_only_ids, "a currently-valid dated row was wrongly excluded from the fallback"
+        assert null_dates_id in vector_only_ids, "a NULL-dates row was wrongly excluded from the fallback"
+    finally:
+        for _cid in (expired_id, not_yet_id, control_id, null_dates_id):
+            if _cid:
+                supabase.table("document_chunks").delete().eq("id", _cid).execute()
+
+
+# =====================================================================
+# Architecture V2 Correction Pass -- Correction B: embedding model identity
+# =====================================================================
+
+def test_embedding_model_identity_backfilled_on_all_existing_rows():
+    """
+    Architecture V2 Correction Pass, Correction B. Every row must now have
+    embedding_model set -- the backfill migration is safe for 100% of rows
+    because the Voyage->Titan cutover DELETED old Voyage vectors rather than
+    leaving them mixed in (Project context/04_database_schema.md: "Old
+    Voyage vectors were incompatible and deleted"), independently
+    re-verified live before the migration (0 rows had any prior
+    model-identity marker to contradict an all-Titan backfill).
+    """
+    null_count = supabase.table("document_chunks").select("id", count="exact") \
+        .is_("embedding_model", "null").execute().count
+    assert null_count == 0, f"{null_count} document_chunks rows still have no embedding_model set"
+
+
+def test_embedding_model_identity_matches_live_ai_config():
+    """Every existing row's embedding_model must match ai.py's actual live
+    EMBED_MODEL -- not a hardcoded string that could silently drift from
+    what ai.py really uses if the env var ever changes."""
+    import ai
+    sample = supabase.table("document_chunks").select("embedding_model").limit(100).execute().data
+    assert sample, "sanity: document_chunks should have real rows to sample"
+    mismatched = [r for r in sample if r["embedding_model"] != ai.EMBED_MODEL]
+    assert mismatched == [], f"{len(mismatched)} sampled rows have an embedding_model that doesn't match ai.EMBED_MODEL"

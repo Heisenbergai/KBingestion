@@ -54,13 +54,38 @@ def _parse(ts) -> datetime:
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
 
-def _cleanup(ids: dict) -> None:
+def _cleanup(ids: dict, workspace_id: str = None) -> None:
+    """Teardown, in foreign-key order: evidence, then memory, then the claim.
+
+    `workspace_id` is a BACKSTOP, and it exists because tracking ids by hand
+    is not sufficient. Some of these tests let the database create a memory
+    (the RPC returns its id), so a call that succeeds server-side but whose id
+    never reaches `ids` -- a failed assertion, a dropped connection, a thread
+    that raised -- leaves an untracked memory whose evidence row then PINS a
+    structured_knowledge row. The delete below fails with a foreign-key
+    violation, the teardown aborts part-done, and real rows survive into the
+    shared live database where later tests correctly flag them as leaks.
+
+    Sweeping the throwaway workspace removes whatever was actually created,
+    tracked or not, which is the only version of this that cannot silently
+    half-succeed."""
     for mid in ids.get("memory_ids", []):
         supabase.table("memory_evidence").delete().eq("memory_id", mid).execute()
     for mid in reversed(ids.get("memory_ids", [])):
         supabase.table("org_memory").delete().eq("id", mid).execute()
+
+    if workspace_id:
+        stray = supabase.table("org_memory").select("id") \
+            .eq("workspace_id", workspace_id).execute().data or []
+        for row in stray:
+            supabase.table("memory_evidence").delete().eq("memory_id", row["id"]).execute()
+            supabase.table("org_memory").delete().eq("id", row["id"]).execute()
+
     for sk_id in ids.get("sk_ids", []):
         supabase.table("structured_knowledge").delete().eq("id", sk_id).execute()
+    if workspace_id:
+        supabase.table("structured_knowledge").delete() \
+            .eq("workspace_id", workspace_id).execute()
 
 
 def _make_sk(workspace_id: str, **overrides) -> str:
@@ -420,6 +445,16 @@ def test_concurrent_supersession_leaves_no_impossible_state():
                                     "stance": "supports", "captured_at": _now_iso()}],
                 }).execute()
                 results[idx] = r.data
+                # Recorded THE INSTANT it exists, before any assertion can run.
+                # A memory that was created but never recorded cannot be
+                # cleaned up, and its evidence row then pins the structured
+                # knowledge it points at -- so the teardown's delete fails with
+                # a foreign-key violation and real rows leak into the shared
+                # database. That is not hypothetical: it happened, and the
+                # three rows it left behind failed five other tests in two
+                # different files before anyone reached this one.
+                if isinstance(r.data, str):
+                    ids["memory_ids"].append(r.data)
             except Exception as e:
                 results[idx] = ("error", str(e))
 
@@ -429,7 +464,6 @@ def test_concurrent_supersession_leaves_no_impossible_state():
 
         for r in results:
             assert isinstance(r, str), f"a concurrent successor must not error: {r}"
-        ids["memory_ids"].extend(results)
 
         row_a = _row(memory_a)
         assert row_a["lifecycle_status"] == "superseded"
@@ -439,7 +473,9 @@ def test_concurrent_supersession_leaves_no_impossible_state():
         successor_created_ats = {_row(mid)["created_at"] for mid in results}
         assert row_a["superseded_at"] in successor_created_ats
     finally:
-        _cleanup(ids)
+        # Workspace-scoped: this is the concurrency test, the one that can
+        # create memories it does not get to record.
+        _cleanup(ids, workspace_id=ws)
 
 
 def test_no_orphan_evidence_after_concurrent_supersession():
