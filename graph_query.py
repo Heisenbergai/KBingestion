@@ -320,20 +320,33 @@ def _build_visible_evidence_batch(relationship_ids: list[str], allowed_sensitivi
 # Endpoint label resolution -- one hop out, for the depth-2 traversal view.
 # =====================================================================
 
-def _resolve_endpoint_label(object_type: str, object_id: str) -> Optional[str]:
+def _resolve_endpoint_label(object_type: str, object_id: str,
+                            allowed_sensitivities: list[str]) -> Optional[str]:
     """Single-endpoint form, kept unchanged for get_relationship() (a
     one-off, low-volume lookup). The multi-relationship traversal path uses
-    _resolve_endpoint_labels_batch below instead."""
+    _resolve_endpoint_labels_batch below instead.
+
+    SENSITIVITY (Phase 8D.1). A structured_knowledge endpoint's label IS its
+    statement, so resolving one without the ceiling publishes restricted
+    claim text through any relationship that happens to point at it. Both
+    resolvers now take the ceiling and return None for a claim the caller
+    may not read -- the same value they already return for an endpoint that
+    does not exist, so no caller needs new None-handling.
+
+    Entities carry no sensitivity column, so their labels are unaffected."""
     if object_type == "entity":
         rows = bc.supabase.table("knowledge_entities").select("canonical_label").eq("id", object_id).execute().data
         return rows[0]["canonical_label"] if rows else None
     if object_type == "structured_knowledge":
-        rows = bc.supabase.table("structured_knowledge").select("statement").eq("id", object_id).execute().data
-        return rows[0]["statement"] if rows else None
+        rows = bc.supabase.table("structured_knowledge").select("statement,sensitivity").eq("id", object_id).execute().data
+        if not rows or not _is_visible(rows[0].get("sensitivity"), allowed_sensitivities):
+            return None
+        return rows[0]["statement"]
     return None
 
 
-def _resolve_endpoint_labels_batch(rows: list[dict]) -> dict:
+def _resolve_endpoint_labels_batch(rows: list[dict],
+                                   allowed_sensitivities: list[str]) -> dict:
     """Phase 6H.1 performance pass -- batched form of _resolve_endpoint_label
     for the multi-relationship traversal path ONLY. `rows` are real
     knowledge_relationships rows; collects every distinct (object_type,
@@ -362,10 +375,13 @@ def _resolve_endpoint_labels_batch(rows: list[dict]) -> dict:
         for r in rows_:
             labels[("entity", r["id"])] = r["canonical_label"]
     if sk_ids:
-        rows_ = bc.supabase.table("structured_knowledge").select("id,statement") \
+        rows_ = bc.supabase.table("structured_knowledge").select("id,statement,sensitivity") \
             .in_("id", list(sk_ids)).execute().data or []
         for r in rows_:
-            labels[("structured_knowledge", r["id"])] = r["statement"]
+            # Phase 8D.1: an invisible claim contributes NO key, so the
+            # caller's .get() returns None -- identical to "not found".
+            if _is_visible(r.get("sensitivity"), allowed_sensitivities):
+                labels[("structured_knowledge", r["id"])] = r["statement"]
     return labels
 
 
@@ -399,9 +415,9 @@ def get_relationship(relationship_id: str, workspace_id: str,
         valid_until=row["valid_until"],
         rationale=row["rationale"],
         source=GraphEndpoint(row["source_object_type"], row["source_object_id"],
-                             _resolve_endpoint_label(row["source_object_type"], row["source_object_id"])),
+                             _resolve_endpoint_label(row["source_object_type"], row["source_object_id"], allowed_sensitivities)),
         target=GraphEndpoint(row["target_object_type"], row["target_object_id"],
-                             _resolve_endpoint_label(row["target_object_type"], row["target_object_id"])),
+                             _resolve_endpoint_label(row["target_object_type"], row["target_object_id"], allowed_sensitivities)),
         evidence=evidence,
     )
 
@@ -507,13 +523,35 @@ def get_structured_knowledge_graph(structured_knowledge_id: str, workspace_id: s
     meaningful here -- checked as both, for correctness, not assumed.
 
     Phase 5K Part 3: same status semantics as get_entity_graph -- see that
-    function's docstring."""
+    function's docstring.
+
+    SENSITIVITY (Phase 8D.1). The claim ITSELF is gated here, not just the
+    relationships around it. Until this pass the row was selected by id +
+    workspace alone and `allowed_sensitivities` was applied only to the
+    relationship reads, so this function returned a restricted statement to
+    any caller that asked for it by id. That is an architectural defect
+    rather than a caller bug: a shared primitive must not depend on every
+    present and future caller remembering to pre-filter.
+
+    It was reachable in production. impact_analysis._load_node_graph uses
+    `sk["statement"]` as an ImpactNode LABEL without pre-filtering, so a
+    restricted claim's text surfaced in impact paths in BOTH directions --
+    as the origin's own label, and as the target label when traversing into
+    it from a visible entity.
+
+    Returning None for an invisible claim is deliberately the SAME result as
+    for a non-existent one, so neither a caller nor anyone probing through
+    one can distinguish "hidden from you" from "does not exist"."""
     is_historical = as_of is not None
     as_of = as_of or datetime.now(timezone.utc)
 
-    rows = bc.supabase.table("structured_knowledge").select("id,statement") \
+    rows = bc.supabase.table("structured_knowledge").select("id,statement,sensitivity") \
         .eq("id", structured_knowledge_id).eq("workspace_id", workspace_id).execute().data
     if not rows:
+        return None
+    if not _is_visible(rows[0].get("sensitivity"), allowed_sensitivities):
+        # Identical to "no such row": no statement, no relationships, no
+        # count, and nothing in the return value that confirms existence.
         return None
 
     outbound = _fetch_relationships_for_endpoint("structured_knowledge", structured_knowledge_id,
@@ -575,7 +613,7 @@ def _fetch_relationships_for_endpoint(object_type: str, object_id: str, workspac
         return []
 
     evidence_by_rel = _build_visible_evidence_batch([r["id"] for r in candidate_rows], allowed_sensitivities)
-    label_by_endpoint = _resolve_endpoint_labels_batch(candidate_rows)
+    label_by_endpoint = _resolve_endpoint_labels_batch(candidate_rows, allowed_sensitivities)
 
     result = []
     for row in candidate_rows:

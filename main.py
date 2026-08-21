@@ -23,6 +23,7 @@ from bot_learning import router as bot_learning_router
 from admin import router as admin_router
 from signals import router as signals_router
 from wiki_api import router as wiki_router
+from dashboard_brain_api import router as dashboard_brain_router
 
 app = FastAPI(title="Knowledge OS API", version="1.0.0")
 
@@ -57,6 +58,7 @@ app.include_router(bot_learning_router)
 app.include_router(admin_router)
 app.include_router(signals_router)
 app.include_router(wiki_router)
+app.include_router(dashboard_brain_router)
 
 @app.get("/health")
 def health_check():
