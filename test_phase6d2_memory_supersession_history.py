@@ -54,6 +54,33 @@ def _parse(ts) -> datetime:
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
 
+def _unlink_supersession(memory_ids: list) -> None:
+    """Breaks org_memory's self-reference before any row is deleted.
+
+    `supersedes_memory_id` points from a successor back to its predecessor, so
+    deleting the predecessor while a successor still references it raises
+    org_memory_supersedes_memory_id_fkey. Ordering alone cannot save this: the
+    concurrent-supersession test deliberately creates TWO successors of one
+    predecessor, which is a branch rather than a chain, so no single delete
+    order is correct for every shape the tests produce.
+
+    Nulling the link first makes the delete order-independent. This matters
+    most after a test that FAILED partway, because that is exactly when the
+    tangled state exists -- the teardown then aborts on the foreign key and the
+    rows survive into the shared live database, where later suites correctly
+    flag them as leaks. That is how one Windows socket error inside the
+    concurrency test turned into six failures across three files: three leaked
+    structured_knowledge rows moved the global count from 15 to 18.
+    """
+    if not memory_ids:
+        return
+    referring = supabase.table("org_memory").select("id") \
+        .in_("supersedes_memory_id", memory_ids).execute().data or []
+    for row in referring:
+        supabase.table("org_memory").update({"supersedes_memory_id": None}) \
+            .eq("id", row["id"]).execute()
+
+
 def _cleanup(ids: dict, workspace_id: str = None) -> None:
     """Teardown, in foreign-key order: evidence, then memory, then the claim.
 
@@ -69,17 +96,22 @@ def _cleanup(ids: dict, workspace_id: str = None) -> None:
     Sweeping the throwaway workspace removes whatever was actually created,
     tracked or not, which is the only version of this that cannot silently
     half-succeed."""
-    for mid in ids.get("memory_ids", []):
+    tracked = ids.get("memory_ids", [])
+    for mid in tracked:
         supabase.table("memory_evidence").delete().eq("memory_id", mid).execute()
-    for mid in reversed(ids.get("memory_ids", [])):
+    _unlink_supersession(tracked)
+    for mid in reversed(tracked):
         supabase.table("org_memory").delete().eq("id", mid).execute()
 
     if workspace_id:
         stray = supabase.table("org_memory").select("id") \
             .eq("workspace_id", workspace_id).execute().data or []
-        for row in stray:
-            supabase.table("memory_evidence").delete().eq("memory_id", row["id"]).execute()
-            supabase.table("org_memory").delete().eq("id", row["id"]).execute()
+        stray_ids = [row["id"] for row in stray]
+        for mid in stray_ids:
+            supabase.table("memory_evidence").delete().eq("memory_id", mid).execute()
+        _unlink_supersession(stray_ids)
+        for mid in stray_ids:
+            supabase.table("org_memory").delete().eq("id", mid).execute()
 
     for sk_id in ids.get("sk_ids", []):
         supabase.table("structured_knowledge").delete().eq("id", sk_id).execute()
