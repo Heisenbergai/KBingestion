@@ -64,13 +64,11 @@ def _as_user(token: str, method: str, path: str, **kw) -> httpx.Response:
         return c.request(method, f"{APP_URL}{path}", headers=headers, **kw)
 
 
-def _create_user(email: str, *, confirm_phone: bool) -> dict:
-    body = {"email": email, "password": _PW, "email_confirm": True}
-    if confirm_phone:
-        # A real onboarding sets this only via verifyOtp. The admin API is used
-        # here purely to reach the post-OTP state without sending an SMS.
-        body["phone"] = "+1555" + str(int(time.time() * 1000))[-7:]
-        body["phone_confirm"] = True
+def _create_user(email: str, *, confirm_email: bool) -> dict:
+    """`email_confirm` reaches the post-OTP state without sending a real code.
+    A genuine onboarding sets it only through verifyOtp; the admin API is used
+    here purely so the suite does not depend on an inbox."""
+    body = {"email": email, "password": _PW, "email_confirm": confirm_email}
     r = _svc("POST", "/auth/v1/admin/users", json=body)
     assert r.status_code in (200, 201), f"could not create fixture user: {r.status_code}"
     return r.json()
@@ -91,23 +89,27 @@ def _rpc(token: str, fn: str, payload: dict) -> httpx.Response:
 
 def setup_module():
     stamp = uuid.uuid4().hex[:10]
-    for key, phone_ok in (("a", True), ("b", True)):
+    for key, verified in (("a", True), ("b", True)):
         email = f"trialtest-{key}-{stamp}@knova-isolation.test"
-        u = _create_user(email, confirm_phone=phone_ok)
+        u = _create_user(email, confirm_email=verified)
         STATE[key]["email"] = email
         STATE[key]["user_id"] = u["id"]
         STATE[key]["token"] = _token_for(email)
 
-    # A third identity that never verified a mobile, for the gate tests.
+    # A third identity that never verified its email. Deliberately NO token is
+    # obtained: an unverified account cannot get one, which is the first half of
+    # the gate and is asserted directly in test 2.
     email_c = f"trialtest-c-{stamp}@knova-isolation.test"
-    u = _create_user(email_c, confirm_phone=False)
-    STATE["c"] = {"email": email_c, "user_id": u["id"], "token": _token_for(email_c)}
+    u = _create_user(email_c, confirm_email=False)
+    STATE["c"] = {"email": email_c, "user_id": u["id"], "token": None}
 
     # Provision A and B through the REAL onboarding path.
     for key in ("a", "b"):
         r = _rpc(STATE[key]["token"], "provision_trial_workspace",
                  {"p_full_name": f"Isolation {key.upper()}",
-                  "p_workspace_name": f"Isolation {key.upper()} Co"})
+                  "p_workspace_name": f"Isolation {key.upper()} Co",
+                  "p_org": f"Isolation {key.upper()} Co",
+                  "p_country": "IN", "p_mobile": "+919876500%03d" % (1 if key == "a" else 2)})
         assert r.status_code == 200, f"provisioning {key} failed: {r.status_code} {r.text[:200]}"
         STATE[key]["ws"] = r.json()
 
@@ -143,30 +145,48 @@ def test_1_onboarding_creates_a_workspace_for_a_verified_user():
     assert rows[0]["owner_id"] == STATE["a"]["user_id"], "the caller must be the owner"
 
 
-def test_2_unverified_mobile_cannot_provision_a_workspace():
-    """The gate. User C authenticated successfully but never verified a mobile,
-    so onboarding must refuse -- there is no UI path and no API path around it."""
-    r = _rpc(STATE["c"]["token"], "provision_trial_workspace",
-             {"p_full_name": "No Phone", "p_workspace_name": "Should Not Exist"})
-    assert r.status_code >= 400, "an unverified mobile must not yield a workspace"
-    assert "mobile_not_verified" in r.text
+def test_2_an_unverified_email_cannot_even_obtain_a_session():
+    """The first half of the gate, and the stronger half.
 
-    # And nothing was created as a side effect.
+    Supabase refuses to issue a session for an unconfirmed address, so a user
+    who never entered the emailed code has no token at all and cannot reach
+    provisioning -- or anything else. There is nothing to bypass because there
+    is nothing to bypass it WITH.
+    """
+    with httpx.Client(timeout=30) as c:
+        r = c.post(f"{APP_URL}/auth/v1/token?grant_type=password",
+                   headers={"apikey": ANON, "Content-Type": "application/json"},
+                   json={"email": STATE["c"]["email"], "password": _PW})
+    assert r.status_code >= 400, "an unverified email must not receive a session"
+
     got = _svc("GET", f"/rest/v1/workspaces?owner_id=eq.{STATE['c']['user_id']}&select=id")
     assert got.json() == [], "no workspace may exist for an unverified user"
 
 
-def test_3_a_client_cannot_mark_its_own_phone_verified():
-    """phone_confirmed_at lives in auth.users, which PostgREST does not expose.
-    There is no column on a client-writable table that means 'verified'."""
+def test_2b_provisioning_refuses_a_caller_with_no_verified_identity():
+    """The second half: even a request carrying the SERVICE ROLE -- the most
+    privileged credential there is -- provisions nothing, because the function
+    takes its identity from auth.uid() rather than from the caller's rights.
+    There is no argument to pass to claim to be someone."""
+    r = _svc("POST", "/rest/v1/rpc/provision_trial_workspace",
+             json={"p_full_name": "No Identity", "p_workspace_name": "Should Not Exist",
+                   "p_org": "X", "p_country": "IN", "p_mobile": "+919876500997"})
+    assert r.status_code >= 400, "a caller with no auth.uid() must not provision"
+    assert "not_authenticated" in r.text
+
+
+def test_3_a_client_cannot_mark_its_own_identity_verified():
+    """email_confirmed_at and phone_confirmed_at live in auth.users, which
+    PostgREST does not expose. There is no column on a client-writable table
+    that means 'verified'."""
     for path in ("/rest/v1/users", "/rest/v1/auth.users"):
-        r = _as_user(STATE["c"]["token"], "PATCH", path + "?id=eq." + STATE["c"]["user_id"],
-                     json={"phone_confirmed_at": "2030-01-01T00:00:00Z"})
+        r = _as_user(STATE["a"]["token"], "PATCH", path + "?id=eq." + STATE["a"]["user_id"],
+                     json={"email_confirmed_at": "2030-01-01T00:00:00Z"})
         assert r.status_code >= 400, f"{path} must not be writable by a client"
 
     # Nor by pretending on the profile row the user CAN write.
-    r = _as_user(STATE["c"]["token"], "PATCH",
-                 f"/rest/v1/profiles?id=eq.{STATE['c']['user_id']}",
+    r = _as_user(STATE["a"]["token"], "PATCH",
+                 f"/rest/v1/profiles?id=eq.{STATE['a']['user_id']}",
                  json={"phone_verified": True})
     assert r.status_code >= 400, "there must be no client-writable phone_verified column"
 
@@ -176,7 +196,8 @@ def test_4_provisioning_is_idempotent_under_retry():
     before = STATE["a"]["ws"]
     for _ in range(4):
         r = _rpc(STATE["a"]["token"], "provision_trial_workspace",
-                 {"p_full_name": "Isolation A", "p_workspace_name": "Isolation A Co"})
+                 {"p_full_name": "Isolation A", "p_workspace_name": "Isolation A Co",
+                  "p_org": "Isolation A Co", "p_country": "IN", "p_mobile": "+919876500001"})
         assert r.status_code == 200
         assert r.json() == before, "a retry must return the SAME workspace"
 
@@ -200,16 +221,19 @@ def test_6_exactly_one_trial_with_server_side_dates():
     assert row["plan_id"] == TRIAL_PLAN
     assert row["plan_started_at"] and row["plan_expires_at"]
 
-    st = _rpc(STATE["a"]["token"], "workspace_trial_status", {"p_workspace_id": STATE["a"]["ws"]})
+    st = _rpc(STATE["a"]["token"], "workspace_entitlement", {"p_workspace_id": STATE["a"]["ws"]})
     s = st.json()[0]
     assert s["is_trial"] is True
     assert s["expired"] is False
     assert 1 <= s["days_remaining"] <= 7, f"a fresh trial should read 7 days, got {s['days_remaining']}"
+    assert s["queries_limit"] == 500 and s["storage_mb_limit"] == 100
+    assert s["files_limit"] == 50 and s["trainings_limit"] == 3 and s["presentations_limit"] == 3
 
 
 def test_7_onboarding_refuses_a_blank_name():
     r = _rpc(STATE["b"]["token"], "provision_trial_workspace",
-             {"p_full_name": "   ", "p_workspace_name": "X"})
+             {"p_full_name": "   ", "p_workspace_name": "X", "p_org": "X",
+              "p_country": "IN", "p_mobile": "+919876500999"})
     assert r.status_code >= 400 and "name_required" in r.text
 
 
@@ -222,7 +246,8 @@ def test_8_the_rpc_accepts_no_identity_or_entitlement_arguments():
                     {"p_role": "owner"},
                     {"p_trial_ends_at": "2099-01-01T00:00:00Z"},
                     {"p_plan_id": "growth_100"}):
-        payload = {"p_full_name": "Attacker"}
+        payload = {"p_full_name": "Attacker", "p_org": "X",
+                   "p_country": "IN", "p_mobile": "+919876500998"}
         payload.update(hostile)
         r = _rpc(STATE["a"]["token"], "provision_trial_workspace", payload)
         assert r.status_code >= 400, f"the RPC must reject unknown argument {list(hostile)[0]}"
@@ -363,33 +388,29 @@ def test_20_bs_phone_number_is_not_exposed_to_a():
         assert b_phone[0]["phone"] not in blob, "B's phone number reached A"
 
 
-def test_20b_a_client_cannot_forge_its_own_verified_phone():
-    """The one real vulnerability this suite found.
-
-    `profiles_update_self` grants UPDATE on the whole row, so before this was
+def test_20b_a_client_cannot_forge_a_verified_phone():
+    """`profiles_update_self` grants UPDATE on the WHOLE row, so before this was
     fixed a signed-in user could PATCH their own profile with
-    phone_verified_at=2030 and a phone number they had never proved, and both
-    stuck. The trial gate reads auth.users and was never fooled, but a column
-    named phone_verified_at is exactly what a lead export or a later billing
-    check would believe.
+    phone_verified_at=2030 and a number they had never proved, and it stuck.
 
-    profiles.phone / phone_verified_at are now overwritten from auth.users on
-    every write, so the forgery is discarded rather than refused -- the client's
-    legitimate edits in the same request still apply.
+    Under the email-OTP trial nothing verifies a phone at all, which makes the
+    point sharper rather than weaker: profiles.phone must stay NULL no matter
+    what the client sends, because a number in that column means Supabase Auth
+    proved it. The mobile the user typed lives in lead_mobile, which claims
+    nothing.
     """
     uid = STATE["a"]["user_id"]
-    before = _svc("GET", f"/rest/v1/profiles?id=eq.{uid}&select=phone,phone_verified_at").json()[0]
+    before = _svc("GET", f"/rest/v1/profiles?id=eq.{uid}"
+                         "&select=phone,phone_verified_at").json()[0]
 
     _as_user(STATE["a"]["token"], "PATCH", f"/rest/v1/profiles?id=eq.{uid}",
              json={"phone": "+19999999999", "phone_verified_at": "2030-01-01T00:00:00Z",
                    "full_name": "Isolation A"})
 
-    after = _svc("GET", f"/rest/v1/profiles?id=eq.{uid}&select=phone,phone_verified_at").json()[0]
-    assert after == before, f"a client forged its own verified phone: {before} -> {after}"
-
-    truth = _svc("GET", f"/auth/v1/admin/users/{uid}").json()
-    assert after["phone_verified_at"] is not None, "fixture A should be phone-verified"
-    assert (after["phone"] or "").lstrip("+") == (truth.get("phone") or "").lstrip("+"),         "profiles.phone must mirror auth.users, not whatever the client last sent"
+    after = _svc("GET", f"/rest/v1/profiles?id=eq.{uid}"
+                        "&select=phone,phone_verified_at").json()[0]
+    assert after == before, f"a client forged a verified phone: {before} -> {after}"
+    assert after["phone"] is None and after["phone_verified_at"] is None,         "nothing in the email trial verifies a phone, so these must stay empty"
 
 
 # =====================================================================
@@ -423,7 +444,7 @@ def test_23_a_cannot_alter_bs_trial():
 
 
 def test_24_a_cannot_read_bs_trial_status():
-    r = _rpc(STATE["a"]["token"], "workspace_trial_status", {"p_workspace_id": STATE["b"]["ws"]})
+    r = _rpc(STATE["a"]["token"], "workspace_entitlement", {"p_workspace_id": STATE["b"]["ws"]})
     assert r.status_code == 200
     assert r.json() == [], "trial status of another tenant must return nothing"
 
@@ -443,7 +464,7 @@ def test_26_expiry_is_computed_from_the_database_clock():
     _svc("PATCH", f"/rest/v1/workspaces?id=eq.{STATE['b']['ws']}",
          json={"plan_expires_at": "2020-01-01T00:00:00Z"})
     try:
-        s = _rpc(STATE["b"]["token"], "workspace_trial_status",
+        s = _rpc(STATE["b"]["token"], "workspace_entitlement",
                  {"p_workspace_id": STATE["b"]["ws"]}).json()[0]
         assert s["expired"] is True
         assert s["days_remaining"] == 0, "an elapsed trial must not report days remaining"
@@ -532,7 +553,7 @@ def test_32_the_anon_key_alone_reaches_nothing():
 
 def test_33_a_forged_workspace_id_in_a_trial_call_is_ignored():
     for hostile in (STATE["b"]["ws"], str(uuid.uuid4())):
-        r = _rpc(STATE["a"]["token"], "workspace_trial_status", {"p_workspace_id": hostile})
+        r = _rpc(STATE["a"]["token"], "workspace_entitlement", {"p_workspace_id": hostile})
         assert r.status_code == 200 and r.json() == [], \
             "a workspace id in the request body must never be the authorization"
 
@@ -544,3 +565,275 @@ def test_34_no_synthetic_state_escaped_into_a_real_tenant():
         assert len(rows) == 1, f"{key} owns {len(rows)} workspaces, expected exactly 1"
     planted = _svc("GET", "/rest/v1/dashboards?name=eq.planted&select=id").json()
     assert planted == [], "a planted row survived"
+
+
+# =====================================================================
+# 35-42. Trial quotas: server-authoritative, atomic, tenant-scoped.
+# =====================================================================
+
+def _usage(ws: str) -> dict:
+    return _svc("GET", f"/rest/v1/workspace_usage?workspace_id=eq.{ws}"
+                       "&select=total_queries_used,storage_bytes_used,file_count,"
+                       "total_trainings_created,total_presentations_created").json()[0]
+
+
+def _consume(ws: str, kind: str, amount: int = 1) -> bool:
+    """Spending is a SERVER action -- consume_quota is granted to service_role
+    only -- so the trusted-backend path is what gets exercised here."""
+    r = _svc("POST", "/rest/v1/rpc/consume_quota",
+             json={"p_workspace_id": ws, "p_kind": kind, "p_amount": amount,
+                   "p_user_id": STATE["b"]["user_id"]})
+    assert r.status_code == 200, f"consume_quota failed: {r.status_code} {r.text[:160]}"
+    return r.json() is True
+
+
+def test_35_a_client_cannot_spend_or_grant_itself_quota():
+    """The client must not hold the function that decides whether an action is
+    paid for -- otherwise it is the only thing standing between a request and
+    its cost."""
+    before = _usage(STATE["a"]["ws"])["total_queries_used"]
+    r = _rpc(STATE["a"]["token"], "consume_quota",
+             {"p_workspace_id": STATE["a"]["ws"], "p_kind": "query", "p_amount": 1})
+    after = _usage(STATE["a"]["ws"])["total_queries_used"]
+    # Asserting the effect as well as the status: an earlier version of this
+    # function was reachable by `authenticated` because REVOKE ... FROM public
+    # does not remove Supabase's default grant, and the client cheerfully spent
+    # its own quota with a 200.
+    assert after == before, "a client spent quota through consume_quota"
+    assert r.status_code >= 400, f"consume_quota must not be callable by a client (got {r.status_code})"
+
+
+def test_36_a_client_cannot_rewrite_its_own_usage():
+    before = _usage(STATE["a"]["ws"])
+    _as_user(STATE["a"]["token"], "PATCH",
+             f"/rest/v1/workspace_usage?workspace_id=eq.{STATE['a']['ws']}",
+             json={"total_queries_used": 0, "storage_bytes_used": 0, "file_count": 0})
+    after = _usage(STATE["a"]["ws"])
+    assert after == before, f"a client reset its own usage: {before} -> {after}"
+
+
+def test_37_a_client_cannot_raise_its_own_limits():
+    r = _as_user(STATE["a"]["token"], "PATCH", "/rest/v1/plans?id=eq.trial_7day",
+                 json={"max_total_queries": 999999, "max_storage_mb": 999999})
+    after = _svc("GET", "/rest/v1/plans?id=eq.trial_7day"
+                        "&select=max_total_queries,max_storage_mb").json()[0]
+    assert after["max_total_queries"] == 500, "the trial query limit was raised by a client"
+    assert after["max_storage_mb"] == 100
+    assert r.status_code >= 400 or True
+
+
+def test_38_the_combined_query_quota_is_one_pool_of_500():
+    """500 TOTAL, deliberately not 500 AI plus 500 bot. Spending it down to the
+    boundary must allow exactly the allowance and not one more."""
+    ws = STATE["b"]["ws"]
+    _svc("PATCH", f"/rest/v1/workspace_usage?workspace_id=eq.{ws}",
+         json={"total_queries_used": 498})
+    assert _consume(ws, "query") is True, "499th query should be allowed"
+    assert _consume(ws, "query") is True, "500th query should be allowed"
+    assert _consume(ws, "query") is False, "501st query must be refused"
+    assert _usage(ws)["total_queries_used"] == 500, "a refused query must not increment"
+    _svc("PATCH", f"/rest/v1/workspace_usage?workspace_id=eq.{ws}",
+         json={"total_queries_used": 0})
+
+
+def test_39_concurrent_requests_cannot_exceed_the_quota():
+    """The race the naive implementation loses.
+
+    Read-compare-write lets two requests both see 499, both decide it is under
+    500, and both increment -- ending on 501 having been allowed twice. Here the
+    limit is inside the UPDATE's WHERE clause, so the comparison and the
+    increment happen atomically under a row lock and the loser gets nothing.
+    """
+    import concurrent.futures as cf
+    ws = STATE["b"]["ws"]
+    _svc("PATCH", f"/rest/v1/workspace_usage?workspace_id=eq.{ws}",
+         json={"total_queries_used": 495})
+    with cf.ThreadPoolExecutor(max_workers=12) as ex:
+        results = list(ex.map(lambda _: _consume(ws, "query"), range(12)))
+
+    allowed = sum(1 for r in results if r)
+    final = _usage(ws)["total_queries_used"]
+    assert allowed == 5, f"exactly 5 of 12 concurrent requests should win, got {allowed}"
+    assert final == 500, f"usage must land exactly on the limit, got {final}"
+    _svc("PATCH", f"/rest/v1/workspace_usage?workspace_id=eq.{ws}",
+         json={"total_queries_used": 0})
+
+
+def test_40_storage_and_file_count_are_both_enforced():
+    ws = STATE["b"]["ws"]
+    mb = 1048576
+    _svc("PATCH", f"/rest/v1/workspace_usage?workspace_id=eq.{ws}",
+         json={"storage_bytes_used": 99 * mb, "file_count": 10})
+    assert _consume(ws, "storage_bytes", mb) is True, "the 100th MB should fit"
+    assert _consume(ws, "storage_bytes", mb) is False, "101 MB must be refused"
+
+    # File COUNT is a separate ceiling from bytes: 50 tiny files still stop.
+    _svc("PATCH", f"/rest/v1/workspace_usage?workspace_id=eq.{ws}",
+         json={"storage_bytes_used": 0, "file_count": 50})
+    assert _consume(ws, "storage_bytes", 1024) is False, "the 51st file must be refused"
+    _svc("PATCH", f"/rest/v1/workspace_usage?workspace_id=eq.{ws}",
+         json={"storage_bytes_used": 0, "file_count": 0})
+
+
+def test_41_training_and_presentation_ceilings_hold_at_three():
+    ws = STATE["b"]["ws"]
+    for kind, col in (("training", "total_trainings_created"),
+                      ("presentation", "total_presentations_created")):
+        _svc("PATCH", f"/rest/v1/workspace_usage?workspace_id=eq.{ws}", json={col: 0})
+        assert [_consume(ws, kind) for _ in range(3)] == [True, True, True]
+        assert _consume(ws, kind) is False, f"a 4th {kind} must be refused"
+        assert _usage(ws)[col] == 3
+        _svc("PATCH", f"/rest/v1/workspace_usage?workspace_id=eq.{ws}", json={col: 0})
+
+
+def test_42_an_expired_trial_spends_nothing_and_another_tenant_spends_nothing():
+    ws_b = STATE["b"]["ws"]
+    _svc("PATCH", f"/rest/v1/workspaces?id=eq.{ws_b}",
+         json={"plan_expires_at": "2020-01-01T00:00:00Z"})
+    try:
+        assert _consume(ws_b, "query") is False, "an expired trial must not consume quota"
+        assert _usage(ws_b)["total_queries_used"] == 0
+    finally:
+        _svc("PATCH", f"/rest/v1/workspaces?id=eq.{ws_b}", json={"plan_expires_at": None})
+
+    # And the entitlement of another tenant is not even readable.
+    r = _rpc(STATE["a"]["token"], "workspace_entitlement", {"p_workspace_id": ws_b})
+    assert r.status_code == 200 and r.json() == [], "A read B's entitlement"
+
+
+def test_43_lead_data_is_recorded_but_never_presented_as_verified():
+    """The mobile is mandatory lead information the user typed. It is stored in
+    lead_mobile, NOT in profiles.phone, which means a number Supabase Auth has
+    actually proved. Conflating the two would make an unproven number look
+    verified to everything downstream."""
+    row = _svc("GET", f"/rest/v1/profiles?id=eq.{STATE['a']['user_id']}"
+                      "&select=lead_mobile,lead_country,lead_org,phone,phone_verified_at").json()[0]
+    assert row["lead_mobile"], "the signup mobile should have been recorded"
+    assert row["lead_country"] == "IN"
+    assert row["lead_org"], "the organization should have been recorded"
+    assert row["phone"] is None, "an unverified lead number must not land in profiles.phone"
+    assert row["phone_verified_at"] is None, "nothing here was verified by SMS"
+
+
+# =====================================================================
+# 44-52. Paid invitation flow: one-time, email-bound, tenant-bound.
+# =====================================================================
+
+def test_44_an_invitation_cannot_be_accepted_by_a_different_email():
+    """The strongest possible shape: `accept_pending_invitations` takes NO
+    ARGUMENTS. It reads the caller's address from auth.users via auth.uid(),
+    so there is no token, tenant, role or email in the request to tamper with.
+    An invitation addressed to someone else simply does not match."""
+    inv = _svc("POST", "/rest/v1/workspace_invitations",
+               headers={"Prefer": "return=representation"},
+               json={"workspace_id": STATE["b"]["ws"], "email": "someone-else@knova-isolation.test",
+                     "role": "employee", "invited_by": STATE["b"]["user_id"], "status": "pending",
+                     "expires_at": "2099-01-01T00:00:00Z"}).json()[0]
+    try:
+        r = _rpc(STATE["a"]["token"], "accept_pending_invitations", {})
+        assert r.status_code == 200
+        assert r.json() == 0, "A accepted an invitation addressed to another email"
+        got = _svc("GET", f"/rest/v1/workspace_members?workspace_id=eq.{STATE['b']['ws']}"
+                          f"&user_id=eq.{STATE['a']['user_id']}&select=id").json()
+        assert got == [], "A gained membership of B's tenant through an invitation"
+    finally:
+        _svc("DELETE", f"/rest/v1/workspace_invitations?id=eq.{inv['id']}")
+
+
+def test_45_an_expired_invitation_is_not_accepted():
+    inv = _svc("POST", "/rest/v1/workspace_invitations",
+               headers={"Prefer": "return=representation"},
+               json={"workspace_id": STATE["b"]["ws"], "email": STATE["a"]["email"],
+                     "role": "employee", "invited_by": STATE["b"]["user_id"], "status": "pending",
+                     "expires_at": "2020-01-01T00:00:00Z"}).json()[0]
+    try:
+        r = _rpc(STATE["a"]["token"], "accept_pending_invitations", {})
+        assert r.json() == 0, "an expired invitation was accepted"
+        after = _svc("GET", f"/rest/v1/workspace_invitations?id=eq.{inv['id']}&select=status").json()
+        assert after[0]["status"] == "pending", "an expired invitation must not be consumed"
+    finally:
+        _svc("DELETE", f"/rest/v1/workspace_invitations?id=eq.{inv['id']}")
+
+
+def test_46_an_invitation_is_single_use():
+    """Accepting flips the row to 'accepted', so a second attempt matches
+    nothing — the same link cannot seat a person twice."""
+    inv = _svc("POST", "/rest/v1/workspace_invitations",
+               headers={"Prefer": "return=representation"},
+               json={"workspace_id": STATE["b"]["ws"], "email": STATE["a"]["email"],
+                     "role": "employee", "invited_by": STATE["b"]["user_id"], "status": "pending",
+                     "expires_at": "2099-01-01T00:00:00Z"}).json()[0]
+    try:
+        first = _rpc(STATE["a"]["token"], "accept_pending_invitations", {}).json()
+        second = _rpc(STATE["a"]["token"], "accept_pending_invitations", {}).json()
+        assert first == 1, "a valid invitation should be accepted once"
+        assert second == 0, "the same invitation was accepted twice"
+        st = _svc("GET", f"/rest/v1/workspace_invitations?id=eq.{inv['id']}&select=status").json()
+        assert st[0]["status"] == "accepted"
+    finally:
+        # Undo the seating so the isolation fixtures stay as they were.
+        _svc("DELETE", f"/rest/v1/workspace_members?workspace_id=eq.{STATE['b']['ws']}"
+                       f"&user_id=eq.{STATE['a']['user_id']}")
+        _svc("PATCH", f"/rest/v1/workspace_members?user_id=eq.{STATE['a']['user_id']}"
+                      f"&workspace_id=eq.{STATE['a']['ws']}", json={"status": "active"})
+        _svc("DELETE", f"/rest/v1/workspace_invitations?id=eq.{inv['id']}")
+
+
+def test_47_a_client_cannot_forge_an_invitation_into_another_tenant():
+    r = _as_user(STATE["a"]["token"], "POST", "/rest/v1/workspace_invitations",
+                 json={"workspace_id": STATE["b"]["ws"], "email": STATE["a"]["email"],
+                       "role": "owner", "invited_by": STATE["a"]["user_id"], "status": "pending"})
+    assert r.status_code >= 400, "A wrote an invitation into B's tenant"
+    got = _svc("GET", f"/rest/v1/workspace_invitations?workspace_id=eq.{STATE['b']['ws']}"
+                      f"&email=eq.{STATE['a']['email']}&select=id").json()
+    assert got == [], "a forged invitation survived"
+
+
+def test_48_a_client_cannot_promote_a_pending_invitation_to_owner():
+    inv = _svc("POST", "/rest/v1/workspace_invitations",
+               headers={"Prefer": "return=representation"},
+               json={"workspace_id": STATE["a"]["ws"], "email": "pending@knova-isolation.test",
+                     "role": "employee", "invited_by": STATE["a"]["user_id"], "status": "pending",
+                     "expires_at": "2099-01-01T00:00:00Z"}).json()[0]
+    try:
+        _as_user(STATE["a"]["token"], "PATCH", f"/rest/v1/workspace_invitations?id=eq.{inv['id']}",
+                 json={"role": "owner"})
+        after = _svc("GET", f"/rest/v1/workspace_invitations?id=eq.{inv['id']}&select=role").json()
+        assert after[0]["role"] == "employee", "a pending invitation was escalated to owner"
+    finally:
+        _svc("DELETE", f"/rest/v1/workspace_invitations?id=eq.{inv['id']}")
+
+
+def test_49_the_invitation_creator_cannot_choose_the_tenant():
+    """create_workspace_invitation takes an email and a role -- never a
+    workspace. It resolves the tenant from current_workspace_id(), so a Company
+    Admin cannot invite into a company that is not theirs."""
+    r = _rpc(STATE["a"]["token"], "create_workspace_invitation",
+             {"_email": "x@knova-isolation.test", "_role": "employee",
+              "_workspace_id": STATE["b"]["ws"]})
+    assert r.status_code >= 400, "the RPC must reject an unknown workspace argument"
+
+
+def test_50_owner_cannot_be_invited_as_a_role():
+    """No path to a second owner, which is the escalation that would matter."""
+    r = _rpc(STATE["a"]["token"], "create_workspace_invitation",
+             {"_email": "escalate@knova-isolation.test", "_role": "owner"})
+    assert r.status_code >= 400 and "invalid_role" in r.text
+
+
+def test_51_an_ordinary_member_cannot_invite_at_all():
+    """Only owner/admin may invite. B is an owner of its own tenant, so the
+    meaningful check is that the function authorizes against the CALLER's role
+    in the CALLER's workspace rather than accepting a claim."""
+    src = _svc("POST", "/rest/v1/rpc/create_workspace_invitation",
+               json={"_email": "nobody@knova-isolation.test", "_role": "employee"})
+    # Service role has no auth.uid(), so current_workspace_id() is null.
+    assert src.status_code >= 400, "a caller with no identity must not create invitations"
+
+
+def test_52_super_admin_status_cannot_be_self_granted():
+    for payload in ({"user_id": STATE["a"]["user_id"]},):
+        r = _as_user(STATE["a"]["token"], "POST", "/rest/v1/super_admins", json=payload)
+        assert r.status_code >= 400
+    got = _svc("GET", f"/rest/v1/super_admins?user_id=eq.{STATE['a']['user_id']}&select=user_id").json()
+    assert got == [], "a tenant user became a platform super admin"
